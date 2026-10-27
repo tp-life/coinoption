@@ -111,10 +111,11 @@ type APIError struct {
 
 // hint 为常见业务错误码补充人类指引。
 var hint = map[string]string{
-	"50105": "IP 白名单未配置或不匹配：OKX 看到的出口 IP 需加入 API Key 白名单（走代理时应填代理出口 IP），或改为不绑定 IP 的 Key",
+	"50105": "Passphrase 不正确：passphrase 是创建 API Key 时 YOU 自己设置的那串口令（不是 OKX 发的），检查是否漏拷/多空格/引号",
+	"50106": "IP 白名单未配置或不匹配：OKX 看到的出口 IP 需加入 API Key 白名单（走代理时应填代理出口 IP），或改为不绑定 IP 的 Key",
 	"50102": "签名时间戳偏差超过 30s：请校对本机时间/时区",
 	"50111": "API Key 为空或未传入",
-	"50103": "API Key 无效（Header 缺失或不匹配）",
+	"50103": "API Key 不存在或已失效（Header 不匹配）",
 	"50113": "API Key 权限不足：双币赢查询需「读取」权限，下单需「交易」权限",
 }
 
@@ -248,7 +249,14 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body []byte) (
 		return nil, err
 	}
 
-	// HTTP 层错误：429 / 5xx 可重试（交给 request 循环）
+	// 4xx/5xx 时 body 往往携带业务错误码（401 → {"code":"50105",...}），
+	// 优先按业务错误解析，给出可读性更好的 APIError。
+	var pre resp
+	if uerr := json.Unmarshal(raw, &pre); uerr == nil && pre.Code != "" && pre.Code != "0" {
+		return nil, &APIError{Code: pre.Code, Msg: pre.Msg}
+	}
+
+	// 纯 HTTP 层错误：429 / 5xx 可重试（交给 request 循环）
 	switch {
 	case httpResp.StatusCode == http.StatusTooManyRequests:
 		return nil, &HTTPError{StatusCode: httpResp.StatusCode}
