@@ -109,7 +109,19 @@ type APIError struct {
 	Msg  string
 }
 
+// hint 为常见业务错误码补充人类指引。
+var hint = map[string]string{
+	"50105": "IP 白名单未配置或不匹配：OKX 看到的出口 IP 需加入 API Key 白名单（走代理时应填代理出口 IP），或改为不绑定 IP 的 Key",
+	"50102": "签名时间戳偏差超过 30s：请校对本机时间/时区",
+	"50111": "API Key 为空或未传入",
+	"50103": "API Key 无效（Header 缺失或不匹配）",
+	"50113": "API Key 权限不足：双币赢查询需「读取」权限，下单需「交易」权限",
+}
+
 func (e *APIError) Error() string {
+	if h, has := hint[e.Code]; has {
+		return fmt.Sprintf("okx api error: code=%s msg=%s → %s", e.Code, e.Msg, h)
+	}
 	return fmt.Sprintf("okx api error: code=%s msg=%s", e.Code, e.Msg)
 }
 
