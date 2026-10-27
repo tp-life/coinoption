@@ -171,11 +171,21 @@ func (g *Guard) Snapshot() GuardState {
 	}
 }
 
+// RestoreAggregate 聚合恢复（live 平台仓位：总额 + 笔数）。
+func (g *Guard) RestoreAggregate(exposureUSDT float64, openCount int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if exposureUSDT > 0 {
+		g.exposureUSDT += exposureUSDT
+	}
+	g.openCount += openCount
+}
+
 // Restore 从落库数据恢复运行态（进程重启后风控不归零的关键）：
-//   - openAmounts：在持订单的敞口清单（纸面单 open 态 + 平台真实单快照）
+//   - openAmounts：在持订单的敞口清单（纸面单 open 态）
 //   - dayCount：今日已提交次数（audit "submit" 事件当日汇总）
 //
-// live 模式的平台真实单恢复（读取平台仓位折算）→ M3.2 接入；当前恢复覆盖纸面单。
+// live 模式的平台真实仓位由 executor.SyncLiveGuard 在启动时另行聚合恢复（RestoreAggregate）。
 func (g *Guard) Restore(openAmountsUSDT []float64, dayCount int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()

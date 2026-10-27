@@ -38,8 +38,8 @@ func (c cliExec) boot() (executor.Mode, *executor.Executor, error) {
 		return m, nil, err
 	}
 
-	// sim-local 不需私钥：无 Key 时建成仅公开行情的 client。
-	client := buildClient(c.proxy, c.apiKey, c.secret, c.passphrase, false)
+	// sim-okx 的期权走 Demo（x-simulated-trading 头 + Demo Key）；其余为实盘/公开。
+	client := buildClient(c.proxy, c.apiKey, c.secret, c.passphrase, c.mode == "sim-okx")
 
 	lim := executor.DefaultLimits()
 	if c.limitsOverride != "" {

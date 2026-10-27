@@ -15,6 +15,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/tp/coinoption/internal/executor"
 	"github.com/tp/coinoption/internal/market"
 	"github.com/tp/coinoption/internal/okx"
 	"github.com/tp/coinoption/internal/strategy"
@@ -93,11 +94,26 @@ func main() {
 			os.Exit(1)
 		}
 	default:
-		// TUI 主模式：Bubble Tea Dashboard（读取环境变量装配客户端）
-		client := buildClient(os.Getenv("COINOPTION_PROXY"),
-			os.Getenv("COINOPTION_API_KEY"), os.Getenv("COINOPTION_SECRET"),
-			os.Getenv("COINOPTION_PASSPHRASE"), *demo)
-		run := ui.New(market.Fetcher{C: client}, *uly)
+		// TUI 主模式：行情 fetcher + executor（--mode 决定执行路径；sim-local 也可无 Key）
+		cli := cliExec{
+			mode: *mode, proxy: *proxy,
+			apiKey: *apiKey, secret: *secret, passphrase: *passphrase,
+			storeDir: *storeDir, uly: *uly, limitsOverride: *limits,
+		}
+		_, ex, err := cli.boot()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "executor 装配失败: %v\n", err)
+			os.Exit(1)
+		}
+		if ex.Mode() == executor.ModeLive {
+			if msg, err := ex.SyncLiveGuard(); err != nil {
+				fmt.Fprintf(os.Stderr, "[warn] 平台仓位恢复失败: %v\n", err)
+			} else {
+				fmt.Fprintln(os.Stderr, "[restore]", msg)
+			}
+		}
+		client := buildClient(*proxy, *apiKey, *secret, *passphrase, *demo)
+		run := ui.New(market.Fetcher{C: client}, ex, *uly)
 		p := tea.NewProgram(run, tea.WithAltScreen())
 		if _, err := p.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)

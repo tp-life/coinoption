@@ -19,8 +19,9 @@ type Snapshot struct {
 	SpotPrice    float64
 	OptionCount  int
 	DcdCount     int
-	Decisions    []strategy.Decision  // DCY↔期权 对齐决策（可能为空）
-	OptionRows   []strategy.OptionRow // 期权侧机会榜（始终有）
+	Decisions    []strategy.Decision       // DCY↔期权 对齐决策（可能为空）
+	OptionRows   []strategy.OptionRow      // 期权侧机会榜（始终有）
+	Products     map[string]okx.DCDProduct // productId → 产品（TUI 申购用）
 	DCYAvailable bool
 	Warn         string // 非致命提示（如 DCY 需 Key 的 401/500）
 }
@@ -77,6 +78,10 @@ func Fetch(c *okx.Client, dcyUly string) (*Snapshot, error) {
 	snapshot.DcdCount = len(dcds)
 	if len(dcds) > 0 {
 		snapshot.DCYAvailable = true
+		snapshot.Products = make(map[string]okx.DCDProduct, len(dcds))
+		for _, p := range dcds {
+			snapshot.Products[p.ProductID] = p
+		}
 		snapshot.Decisions = strategy.Build(dcds, instruments, tickers, spotMap, time.Now(), strategy.DefaultParams())
 	} else {
 		snapshot.Warn = "双币赢不可用（需实盘 API Key；模拟盘无金融产品）→ [" + strings.Join(warns, "; ") + "]"
