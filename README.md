@@ -61,7 +61,7 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
   --limits 500000,160000,5,10
 ```
 
-数据落盘（默认 `~/.coinoption/`，`--store` 覆盖）：`sim_orders.jsonl` / `orders.jsonl` / `audit_log.jsonl`，可直接 `cat` 对账。
+数据落盘（默认 `~/.coinoption/`，`--store` 覆盖）：`sim_orders.jsonl` / `orders.jsonl` / `audit_log.jsonl` / `settings.json`，可直接 `cat` 对账。
 
 ### 实测结论（M3 新增）
 - **期权合约名义**：BTC 币本位（BTC-USD）与 UM 链单张均为 **1 BTC ≈ 8 万 USDT**，`ctMult=0.01` 只是权利金报价的数量裁量，不影响名义/权利金总口径 → 默认单笔 2000 USDT 无法卖 BTC 期权，期权腿要么放宽 `--limits`、要么依赖 DCY 的小额申购
@@ -98,10 +98,25 @@ go test ./internal/strategy/        # 黄金回归
 | `--key` | `COINOPTION_API_KEY` | API Key（仅私有接口，双币赢接口实测需要） |
 | `--secret` | `COINOPTION_SECRET` | API Secret |
 | `--passphrase` | `COINOPTION_PASSPHRASE` | API Passphrase |
-| `--demo` | — | 走 OKX 模拟盘（期权验证可；DCY 需实盘 Key） |
+| `--demo` | — | 公开行情/Demo 兼容标志（TUI 执行路径以 `--mode` 为准） |
+| `--mode` | — | `live` / `sim-okx`（期权走 Demo，DCY 本地纸面）/ `sim-local`（默认，全本地） |
+| `--store` | — | 数据目录，默认 `~/.coinoption` |
+| `--limits` | — | 风控覆盖 `"总敞口,单笔,并行,日限"`，默认 `5000,2000,5,10`（期权大名义验证需放宽） |
 | `--uly` | — | 标的，默认 `BTC-USDT`（支持 ETH-USDT/SOL-USDT） |
+
+> 运行模式在启动时固定（executor 装配后不可热切换）；Settings 页显示当前模式，切换需重启并指定 `--mode`。
 
 ## API Key 权限需求
 
-- 双币赢（sfp/dcd）接口：需要「读取」权限（产品/订单查询）
-- 后续 M3 下单阶段：需要「交易」权限
+- 双币赢（sfp/dcd）接口：需要「读取」权限（产品/订单查询）；实盘申购需要「交易」权限
+- 期权卖单：需要「交易」权限（`tdMode=cross`）
+- **IP 白名单**：私有接口会校验来源 IP（实测出口 `198.176.52.187` 未在 Key 白名单 → `50110`）；需在 OKX 后台加入当前出口 IP，或改用不绑定 IP 的 Key
+
+## 下一步验证清单（需要人工配合）
+
+1. **白名单**：把代理出口 IP 加入 API Key 白名单（或换不绑 IP 的 Key），使 `--dump` 能看到 `dcdProducts > 0`。
+2. **`sim-okx` 期权 Demo**：提供模拟盘专用 Key，执行
+   `./bin/coinoption --mode sim-okx --order opt --inst BTC-USD_UM-261106-83000-C --sz 1 --px 0 --limits 500000,160000,5,10`
+   预期：Demo 成交回执写入 `orders.jsonl`，DCY 仍走本地纸面。
+3. **小实盘**：先用 `--limits 5000,2000,5,10` 下 1 笔最小 DCY 申购（如 10 USDT 等值），确认订单与 `--positions` 平台数据一致。
+4. **自动执行**：在 sim-local 打开 Settings → `a` 观察 1–2 轮（同一产品只做一次）；确认无误后再考虑 sim-okx / live（live 需当次 `y` 确认）。
