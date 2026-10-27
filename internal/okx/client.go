@@ -114,6 +114,7 @@ type APIError struct {
 var hint = map[string]string{
 	"50105": "Passphrase 不正确：passphrase 是创建 API Key 时 YOU 自己设置的那串口令（不是 OKX 发的），检查是否漏拷/多空格/引号",
 	"50106": "IP 白名单未配置或不匹配：OKX 看到的出口 IP 需加入 API Key 白名单（走代理时应填代理出口 IP），或改为不绑定 IP 的 Key",
+	"50110": "IP 不在 API Key 白名单：(上方报文的出口 IP) 加入白名单或换不绑 IP 的 Key",
 	"50102": "签名时间戳偏差超过 30s：请校对本机时间/时区",
 	"50111": "API Key 为空或未传入",
 	"50103": "API Key 不存在或已失效（Header 不匹配）",

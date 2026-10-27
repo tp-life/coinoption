@@ -26,12 +26,55 @@ func main() {
 	dump := flag.Bool("dump", false, "拉取实时行情并输出比对决策 CSV（双币赢部分需 API Key）")
 	optdebug := flag.Bool("optdebug", false, "打印期权链到期日分布与 bid 覆盖诊断")
 	demo := flag.Bool("demo", false, "走 OKX 模拟盘（x-simulated-trading: 1），需模拟盘专用 API Key")
+
+	// ── M3 执行通道 ──
+	mode := flag.String("mode", "sim-local", "运行模式 live | sim-okx | sim-local（默认 sim-local 全本地纸面）")
+	order := flag.String("order", "", "执行动作：dcd（申购双币赢）| opt（卖出期权）")
+	product := flag.String("product", "", "--order dcd 的产品 ID，如 BTC-USDT-261106-80000-C")
+	amt := flag.Float64("amt", 0, "--order dcd 的申购量（投资币种；>产品 maxSize 会自动截到上限）")
+	syntheticStrike := flag.Float64("strike", 0, "无 Key 时合成 DCD 产品的行权价")
+	syntheticYield := flag.Float64("abs-yield", 0, "无 Key 时合成 DCD 产品的绝对收益率（如 0.0035）")
+	expTime := flag.String("exp-time", "", "合成 DCD 产品的到期时间（RFC3339，如 2026-11-06T08:00:00Z）")
+	instID := flag.String("inst", "", "--order opt 的期权合约，如 BTC-USD-261106-83000-C")
+	sz := flag.Float64("sz", 0, "--order opt 的张数")
+	limPx := flag.Float64("px", 0, "--order opt 的限价（0=以当前 bid 追卖）")
+	positions := flag.Bool("positions", false, "查看持仓：风控快照 + 纸面单 + 平台单")
+	settle := flag.Bool("settle", false, "扫描到期纸面单并按当前现价结算（模拟口径）")
+	guardOnly := flag.Bool("guard", false, "只打印风控守卫状态")
+	storeDir := flag.String("store", "", "数据目录（默认 ~/.coinoption）")
+	limits := flag.String("limits", "", "风控上限覆盖 \"total,perOrder,concurrent,perDay\"（默认 5000,2000,5,10；仅测试/期权大名义需要）")
+
 	uly := flag.String("uly", "BTC-USDT", "标的（BTC-USDT | ETH-USDT | SOL-USDT）")
 	proxy := flag.String("proxy", os.Getenv("COINOPTION_PROXY"), "HTTP/SOCKS5 代理地址，空则直连；也可用环境变量 COINOPTION_PROXY")
 	apiKey := flag.String("key", os.Getenv("COINOPTION_API_KEY"), "API Key（环境变量 COINOPTION_API_KEY）")
 	secret := flag.String("secret", os.Getenv("COINOPTION_SECRET"), "API Secret（环境变量 COINOPTION_SECRET）")
 	passphrase := flag.String("passphrase", os.Getenv("COINOPTION_PASSPHRASE"), "API Passphrase（环境变量 COINOPTION_PASSPHRASE）")
 	flag.Parse()
+
+	switch {
+	case *positions || *settle || *guardOnly || *order != "":
+		cli := cliExec{
+			mode: *mode, proxy: *proxy,
+			apiKey: *apiKey, secret: *secret, passphrase: *passphrase,
+			storeDir: *storeDir, uly: *uly, limitsOverride: *limits,
+		}
+		var err error
+		switch {
+		case *order != "":
+			err = cli.runOrder(*order, *product, *amt, *syntheticStrike, *syntheticYield, *expTime, *instID, *sz, *limPx)
+		case *positions:
+			err = cli.runPositions()
+		case *settle:
+			err = cli.runSettle()
+		case *guardOnly:
+			err = cli.runGuard()
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "exec failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	switch {
 	case *smoke:

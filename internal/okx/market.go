@@ -75,11 +75,13 @@ type Instrument struct {
 	InstFamily string `json:"instFamily"`
 	Ccy        string `json:"ccy"`
 	OptType    string `json:"optType"`
-	OptStrike  string `json:"optStrike"`
-	ExpTime    string `json:"expTime"` // 到期时间（时区相关，UTC）
+	OptStrike  string `json:"optStrike"` // 老 tag 保留（真实响应用 stk）
+	Stk        string `json:"stk"`       // 行权价（实测字段名）
+	ExpTime    string `json:"expTime"`   // 到期时间（时区相关，UTC）
 	TickSz     string `json:"tickSz"`
 	CtVal      string `json:"ctVal"`
 	CtValCcy   string `json:"ctValCcy"`
+	CtMult     string `json:"ctMult"` // 合约乘数（_UM 链实测 0.01；未给=1）
 	SettleCcy  string `json:"settleCcy"`
 	MinSz      string `json:"minSz"`
 }
@@ -90,6 +92,11 @@ type Instrument struct {
 func (c *Client) GetSpotTicker(instId string) ([]SpotTicker, error) {
 	q := url.Values{"instId": {instId}}
 	return wrap[SpotTicker](c.get(context.Background(), pathSpotTicker, q))
+}
+
+// GetTicker 单合约 ticker（现货/期权/合约通用，同一 /market/ticker 端点）。
+func (c *Client) GetTicker(instId string) ([]SpotTicker, error) {
+	return c.GetSpotTicker(instId)
 }
 
 // GetOptionTickers 某 uly 的全部期权行情（含 IV/权利金盘口）。
