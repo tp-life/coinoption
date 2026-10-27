@@ -80,7 +80,7 @@ premium_apr = (markIV 对应的权利金卖价 或 bid价 × 合约规模 × 张
 
 | 层级 | 对象 | 机制 | 说明 |
 | --- | --- | --- | --- |
-| **L1：OKX Demo API** | 期权卖单 | 相同 REST 端点 + 请求头 `x-simulated-trading: 1`，WS 连 `wspap.okx.com:8443` | 模拟盘覆盖期权交易，走真实撮合/风控校验，最贴近真实 |
+| **L1：OKX Demo API** | 期权卖单 | 相同 REST 端点 + 请求头 `x-simulated-trading: 1`，WS 连 `wspap.okx.com:8443` | 模拟盘覆盖期权交易，走真实撮合/风控校验，最贴近真实。**M0/M2 实测：Demo 下公开行情可用（现货/期权链），但 `sfp/dcd` 返回 HTTP 500——金融产品确认不在模拟盘范围** |
 | **L2：本地纸面模拟器** | 双币赢申购 | 本地记录 `{产品, 金额, 申购价, 目标价, 结算日}`，到结算日按当前指数价自行结算并计算收益 | OKX Demo **不覆盖金融产品（DCY）**，只能本地模拟 DCY 结算逻辑 |
 
 - 模式值为 `live` / `sim-okx`（期权 Demo + DCY 本地）/ `sim-local`（全本地，甚至不用 API Key 也能跑，行情走公开接口）

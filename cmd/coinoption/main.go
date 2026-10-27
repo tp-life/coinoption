@@ -13,13 +13,18 @@ import (
 	"strings"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/tp/coinoption/internal/market"
 	"github.com/tp/coinoption/internal/okx"
 	"github.com/tp/coinoption/internal/strategy"
+	"github.com/tp/coinoption/internal/ui"
 )
 
 func main() {
 	smoke := flag.Bool("smoke", false, "对 OKX 公开行情做冒烟测试（无需 API Key）")
 	dump := flag.Bool("dump", false, "拉取实时行情并输出比对决策 CSV（双币赢部分需 API Key）")
+	demo := flag.Bool("demo", false, "走 OKX 模拟盘（x-simulated-trading: 1），需模拟盘专用 API Key")
 	uly := flag.String("uly", "BTC-USDT", "标的（BTC-USDT | ETH-USDT | SOL-USDT）")
 	proxy := flag.String("proxy", os.Getenv("COINOPTION_PROXY"), "HTTP/SOCKS5 代理地址，空则直连；也可用环境变量 COINOPTION_PROXY")
 	apiKey := flag.String("key", os.Getenv("COINOPTION_API_KEY"), "API Key（环境变量 COINOPTION_API_KEY）")
@@ -29,29 +34,31 @@ func main() {
 
 	switch {
 	case *smoke:
-		if err := runSmoke(*uly, *proxy, *apiKey, *secret, *passphrase); err != nil {
+		if err := runSmoke(*uly, *proxy, *apiKey, *secret, *passphrase, *demo); err != nil {
 			fmt.Fprintf(os.Stderr, "smoke failed: %v\n", err)
 			os.Exit(1)
 		}
 	case *dump:
-		if err := runDump(*uly, *proxy, *apiKey, *secret, *passphrase); err != nil {
+		if err := runDump(*uly, *proxy, *apiKey, *secret, *passphrase, *demo); err != nil {
 			fmt.Fprintf(os.Stderr, "dump failed: %v\n", err)
 			os.Exit(1)
 		}
 	default:
-		flag.Usage()
+		// TUI 主模式：Bubble Tea Dashboard（读取环境变量装配客户端）
+		client := buildClient(os.Getenv("COINOPTION_PROXY"),
+			os.Getenv("COINOPTION_API_KEY"), os.Getenv("COINOPTION_SECRET"),
+			os.Getenv("COINOPTION_PASSPHRASE"), *demo)
+		run := ui.New(market.Fetcher{C: client}, *uly)
+		p := tea.NewProgram(run, tea.WithAltScreen())
+		if _, err := p.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 }
 
-func runSmoke(uly, proxy, apiKey, secret, passphrase string) error {
-	opts := []okx.Option{}
-	if proxy != "" {
-		opts = append(opts, okx.WithProxy(proxy))
-	}
-	if apiKey != "" && secret != "" && passphrase != "" {
-		opts = append(opts, okx.WithAuth(apiKey, secret, passphrase))
-	}
-	c := okx.NewClient(opts...)
+func runSmoke(uly, proxy, apiKey, secret, passphrase string, demo bool) error {
+	c := buildClient(proxy, apiKey, secret, passphrase, demo)
 
 	fmt.Printf("== smoke: %s @ %s ==\n\n", uly, time.Now().Format(time.RFC3339))
 
@@ -134,6 +141,21 @@ func runSmoke(uly, proxy, apiKey, secret, passphrase string) error {
 	return nil
 }
 
+// buildClient 统一客户端装配（代理/密钥/模拟盘）。
+func buildClient(proxy, apiKey, secret, passphrase string, demo bool) *okx.Client {
+	opts := []okx.Option{}
+	if proxy != "" {
+		opts = append(opts, okx.WithProxy(proxy))
+	}
+	if demo {
+		opts = append(opts, okx.WithDemo())
+	}
+	if apiKey != "" && secret != "" && passphrase != "" {
+		opts = append(opts, okx.WithAuth(apiKey, secret, passphrase))
+	}
+	return okx.NewClient(opts...)
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -142,16 +164,8 @@ func min(a, b int) int {
 }
 
 // runDump 实时数据 → strategy.Build → CSV 决策输出（M1 验证通道）。
-func runDump(uly, proxy, apiKey, secret, passphrase string) error {
-	opts := []okx.Option{}
-	if proxy != "" {
-		opts = append(opts, okx.WithProxy(proxy))
-	}
-	hasKey := apiKey != "" && secret != "" && passphrase != ""
-	if hasKey {
-		opts = append(opts, okx.WithAuth(apiKey, secret, passphrase))
-	}
-	c := okx.NewClient(opts...)
+func runDump(uly, proxy, apiKey, secret, passphrase string, demo bool) error {
+	c := buildClient(proxy, apiKey, secret, passphrase, demo)
 
 	// DCY 基础币种（BTC-USDT → BTC）；期权底层自动降级 USD
 	parts := strings.Split(uly, "-")
