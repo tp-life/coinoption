@@ -52,9 +52,11 @@ func ShortOptionAPR(q OptQuote, spotPrice float64, now time.Time) (apr, days flo
 	premium := bid * q.CtVal
 	var premiumUSD float64
 	switch q.SettleCcy {
-	case "USDT":
+	case "USDT", "USD":
+		// 稳定币/美元计价期权（如 _UM）：premium 已是美元口径，无需换算
 		premiumUSD = premium
-	default: // 币本位（BTC/ETH/SOL 结算）
+	default:
+		// 币本位（BTC/ETH/SOL 结算）：premium × 现货折 USD
 		premiumUSD = premium * spotPrice
 	}
 	notional := q.Strike * q.CtVal

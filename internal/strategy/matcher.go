@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -126,7 +127,7 @@ func Match(dcds []okx.DCDProduct, instruments []okx.Instrument, tickers []okx.Op
 			if absDays < 0 || absDays > 1 {
 				continue
 			}
-			score := strikeGapPct(q.Strike, float64(d.Strike), spotPrice) + absDays*0.01
+			score := math.Abs(strikeGapPct(q.Strike, float64(d.Strike), spotPrice)) + absDays*0.01
 			if !found || score < bestScore {
 				bestScore = score
 				best = q

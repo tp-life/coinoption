@@ -24,6 +24,7 @@ import (
 func main() {
 	smoke := flag.Bool("smoke", false, "对 OKX 公开行情做冒烟测试（无需 API Key）")
 	dump := flag.Bool("dump", false, "拉取实时行情并输出比对决策 CSV（双币赢部分需 API Key）")
+	optdebug := flag.Bool("optdebug", false, "打印期权链到期日分布与 bid 覆盖诊断")
 	demo := flag.Bool("demo", false, "走 OKX 模拟盘（x-simulated-trading: 1），需模拟盘专用 API Key")
 	uly := flag.String("uly", "BTC-USDT", "标的（BTC-USDT | ETH-USDT | SOL-USDT）")
 	proxy := flag.String("proxy", os.Getenv("COINOPTION_PROXY"), "HTTP/SOCKS5 代理地址，空则直连；也可用环境变量 COINOPTION_PROXY")
@@ -41,6 +42,11 @@ func main() {
 	case *dump:
 		if err := runDump(*uly, *proxy, *apiKey, *secret, *passphrase, *demo); err != nil {
 			fmt.Fprintf(os.Stderr, "dump failed: %v\n", err)
+			os.Exit(1)
+		}
+	case *optdebug:
+		if err := runOptDebug(*uly, *proxy, *apiKey, *secret, *passphrase, *demo); err != nil {
+			fmt.Fprintf(os.Stderr, "optdebug failed: %v\n", err)
 			os.Exit(1)
 		}
 	default:
@@ -230,6 +236,51 @@ func runDump(uly, proxy, apiKey, secret, passphrase string, demo bool) error {
 		fmt.Printf("%s,%c,%.0f,%.4f,%s,%.4f,%.4f,%.1f,%.3f,%s,%s,%.2f %s\n",
 			r.ProductID, r.OptType, r.Strike, r.DcyAPR*100, opt, r.OptAPR*100, r.Diff*100,
 			r.Days, r.StrikeErrPct, d.Action, d.ReasonCode, d.SuggestedAmt, r.InvestCcy)
+	}
+	return nil
+}
+
+// runOptDebug 期权链诊断：到期日分布 × instruments/tickers/bid 覆盖。
+func runOptDebug(uly, proxy, apiKey, secret, passphrase string, demo bool) error {
+	c := buildClient(proxy, apiKey, secret, passphrase, demo)
+
+	base := strings.Split(uly, "-")[0]
+	optionUly := uly
+	instruments, err := c.GetOptionInstruments(optionUly)
+	if (err != nil || len(instruments) == 0) && strings.HasSuffix(uly, "-USDT") {
+		optionUly = base + "-USD"
+		instruments, err = c.GetOptionInstruments(optionUly)
+	}
+	if err != nil {
+		return err
+	}
+	tickers, err := c.GetOptionTickers(optionUly)
+	if err != nil {
+		return err
+	}
+
+	instExp := map[string]string{}
+	dayInst := map[string]int{}
+	for _, ins := range instruments {
+		if ms, e := strconv.ParseInt(ins.ExpTime, 10, 64); e == nil {
+			d := time.UnixMilli(ms).UTC().Format("01-02")
+			instExp[ins.InstID] = d
+			dayInst[d]++
+		}
+	}
+	dayTick := map[string]int{}
+	dayBid := map[string]int{}
+	for _, t := range tickers {
+		if d, ok := instExp[t.InstID]; ok {
+			dayTick[d]++
+			if t.BidPx != "" && t.BidPx != "0" {
+				dayBid[d]++
+			}
+		}
+	}
+	fmt.Println("date  inst  tick  bid")
+	for d := range dayInst {
+		fmt.Printf("%s %5d %5d %5d\n", d, dayInst[d], dayTick[d], dayBid[d])
 	}
 	return nil
 }

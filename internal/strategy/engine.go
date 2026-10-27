@@ -24,16 +24,17 @@ func Decide(row MatchRow, p Params) Decision {
 		d.ReasonCode = "no_option_quote"
 		return d
 	}
-	if row.StrikeErrPct > p.MaxStrikeGapPct || row.StrikeErrPct < -p.MaxStrikeGapPct {
-		d.Action = ActionUnaligned
-		d.ReasonCode = "strike_gap_too_big"
-		return d
-	}
 
-	// 期限窗口过滤：7–30 天
+	// 期限窗口过滤：7–30 天（先于行权价检查，长周期产品的原因更准确）
 	if row.Days < p.DaysMin || row.Days > p.DaysMax {
 		d.Action = ActionNone
 		d.ReasonCode = "out_of_tenor"
+		return d
+	}
+
+	if row.StrikeErrPct > p.MaxStrikeGapPct || row.StrikeErrPct < -p.MaxStrikeGapPct {
+		d.Action = ActionUnaligned
+		d.ReasonCode = "strike_gap_too_big"
 		return d
 	}
 
@@ -69,6 +70,7 @@ func Build(dcds []okx.DCDProduct, instruments []okx.Instrument, tickers []okx.Op
 
 // clampCap 依据 DCY 产品的最小/最大申购规模与资金上限计算建议金额。
 // 上限 < 产品最小规模或产品无有效规模区间 → 返回 0（executor 侧拒绝）。
+// TODO(M3): capUSDT 为 USDT 口径，投资币种为 BTC/USDT 时需经现货价换算再校验。
 func clampCap(row MatchRow, capUSDT float64) float64 {
 	if capUSDT <= 0 {
 		return 0

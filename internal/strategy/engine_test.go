@@ -215,3 +215,37 @@ func TestSortOrder(t *testing.T) {
 		t.Fatalf("unaligned should be last executable, got %s", ds[3].Action)
 	}
 }
+
+// 回归：行权价匹配必须取绝对偏差最小者（2026-10-27 实线 bug：
+// 深 ITM 70000 因负分赢得匹配，压过精确匹配的 80000）。
+func TestNearestStrikeBeatsDeepITM(t *testing.T) {
+	ins := []okx.Instrument{
+		goldenInstrument("BTC-USD-260327-70000-C", "C"),
+		goldenInstrument("BTC-USD-260327-80000-C", "C"),
+	}
+	tick := []okx.OptionTicker{
+		{InstID: "BTC-USD-260327-70000-C", BidPx: "0.12", BidSz: "99"},
+		{InstID: "BTC-USD-260327-80000-C", BidPx: "0.023", BidSz: "698"},
+	}
+	dcd := okx.DCDProduct{
+		ProductID: "BTC-USDT-260327-80000-C", BaseCcy: "BTC", QuoteCcy: "USDT",
+		NotionalCcy: "BTC", OptType: "C", Uly: "BTC-USD",
+		Strike: okx.FlexReal(80000), AbsYield: okx.FlexReal(0.00326059),
+		AnnualizedYield: okx.FlexReal(0.242), MinSize: okx.FlexReal(10),
+		MaxSize: okx.FlexReal(6000000), ExpTime: okx.FlexInt(goldenExpMS),
+	}
+	rows := Match([]okx.DCDProduct{dcd}, ins, tick,
+		map[string]float64{"BTC": goldenSpot}, goldenNow)
+	if len(rows) != 1 {
+		t.Fatalf("rows: %d", len(rows))
+	}
+	r := rows[0]
+	if r.OptInstID != "BTC-USD-260327-80000-C" {
+		t.Fatalf("nearest strike must win: matched %s (errPct=%.3f)", r.OptInstID, r.StrikeErrPct)
+	}
+	if r.StrikeErrPct != 0 {
+		t.Fatalf("exact strike should give zero gap: %.6f", r.StrikeErrPct)
+	}
+	target := (0.023 * goldenSpot) / 80000 * (365.0 / 25)
+	assertNear(t, "optAPR", r.OptAPR, target, 1e-9)
+}

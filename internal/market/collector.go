@@ -63,7 +63,10 @@ func Fetch(c *okx.Client, dcyUly string) (*Snapshot, error) {
 	// 4. DCY 产品（尽力而为；无 Key/模拟盘下 401/500 → 降级为纯期权观察）
 	var dcds []okx.DCDProduct
 	var warns []string
-	for _, ot := range []string{"C", "P"} {
+	for i, ot := range []string{"C", "P"} {
+		if i > 0 {
+			time.Sleep(1100 * time.Millisecond) // sfp/dcd 限速 1 req/s（User ID 级）
+		}
 		prods, err := c.GetDCDProducts(base, "USDT", ot)
 		if err != nil {
 			warns = append(warns, ot+": "+shortErr(err))
