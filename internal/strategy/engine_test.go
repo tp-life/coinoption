@@ -57,12 +57,12 @@ func goldenDCDProduct(productID, optType string, strike float64) okx.DCDProduct 
 		NotionalCcy:     notional,
 		OptType:         optType,
 		Uly:             "BTC-USD",
-		Strike:          strike,
-		AbsYield:        0.00232413,
-		AnnualizedYield: 0.0541,
-		MinSize:         10,
-		MaxSize:         6000000,
-		ExpTime:         goldenExpMS,
+		Strike:          okx.FlexReal(strike),
+		AbsYield:        okx.FlexReal(0.00232413),
+		AnnualizedYield: okx.FlexReal(0.0541),
+		MinSize:         okx.FlexReal(10),
+		MaxSize:         okx.FlexReal(6000000),
+		ExpTime:         okx.FlexInt(goldenExpMS),
 	}
 }
 
@@ -150,7 +150,7 @@ func TestCase2DCYBetter(t *testing.T) {
 func TestCase3NoOptionQuote(t *testing.T) {
 	// 45 天后的到期日，黄金 fixture 的期权链只有 25 天到期，无任何匹配候选
 	dcd := goldenDCDProduct("BTC-USDT-260511-54500-P", "P", 54500)
-	dcd.ExpTime = goldenExpMS + int64(45*86400*1000)
+	dcd.ExpTime = okx.FlexInt(goldenExpMS + int64(45*86400*1000))
 	ds := Build([]okx.DCDProduct{dcd}, goldenInstruments(), goldenTickers(),
 		map[string]float64{"BTC": goldenSpot}, goldenNow, DefaultParams())
 	d := ds[0]

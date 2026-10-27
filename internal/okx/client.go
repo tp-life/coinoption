@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -141,9 +142,63 @@ func (e *HTTPError) Retryable() bool {
 	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
 }
 
-// resp 统一响应外壳。
+// flexReal / flexInt 兼容两种 JSON 数值形态：
+// 金融产品端点数值为字符串（"annualizedYield":"0.242"），交易端点可能为裸数字。
+type flexReal float64
+type flexInt int64
+
+func (f *flexReal) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(b)), `"`)
+	if s == "null" || s == "" {
+		*f = 0
+		return nil
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return err
+	}
+	*f = flexReal(v)
+	return nil
+}
+
+func (i *flexInt) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(b)), `"`)
+	if s == "null" || s == "" {
+		*i = 0
+		return nil
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return err
+	}
+	*i = flexInt(v)
+	return nil
+}
+
+// flexCode 兼容 string/number 的错误码（双币赢端点返回数字 0，交易端点返回 "0"）。
+type flexCode string
+
+// FlexReal 宽容取值转换（供测试构造/业务换算）。
+func FlexReal(v float64) flexReal { return flexReal(v) }
+
+// FlexInt 宽容取值转换（供测试构造/业务换算）。
+func FlexInt(v int64) flexInt { return flexInt(v) }
+
+func (c *flexCode) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(b)), `"`)
+	*c = flexCode(s)
+	return nil
+}
+
+// OK 判断业务是否成功（"0"）。
+func (c flexCode) OK() bool { return c == "0" }
+
+// OKErr 判断是否成功。
+func (c flexCode) OKErr() bool { return c == "0" }
+
+// resp 统一响应外壳（code 兼容数字与字符串）。
 type resp struct {
-	Code string          `json:"code"`
+	Code flexCode        `json:"code"`
 	Msg  string          `json:"msg"`
 	Data json.RawMessage `json:"data"`
 }
@@ -252,8 +307,8 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body []byte) (
 	// 4xx/5xx 时 body 往往携带业务错误码（401 → {"code":"50105",...}），
 	// 优先按业务错误解析，给出可读性更好的 APIError。
 	var pre resp
-	if uerr := json.Unmarshal(raw, &pre); uerr == nil && pre.Code != "" && pre.Code != "0" {
-		return nil, &APIError{Code: pre.Code, Msg: pre.Msg}
+	if uerr := json.Unmarshal(raw, &pre); uerr == nil && pre.Code != "" && !pre.Code.OK() {
+		return nil, &APIError{Code: string(pre.Code), Msg: pre.Msg}
 	}
 
 	// 纯 HTTP 层错误：429 / 5xx 可重试（交给 request 循环）
@@ -270,8 +325,8 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body []byte) (
 	if err := json.Unmarshal(raw, &r); err != nil {
 		return nil, fmt.Errorf("decode body: %w (head=%s)", err, truncate(string(raw), 200))
 	}
-	if r.Code != "0" {
-		return nil, &APIError{Code: r.Code, Msg: r.Msg}
+	if !r.Code.OK() {
+		return nil, &APIError{Code: string(r.Code), Msg: r.Msg}
 	}
 	return r.Data, nil
 }

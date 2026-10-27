@@ -40,25 +40,25 @@ type DCDCurrencyPair struct {
 //   - notionalCcy  投资币种：optType=C → baseCcy（币本位高卖）；optType=P → quoteCcy（USDT 低买）
 //   - uly          与期权的底层指数一致（BTC-USD），可直接对齐期权链
 type DCDProduct struct {
-	ProductID           string  `json:"productId"` // BTC-USDT-260327-54500-P
-	BaseCcy             string  `json:"baseCcy"`
-	QuoteCcy            string  `json:"quoteCcy"`
-	NotionalCcy         string  `json:"notionalCcy"`
-	OptType             string  `json:"optType"` // C=看涨(高卖) | P=看跌(低买)
-	Uly                 string  `json:"uly"`     // BTC-USD
-	Strike              float64 `json:"strike"`
-	AbsYield            float64 `json:"absYield"`
-	AnnualizedYield     float64 `json:"annualizedYield"`
-	MinSize             float64 `json:"minSize"`
-	MaxSize             float64 `json:"maxSize"`
-	StepSz              float64 `json:"stepSz"`
-	ListTime            int64   `json:"listTime"`            // ms
-	ExpTime             int64   `json:"expTime"`             // 到期 ms
-	InterestAccrualTime int64   `json:"interestAccrualTime"` // 计息开始 ms
-	RedeemStartTime     int64   `json:"redeemStartTime"`     // 提前赎回开始 ms
-	RedeemEndTime       int64   `json:"redeemEndTime"`
-	TradeEndTime        int64   `json:"tradeEndTime"` // 申购截止 ms
-	QuoteTime           int64   `json:"quoteTime"`    // 报价生成 ms
+	ProductID           string   `json:"productId"` // BTC-USDT-260327-54500-P
+	BaseCcy             string   `json:"baseCcy"`
+	QuoteCcy            string   `json:"quoteCcy"`
+	NotionalCcy         string   `json:"notionalCcy"`
+	OptType             string   `json:"optType"` // C=看涨(高卖) | P=看跌(低买)
+	Uly                 string   `json:"uly"`     // BTC-USD
+	Strike              flexReal `json:"strike"`
+	AbsYield            flexReal `json:"absYield"`
+	AnnualizedYield     flexReal `json:"annualizedYield"`
+	MinSize             flexReal `json:"minSize"`
+	MaxSize             flexReal `json:"maxSize"`
+	StepSz              flexReal `json:"stepSz"`
+	ListTime            flexInt  `json:"listTime"`            // ms
+	ExpTime             flexInt  `json:"expTime"`             // 到期 ms
+	InterestAccrualTime flexInt  `json:"interestAccrualTime"` // 计息开始 ms
+	RedeemStartTime     flexInt  `json:"redeemStartTime"`     // 提前赎回开始 ms
+	RedeemEndTime       flexInt  `json:"redeemEndTime"`
+	TradeEndTime        flexInt  `json:"tradeEndTime"` // 申购截止 ms
+	QuoteTime           flexInt  `json:"quoteTime"`    // 报价生成 ms
 }
 
 // DCDQuoteRequest 报价请求。
@@ -83,7 +83,8 @@ type DCDQuote struct {
 
 // GetDCDCurrencyPairs 可用币对。
 func (c *Client) GetDCDCurrencyPairs() ([]DCDCurrencyPair, error) {
-	return wrap[DCDCurrencyPair](c.get(ctx(), pathDCDCurrencyPairs, nil))
+	raw, err := c.get(ctx(), pathDCDCurrencyPairs, nil)
+	return wrapKeys[DCDCurrencyPair](raw, err, "currencyPairs", "pairs", "data")
 }
 
 // GetDCDProducts 在售产品（baseCcy/quoteCcy/optType 均必填）。
@@ -94,7 +95,8 @@ func (c *Client) GetDCDProducts(baseCcy, quoteCcy, optType string) ([]DCDProduct
 		"quoteCcy": {quoteCcy},
 		"optType":  {optType},
 	}
-	return wrap[DCDProduct](c.get(ctx(), pathDCDProducts, q))
+	raw, err := c.get(ctx(), pathDCDProducts, q)
+	return wrapKeys[DCDProduct](raw, err, "products", "list")
 }
 
 // PostDCDQuote 阶段一：请求实时报价（quoteId 有有效期）。
@@ -140,7 +142,8 @@ func (c *Client) GetDCDOrderHistory(ordID, productID, uly, state string, limit i
 	if limit > 0 {
 		q.Set("limit", fmt.Sprintf("%d", limit))
 	}
-	return wrap[DCDOrder](c.get(ctx(), pathDCDOrderHistory, q))
+	raw, err := c.get(ctx(), pathDCDOrderHistory, q)
+	return wrapKeys[DCDOrder](raw, err, "orders", "list")
 }
 
 // DCDOrder 历史订单（持仓页/结算重放用）。

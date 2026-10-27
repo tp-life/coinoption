@@ -93,7 +93,7 @@ func Match(dcds []okx.DCDProduct, instruments []okx.Instrument, tickers []okx.Op
 	rows := make([]MatchRow, 0, len(dcds))
 
 	for _, d := range dcds {
-		exp := time.UnixMilli(d.ExpTime).UTC()
+		exp := time.UnixMilli(int64(d.ExpTime)).UTC()
 		base := d.BaseCcy
 		spotPrice := spot[base]
 
@@ -101,13 +101,13 @@ func Match(dcds []okx.DCDProduct, instruments []okx.Instrument, tickers []okx.Op
 			ProductID:  d.ProductID,
 			Uly:        d.Uly,
 			OptType:    rune(d.OptType[0]),
-			Strike:     d.Strike,
+			Strike:     float64(d.Strike),
 			InvestCcy:  d.NotionalCcy,
-			DcyMinSize: d.MinSize,
-			DcyMaxSize: d.MaxSize,
+			DcyMinSize: float64(d.MinSize),
+			DcyMaxSize: float64(d.MaxSize),
 			ExpTime:    exp,
 			Days:       exp.Sub(now).Hours() / 24,
-			DcyAPR:     NormalizeYield(d.AnnualizedYield),
+			DcyAPR:     NormalizeYield(float64(d.AnnualizedYield)),
 		}
 		if row.Days < 0 || row.DcyAPR <= 0 {
 			rows = append(rows, row) // 已到期/无报价产品不参与决策
@@ -126,7 +126,7 @@ func Match(dcds []okx.DCDProduct, instruments []okx.Instrument, tickers []okx.Op
 			if absDays < 0 || absDays > 1 {
 				continue
 			}
-			score := strikeGapPct(q.Strike, d.Strike, spotPrice) + absDays*0.01
+			score := strikeGapPct(q.Strike, float64(d.Strike), spotPrice) + absDays*0.01
 			if !found || score < bestScore {
 				bestScore = score
 				best = q
@@ -148,7 +148,7 @@ func Match(dcds []okx.DCDProduct, instruments []okx.Instrument, tickers []okx.Op
 		row.OptAPR = aprOpt
 		row.OptBidPx = best.BidPx
 		row.OptSettleCcy = best.SettleCcy
-		row.StrikeErrPct = strikeGapPct(best.Strike, d.Strike, spotPrice)
+		row.StrikeErrPct = strikeGapPct(best.Strike, float64(d.Strike), spotPrice)
 		row.Diff = aprOpt - row.DcyAPR
 		rows = append(rows, row)
 	}
