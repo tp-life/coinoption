@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -40,9 +41,10 @@ type Client struct {
 	passphrase string
 	flag       string // FlagLive | FlagDemo
 
-	baseURL string
-	http    *http.Client
-	limiter *rate.Limiter
+	baseURL   string
+	http      *http.Client
+	limiter   *rate.Limiter
+	retryBase time.Duration // 重试退避基数（测试可调小）
 }
 
 // NewClient 创建客户端。未提供 WithAuth 时为纯公开数据（无需密钥）。
@@ -55,7 +57,8 @@ func NewClient(opts ...Option) *Client {
 			Timeout: 5 * time.Second,
 		},
 		// 公开行情速率上限 20 req/2s，统一取 10 rps、burst 10 留余量
-		limiter: rate.NewLimiter(rate.Limit(10), 10),
+		limiter:   rate.NewLimiter(rate.Limit(10), 10),
+		retryBase: 400 * time.Millisecond,
 	}
 	for _, o := range opts {
 		o(c)
@@ -132,6 +135,7 @@ func (e *APIError) Error() string {
 type HTTPError struct {
 	StatusCode int
 	Head       string
+	RetryAfter time.Duration // 429 响应头 Retry-After（若有）
 }
 
 func (e *HTTPError) Error() string {
@@ -225,39 +229,119 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body any) (jso
 }
 
 // request 单次请求核心：签名、限速、重试、解析。
+//
+// 重试策略（M4 硬化）：
+//   - 网络错误 / 429 / 5xx：指数退避（400ms 起，带抖动，429 优先用 Retry-After），最多 2 次
+//   - 业务码 50011（限速）：请求未被处理，任何方法均可重试
+//   - 其余业务码：GET 的瞬时故障（50001/50026/50013/50004/50005）可重试；
+//     POST 一律不重试，避免「下单其实已成功、重试再下一单」的重复成交
 func (c *Client) request(ctx context.Context, method, path string, body []byte) (json.RawMessage, error) {
+	const maxAttempts = 3
 	var lastErr error
-	for attempt := 0; attempt <= 2; attempt++ { // 最多重试 2 次
-		if attempt > 0 {
-			// 429 / 5xx 退避后重试
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
-			}
-		}
-
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		if err := c.limiter.Wait(ctx); err != nil {
 			return nil, fmt.Errorf("rate limiter: %w", err)
 		}
 
 		raw, err := c.doOnce(ctx, method, path, body)
-		if err != nil {
-			lastErr = err
-			var apiErr *APIError
-			if asAPIError(err, &apiErr) {
-				// 业务错误码不重试（签名错误、参数错误等重试无意义）
-				return nil, err
-			}
-			var httpErr *HTTPError
-			if errors.As(err, &httpErr) && !httpErr.Retryable() {
-				return nil, err // 4XX（除 429）不重试
-			}
-			continue // 网络/5xx/429 才重试
+		if err == nil {
+			return raw, nil
 		}
-		return raw, nil
+		lastErr = err
+
+		delay, retry := c.retryDelay(method, err, attempt)
+		if !retry {
+			return nil, err
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
 	}
 	return nil, fmt.Errorf("retry exhausted: %w", lastErr)
+}
+
+// retryDelay 返回是否重试与本次退避时长。
+func (c *Client) retryDelay(method string, err error, attempt int) (time.Duration, bool) {
+	var apiErr *APIError
+	if asAPIError(err, &apiErr) {
+		if !retryableBusinessCode(method, apiErr.Code) {
+			return 0, false
+		}
+		return c.backoff(attempt, 0), true
+	}
+
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) {
+		if !httpErr.Retryable() {
+			return 0, false
+		}
+		return c.backoff(attempt, httpErr.RetryAfter), true
+	}
+	// 传输层错误（超时/连接重置/代理断流）可重试。
+	return c.backoff(attempt, 0), true
+}
+
+// retryableBusinessCode 判断业务错误码能否安全重试。
+func retryableBusinessCode(method, code string) bool {
+	if code == "50011" { // Too Many Requests：请求未进入撮合/申购
+		return true
+	}
+	if method != http.MethodGet {
+		return false // 写操作不重试，防重复下单
+	}
+	switch code {
+	case "50001", // Service temporarily unavailable
+		"50026", // System error
+		"50013", // Systems busy
+		"50004", // API timeout（GET 无副作用，可重试）
+		"50005": // API temporarily unavailable
+		return true
+	}
+	return false
+}
+
+// backoff 指数退避 + ±25% 抖动；Retry-After 优先，最长 5s。
+func (c *Client) backoff(attempt int, retryAfter time.Duration) time.Duration {
+	if retryAfter > 0 {
+		if retryAfter > 5*time.Second {
+			return 5 * time.Second
+		}
+		return retryAfter
+	}
+	base := c.retryBase
+	if base <= 0 {
+		base = 400 * time.Millisecond
+	}
+	d := base << (attempt - 1)
+	if d > 5*time.Second {
+		d = 5 * time.Second
+	}
+	if half := int64(d) / 4; half > 0 {
+		d += time.Duration(rand.Int63n(half))
+	}
+	return d
+}
+
+// parseRetryAfter 解析 Retry-After（秒数或 HTTP 日期）。
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 func asAPIError(err error, target **APIError) bool {
@@ -315,7 +399,10 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body []byte) (
 	// 纯 HTTP 层错误：429 / 5xx 可重试（交给 request 循环）
 	switch {
 	case httpResp.StatusCode == http.StatusTooManyRequests:
-		return nil, &HTTPError{StatusCode: httpResp.StatusCode}
+		return nil, &HTTPError{
+			StatusCode: httpResp.StatusCode,
+			RetryAfter: parseRetryAfter(httpResp.Header.Get("Retry-After")),
+		}
 	case httpResp.StatusCode >= 500:
 		return nil, &HTTPError{StatusCode: httpResp.StatusCode}
 	case httpResp.StatusCode != http.StatusOK:
