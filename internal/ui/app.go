@@ -15,6 +15,7 @@ import (
 	"github.com/tp/coinoption/internal/executor"
 	"github.com/tp/coinoption/internal/market"
 	"github.com/tp/coinoption/internal/okx"
+	"github.com/tp/coinoption/internal/store"
 	"github.com/tp/coinoption/internal/strategy"
 )
 
@@ -34,6 +35,10 @@ type positionsMsg struct {
 	v   executor.PositionsView
 	err error
 }
+type auditMsg struct {
+	rows []store.AuditEvent
+	err  error
+}
 
 // Executor TUI 侧执行依赖（read-only 模式可为 nil）。
 type Executor interface {
@@ -41,6 +46,7 @@ type Executor interface {
 	SubmitOption(instID string, sz, limPx float64) (executor.Outcome, error)
 	SubmitDCD(p okx.DCDProduct, amt float64) (executor.Outcome, error)
 	Positions() (executor.PositionsView, error)
+	Audit(n int) ([]store.AuditEvent, error)
 	State() executor.GuardState
 }
 
@@ -54,6 +60,7 @@ type viewID int
 const (
 	viewTable viewID = iota
 	viewPositions
+	viewAudit
 )
 
 type rowKind int
@@ -102,9 +109,12 @@ type App struct {
 	flashIsErr bool
 	guard      executor.GuardState
 
-	// 持仓视图缓存（异步刷新，避免每次渲染都打网络）
-	pos    *executor.PositionsView
-	posErr error
+	// 持仓/审计缓存（异步刷新，避免每次渲染都打网络）
+	pos      *executor.PositionsView
+	posErr   error
+	audit    []store.AuditEvent
+	auditErr error
+	auditOK  bool // 已成功读取过（区分「空日志」与「加载中」）
 }
 
 // New 创建 TUI 应用（executor 可为 nil → 只读推荐模式）。
@@ -140,14 +150,20 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		a.loading = true
-		return a, tea.Batch(fetchCmd(a), tickCmd())
+		cmds := []tea.Cmd{fetchCmd(a), tickCmd()}
+		switch a.view {
+		case viewPositions:
+			cmds = append(cmds, fetchPositionsCmd(a))
+		case viewAudit:
+			cmds = append(cmds, fetchAuditCmd(a, 200))
+		}
+		return a, tea.Batch(cmds...)
 
 	case snapMsg:
 		a.loading = false
 		if msg.err != nil {
+			// 保留上次成功快照：短暂网络抖动不清空决策表。
 			a.errMsg = msg.err.Error()
-			a.snap = nil
-			a.refs = nil
 		} else {
 			a.errMsg = ""
 			a.snap = msg.snap
@@ -169,7 +185,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if a.exec != nil {
 				a.guard = a.exec.State()
 			}
-			return a, fetchPositionsCmd(a)
+			return a, tea.Batch(fetchPositionsCmd(a), fetchAuditCmd(a, 200))
 		}
 		return a, nil
 
@@ -179,6 +195,14 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			v := msg.v
 			a.pos = &v
 			a.guard = v.Guard
+		}
+		return a, nil
+
+	case auditMsg:
+		a.auditErr = msg.err
+		if msg.err == nil {
+			a.audit = msg.rows
+			a.auditOK = true
 		}
 		return a, nil
 
@@ -225,6 +249,11 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return app, fetchPositionsCmd(app)
 			}
 			return app, nil
+		case "l", "4":
+			a.view = viewAudit
+			a.scroll = 0
+			a.flash = ""
+			return a, fetchAuditCmd(a, 200)
 		case "1":
 			a.view = viewTable
 			return a, nil
@@ -233,7 +262,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "d":
 			return a.startDCD()
 		}
-		if a.view == viewPositions {
+		if a.view == viewPositions || a.view == viewAudit {
 			switch msg.String() {
 			case "up", "k":
 				if a.scroll > 0 {
@@ -254,7 +283,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // View 渲染。
 func (a App) View() string {
 	title := titleStyle.Render("◈ coinoption") + "  " + a.modeChip() +
-		hintStyle.Render("  1 决策 / 3 持仓 · o 卖期权 · d 申购 · r 刷新 · q 退出")
+		hintStyle.Render("  1 决策 / 3 持仓 / 4 日志 · o 卖期权 · d 申购 · r 刷新 · q 退出")
 
 	header := a.headerLine()
 
@@ -262,6 +291,8 @@ func (a App) View() string {
 	switch {
 	case a.view == viewPositions:
 		body = a.positionsView()
+	case a.view == viewAudit:
+		body = a.auditView()
 	case a.snap == nil:
 		body = a.placeholder()
 	default:
@@ -332,6 +363,9 @@ func (a App) headerLine() string {
 	if s.Warn != "" {
 		line += "\n" + warnStyle.Render(" ⚠ "+s.Warn)
 	}
+	if a.errMsg != "" {
+		line += "\n" + errStyle.Render(" ✗ 刷新失败（显示上次数据，r 重试）: "+a.errMsg)
+	}
 	return line
 }
 
@@ -341,9 +375,11 @@ func (a App) footerLine() string {
 	}
 	switch a.view {
 	case viewPositions:
-		return "3/1 返回决策 · j/k 滚动 · --settle 命令结算到期纸面单"
+		return "3/1 返回决策 · j/k 滚动 · 4 日志 · --settle 命令结算到期纸面单"
+	case viewAudit:
+		return "4/1 返回决策 · j/k 滚动 · 最新 200 条（submit/reject/settle/restore）"
 	default:
-		return "o 卖期权（选中“押注期权”行）/ d 申购双币赢（选中“投注双币赢”行）· p 持仓"
+		return "o 卖期权（选中“押注期权”行）/ d 申购双币赢（选中“投注双币赢”行）· p 持仓 · l 日志"
 	}
 }
 
@@ -358,16 +394,75 @@ func (a App) positionsView() string {
 	if a.pos == nil {
 		return infoStyle.Render("  ⏳ 读取持仓…")
 	}
-	lines := a.pos.Lines()
+	return a.window(a.pos.Lines())
+}
+
+// auditView 渲染审计日志（最新在前，事件着色）。
+func (a App) auditView() string {
+	if a.exec == nil {
+		return warnStyle.Render("  未接入执行器：仅推荐模式")
+	}
+	if a.auditErr != nil {
+		return errStyle.Render("  ✗ 审计读取失败: " + a.auditErr.Error())
+	}
+	if !a.auditOK {
+		return infoStyle.Render("  ⏳ 读取审计日志…")
+	}
+	if len(a.audit) == 0 {
+		return hintStyle.Render("  （暂无审计事件：下单/拒单/结算/恢复都会记录）")
+	}
+	var lines []string
+	for _, e := range a.audit {
+		head := fmt.Sprintf("%s %-7s %-28s",
+			e.Ts.Local().Format("01-02 15:04:05"), e.Event, trimTo(e.Subject, 28))
+		tail := ""
+		if e.AmtUSDT > 0 {
+			tail += fmt.Sprintf(" %.2f USDT", e.AmtUSDT)
+		}
+		if e.Reason != "" {
+			tail += " " + e.Reason
+		}
+		if e.Detail != "" {
+			tail += " " + e.Detail
+		}
+		lines = append(lines, eventStyle(e.Event).Render(head)+hintStyle.Render(tail))
+	}
+	return a.window(lines)
+}
+
+// window 按可视高度截取并应用滚动偏移。
+func (a App) window(lines []string) string {
 	h := a.height - 6
 	if h < 5 {
 		h = 20
 	}
-	if a.scroll > max(0, len(lines)-h) {
-		a.scroll = max(0, len(lines)-h)
+	start := a.scroll
+	if start > max(0, len(lines)-h) {
+		start = max(0, len(lines)-h)
 	}
-	end := min(len(lines), a.scroll+h)
-	return strings.Join(lines[a.scroll:end], "\n")
+	end := min(len(lines), start+h)
+	return strings.Join(lines[start:end], "\n")
+}
+
+func eventStyle(ev string) lipgloss.Style {
+	switch ev {
+	case "reject", "error":
+		return errStyle
+	case "submit":
+		return primaryStyle
+	case "settle", "release":
+		return okStyle
+	default:
+		return infoStyle
+	}
+}
+
+func trimTo(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
 }
 
 // orderPanel 数量输入 / 二次确认面板。
@@ -389,18 +484,24 @@ func (a App) orderPanel() string {
 		g := a.exec.State()
 		lines = append(lines, fmt.Sprintf("  当前敞口 %.2f / %.0f USDT（本单后约 %.2f）",
 			g.ExposureUSDT, g.Limits.TotalExposureUSDT,
-			g.ExposureUSDT+estimateExposure(d)))
+			g.ExposureUSDT+a.estimateExposure(d)))
 	}
 	lines = append(lines, "  "+okStyle.Render("y 确认")+"  "+errStyle.Render("n/Esc 取消"))
 	return strings.Join(lines, "\n")
 }
 
-func estimateExposure(d *orderDraft) float64 {
-	// 期权单张名义 = ctVal × 现货（BTC 约 1 BTC/张），只能粗估。
-	if d.kind == "option" {
-		return 0 // 未知现价，展示上不估算
+func (a App) estimateExposure(d *orderDraft) float64 {
+	if a.snap == nil {
+		return 0
 	}
-	return d.amt
+	if d.kind == "option" {
+		// 单张名义 = ctVal × 现货；BTC/ETH/SOL 期权 ctVal 均为 1 个币。
+		return d.sz * a.snap.SpotPrice
+	}
+	if d.product.NotionalCcy == "USDT" {
+		return d.amt
+	}
+	return d.amt * a.snap.SpotPrice // 投资币种为币时按现价粗估
 }
 
 // ─── 下单动作 ───
@@ -546,6 +647,13 @@ func fetchCmd(a App) tea.Cmd {
 	return func() tea.Msg {
 		snap, err := a.fetcher.FetchSnapshot(a.uly)
 		return snapMsg{snap: snap, err: err}
+	}
+}
+
+func fetchAuditCmd(a App, n int) tea.Cmd {
+	return func() tea.Msg {
+		rows, err := a.exec.Audit(n)
+		return auditMsg{rows: rows, err: err}
 	}
 }
 

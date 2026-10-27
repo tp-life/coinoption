@@ -199,3 +199,18 @@ func (e *Executor) SyncLiveGuard() (string, error) {
 	_ = e.st.Audit(store.AuditEvent{Event: "restore", Mode: string(e.mode), Detail: msg})
 	return msg, nil
 }
+
+// Audit 最近 n 条审计事件（TUI 日志页；最新在前）。
+func (e *Executor) Audit(n int) ([]store.AuditEvent, error) {
+	rows, err := e.st.LoadAudit()
+	if err != nil {
+		return nil, err
+	}
+	if n > 0 && len(rows) > n {
+		rows = rows[len(rows)-n:]
+	}
+	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+		rows[i], rows[j] = rows[j], rows[i]
+	}
+	return rows, nil
+}
