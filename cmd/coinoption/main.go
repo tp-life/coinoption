@@ -9,14 +9,17 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/tp/coinoption/internal/okx"
+	"github.com/tp/coinoption/internal/strategy"
 )
 
 func main() {
 	smoke := flag.Bool("smoke", false, "对 OKX 公开行情做冒烟测试（无需 API Key）")
+	dump := flag.Bool("dump", false, "拉取实时行情并输出比对决策 CSV（双币赢部分需 API Key）")
 	uly := flag.String("uly", "BTC-USDT", "标的（BTC-USDT | ETH-USDT | SOL-USDT）")
 	proxy := flag.String("proxy", os.Getenv("COINOPTION_PROXY"), "HTTP/SOCKS5 代理地址，空则直连；也可用环境变量 COINOPTION_PROXY")
 	apiKey := flag.String("key", os.Getenv("COINOPTION_API_KEY"), "API Key（环境变量 COINOPTION_API_KEY）")
@@ -28,6 +31,11 @@ func main() {
 	case *smoke:
 		if err := runSmoke(*uly, *proxy, *apiKey, *secret, *passphrase); err != nil {
 			fmt.Fprintf(os.Stderr, "smoke failed: %v\n", err)
+			os.Exit(1)
+		}
+	case *dump:
+		if err := runDump(*uly, *proxy, *apiKey, *secret, *passphrase); err != nil {
+			fmt.Fprintf(os.Stderr, "dump failed: %v\n", err)
 			os.Exit(1)
 		}
 	default:
@@ -131,4 +139,83 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// runDump 实时数据 → strategy.Build → CSV 决策输出（M1 验证通道）。
+func runDump(uly, proxy, apiKey, secret, passphrase string) error {
+	opts := []okx.Option{}
+	if proxy != "" {
+		opts = append(opts, okx.WithProxy(proxy))
+	}
+	hasKey := apiKey != "" && secret != "" && passphrase != ""
+	if hasKey {
+		opts = append(opts, okx.WithAuth(apiKey, secret, passphrase))
+	}
+	c := okx.NewClient(opts...)
+
+	// DCY 基础币种（BTC-USDT → BTC）；期权底层自动降级 USD
+	parts := strings.Split(uly, "-")
+	base := parts[0]
+	optionUly := uly
+	instruments, err := c.GetOptionInstruments(optionUly)
+	if (err != nil || len(instruments) == 0) && strings.HasSuffix(uly, "-USDT") {
+		optionUly = base + "-USD"
+		if ins2, err2 := c.GetOptionInstruments(optionUly); err2 == nil && len(ins2) > 0 {
+			instruments = ins2
+		}
+	}
+
+	// 现价（用 optionUly 的底层对应 BTC 现价）
+	spots, err := c.GetSpotTicker(uly)
+	if err != nil {
+		return fmt.Errorf("spot ticker: %w", err)
+	}
+	spotPrice := 0.0
+	if len(spots) > 0 {
+		spotPrice, _ = strconv.ParseFloat(spots[0].Last, 64)
+	}
+
+	tickers, err := c.GetOptionTickers(optionUly)
+	if err != nil {
+		return fmt.Errorf("option tickers: %w", err)
+	}
+	spotMap := map[string]float64{base: spotPrice}
+
+	// DCY：C 和 P 两个方向逐个拉（1次/s 限速）
+	var dcds []okx.DCDProduct
+	for _, ot := range []string{"C", "P"} {
+		prods, err := c.GetDCDProducts(base, "USDT", ot)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[warn] dcd products(%s): %v（需 API Key；期权侧仍会输出）\n", ot, err)
+			continue
+		}
+		dcds = append(dcds, prods...)
+	}
+
+	// 期权侧单跑：无 DCY 产品时把 MatchRow 退化为纯期权方向观察
+	var decisions []strategy.Decision
+	if len(dcds) > 0 {
+		decisions = strategy.Build(dcds, instruments, tickers, spotMap, time.Now(), strategy.DefaultParams())
+	} else {
+		rows := strategy.Match(nil, instruments, tickers, spotMap, time.Now())
+		for _, r := range rows {
+			decisions = append(decisions, strategy.Decide(r, strategy.DefaultParams()))
+		}
+	}
+	strategy.Sort(decisions)
+
+	fmt.Printf("# %s spot=%.2f optionUly=%s dcdProducts=%d decisions=%d @%s\n",
+		uly, spotPrice, optionUly, len(dcds), len(decisions), time.Now().Format(time.RFC3339))
+	fmt.Println("product,optType,strike,dcyApr%,optInstId,optApr%,diff%,days,strikeErr%,action,reason,amount")
+	for _, d := range decisions {
+		r := d.Row
+		opt := "-"
+		if r.OptMatched {
+			opt = r.OptInstID
+		}
+		fmt.Printf("%s,%c,%.0f,%.4f,%s,%.4f,%.4f,%.1f,%.3f,%s,%s,%.2f %s\n",
+			r.ProductID, r.OptType, r.Strike, r.DcyAPR*100, opt, r.OptAPR*100, r.Diff*100,
+			r.Days, r.StrikeErrPct, d.Action, d.ReasonCode, d.SuggestedAmt, r.InvestCcy)
+	}
+	return nil
 }

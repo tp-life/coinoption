@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -112,6 +113,21 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("okx api error: code=%s msg=%s", e.Code, e.Msg)
 }
 
+// HTTPError HTTP 层错误：429/5xx 可重试，其余 4xx 不可重试。
+type HTTPError struct {
+	StatusCode int
+	Head       string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("http %d: %s", e.StatusCode, e.Head)
+}
+
+// Retryable 判断是否可重试。
+func (e *HTTPError) Retryable() bool {
+	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
+}
+
 // resp 统一响应外壳。
 type resp struct {
 	Code string          `json:"code"`
@@ -163,6 +179,10 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte) 
 			if asAPIError(err, &apiErr) {
 				// 业务错误码不重试（签名错误、参数错误等重试无意义）
 				return nil, err
+			}
+			var httpErr *HTTPError
+			if errors.As(err, &httpErr) && !httpErr.Retryable() {
+				return nil, err // 4XX（除 429）不重试
 			}
 			continue // 网络/5xx/429 才重试
 		}
@@ -219,11 +239,11 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body []byte) (
 	// HTTP 层错误：429 / 5xx 可重试（交给 request 循环）
 	switch {
 	case httpResp.StatusCode == http.StatusTooManyRequests:
-		return nil, fmt.Errorf("http 429 rate limited")
+		return nil, &HTTPError{StatusCode: httpResp.StatusCode}
 	case httpResp.StatusCode >= 500:
-		return nil, fmt.Errorf("http %d server error", httpResp.StatusCode)
+		return nil, &HTTPError{StatusCode: httpResp.StatusCode}
 	case httpResp.StatusCode != http.StatusOK:
-		return nil, fmt.Errorf("http %d: %s", httpResp.StatusCode, truncate(string(raw), 300))
+		return nil, &HTTPError{StatusCode: httpResp.StatusCode, Head: truncate(string(raw), 300)}
 	}
 
 	var r resp
