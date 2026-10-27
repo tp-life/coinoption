@@ -1,0 +1,13 @@
+# bin
+/bin/
+# build
+/coinoption
+# test artifacts
+*.out
+coverage.html
+# local config/keys
+configs/config.local.toml
+.env
+# sqlite data
+*.db
+*.sqlite
