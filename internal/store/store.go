@@ -231,3 +231,60 @@ func rewriteAll[T any](path string, rows []T, _ T) error {
 }
 
 func normalizeState(st string) string { return st }
+
+// Settings 用户可调参数（settings.json，单对象覆盖写）。
+//
+// AutoTrade 是「自动执行」总开关：默认关闭；live 模式启动时会被强制关闭，
+// 必须在当次会话的 Settings 页重新确认开启（防止重启后无声自动下单）。
+type Settings struct {
+	MinOptionEdgePP float64 `json:"minOptionEdgePp"` // 期权须高出 DCY 的百分点（20 = 20pp）
+	MaxStrikeGapPct float64 `json:"maxStrikeGapPct"` // 行权价相对现价最大偏差（%）
+	AutoTrade       bool    `json:"autoTrade"`
+}
+
+// DefaultSettings 生产默认值（与 strategy.DefaultParams 对齐）。
+func DefaultSettings() Settings {
+	return Settings{
+		MinOptionEdgePP: 20,
+		MaxStrikeGapPct: 0.5,
+		AutoTrade:       false,
+	}
+}
+
+// LoadSettings 读取配置；文件不存在或字段缺失时回落到默认值（不报错）。
+func (s *Store) LoadSettings() (Settings, error) {
+	out := DefaultSettings()
+	b, err := os.ReadFile(s.path("settings.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return out, nil
+		}
+		return out, err
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		return DefaultSettings(), fmt.Errorf("parse settings.json: %w", err)
+	}
+	// 防御非法值（手改文件导致下单参数失效）。
+	if out.MinOptionEdgePP <= 0 {
+		out.MinOptionEdgePP = 20
+	}
+	if out.MaxStrikeGapPct <= 0 {
+		out.MaxStrikeGapPct = 0.5
+	}
+	return out, nil
+}
+
+// SaveSettings 覆盖写配置（临时文件 + rename，避免半截文件）。
+func (s *Store) SaveSettings(v Settings) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := s.path("settings.json.tmp")
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.path("settings.json"))
+}

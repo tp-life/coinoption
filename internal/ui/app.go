@@ -3,6 +3,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -19,7 +20,15 @@ import (
 	"github.com/tp/coinoption/internal/strategy"
 )
 
-const refreshEvery = 20 * time.Second
+const (
+	refreshEvery = 20 * time.Second
+	autoCooldown = 60 * time.Second // 自动执行最小间隔（防抖/防连环下单）
+)
+
+// ParamSetter 可选能力：行情 fetcher 接受策略参数热更新。
+type ParamSetter interface {
+	SetParams(strategy.Params)
+}
 
 type tickMsg struct{}
 type snapMsg struct {
@@ -47,6 +56,8 @@ type Executor interface {
 	SubmitDCD(p okx.DCDProduct, amt float64) (executor.Outcome, error)
 	Positions() (executor.PositionsView, error)
 	Audit(n int) ([]store.AuditEvent, error)
+	LoadSettings() (store.Settings, error)
+	SaveSettings(store.Settings) error
 	State() executor.GuardState
 }
 
@@ -61,6 +72,7 @@ const (
 	viewTable viewID = iota
 	viewPositions
 	viewAudit
+	viewSettings
 )
 
 type rowKind int
@@ -73,6 +85,13 @@ const (
 type rowRef struct {
 	kind rowKind
 	idx  int
+}
+
+func (d orderDraft) key() string {
+	if d.kind == "option" {
+		return "opt|" + d.instID
+	}
+	return "dcd|" + d.product.ProductID
 }
 
 type orderDraft struct {
@@ -115,6 +134,17 @@ type App struct {
 	audit    []store.AuditEvent
 	auditErr error
 	auditOK  bool // 已成功读取过（区分「空日志」与「加载中」）
+
+	// Settings / 自动执行
+	params          strategy.Params
+	settings        store.Settings
+	setter          ParamSetter // nil → 参数改动只影响本地展示（无热更新）
+	autoOn          bool
+	autoSince       time.Time
+	autoDone        map[string]bool
+	autoCount       int
+	autoNote        string
+	liveConfirmAuto bool // live 模式开启自动执行的二次确认层
 }
 
 // New 创建 TUI 应用（executor 可为 nil → 只读推荐模式）。
@@ -124,13 +154,50 @@ func New(f Fetcher, exec Executor, uly string) App {
 	ti.Placeholder = "数量"
 	ti.CharLimit = 24
 	ti.Width = 24
-	return App{
-		fetcher: f,
-		exec:    exec,
-		uly:     uly,
-		table:   t,
-		input:   ti,
+
+	// 载入用户设置（无 executor → 只读推荐，用默认值）。
+	st := store.DefaultSettings()
+	if exec != nil {
+		if v, err := exec.LoadSettings(); err == nil {
+			st = v
+		}
 	}
+	p := strategy.DefaultParams()
+	p.MinOptionEdge = st.MinOptionEdgePP / 100
+	p.MaxStrikeGapPct = st.MaxStrikeGapPct
+	if exec != nil {
+		// 建议金额跟随 executor 单笔上限，避免默认值天生超限。
+		if lim := exec.State().Limits.PerOrderUSDT; lim > 0 {
+			p.CapitalCap = lim
+		}
+	}
+
+	a := App{
+		fetcher:  f,
+		exec:     exec,
+		uly:      uly,
+		table:    t,
+		input:    ti,
+		params:   p,
+		settings: st,
+		autoOn:   st.AutoTrade,
+		autoDone: map[string]bool{},
+	}
+	if setter, ok := f.(ParamSetter); ok {
+		setter.SetParams(p)
+		a.setter = setter
+	}
+	a.seedAutoDone()
+
+	// 实盘安全闸：自动执行不跨进程延续，必须当次会话重新确认。
+	if exec != nil && exec.Mode() == executor.ModeLive && a.autoOn {
+		a.autoOn = false
+		a.settings.AutoTrade = false
+		_ = exec.SaveSettings(a.settings)
+		a.flash = "实盘启动：自动执行已强制关闭，需在 Settings 页当次确认开启"
+		a.flashIsErr = true
+	}
+	return a
 }
 
 // Init 初始化：立即拉取 + 定时刷新 + live 平台恢复（异步）。
@@ -172,6 +239,19 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if a.exec != nil {
 			a.guard = a.exec.State()
+		}
+		if a.autoOn && a.exec != nil && msg.err == nil {
+			if d, note := a.autoCandidate(); d != nil {
+				a.autoCount++
+				a.autoSince = time.Now()
+				a.autoDone[d.key()] = true
+				a.autoNote = "自动提交：" + d.label
+				a.flash = "⚙ " + a.autoNote
+				a.flashIsErr = false
+				return a, submitDraftCmd(a, *d)
+			} else if note != "" {
+				a.autoNote = note
+			}
 		}
 		return a, nil
 
@@ -236,7 +316,49 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return a, nil
 		}
-		// 3) 全局键
+		// 3) 实盘开启自动执行确认层
+		if a.liveConfirmAuto {
+			switch msg.String() {
+			case "y", "Y":
+				a.liveConfirmAuto = false
+				a.autoOn = true
+				a.settings.AutoTrade = true
+				a.persistSettings()
+				a.flash = "⚠ 实盘自动执行已开启（每 60s 最多 1 单，受风控硬上限约束）"
+				a.flashIsErr = true
+			case "n", "N", "esc":
+				a.liveConfirmAuto = false
+				a.flash = "已取消（自动执行保持关闭）"
+				a.flashIsErr = false
+			}
+			return a, nil
+		}
+		// 4) Settings 页键位（o/d 等下单键在该页禁用）
+		if a.view == viewSettings {
+			switch msg.String() {
+			case "a":
+				return a.toggleAuto(), nil
+			case "]":
+				return a.adjustThreshold(5)
+			case "[":
+				return a.adjustThreshold(-5)
+			case "1", "esc":
+				a.view = viewTable
+			case "q", "ctrl+c":
+				return a, tea.Quit
+			case "r":
+				a.loading = true
+				return a, fetchCmd(a)
+			case "up", "k":
+				if a.scroll > 0 {
+					a.scroll--
+				}
+			case "down", "j":
+				a.scroll++
+			}
+			return a, nil
+		}
+		// 5) 全局键
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return a, tea.Quit
@@ -254,6 +376,11 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.scroll = 0
 			a.flash = ""
 			return a, fetchAuditCmd(a, 200)
+		case "s", "5":
+			a.view = viewSettings
+			a.scroll = 0
+			a.flash = ""
+			return a, nil
 		case "1":
 			a.view = viewTable
 			return a, nil
@@ -283,7 +410,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // View 渲染。
 func (a App) View() string {
 	title := titleStyle.Render("◈ coinoption") + "  " + a.modeChip() +
-		hintStyle.Render("  1 决策 / 3 持仓 / 4 日志 · o 卖期权 · d 申购 · r 刷新 · q 退出")
+		hintStyle.Render("  1 决策 / 3 持仓 / 4 日志 / 5 设置 · o 卖期权 · d 申购 · r 刷新 · q 退出")
 
 	header := a.headerLine()
 
@@ -293,6 +420,8 @@ func (a App) View() string {
 		body = a.positionsView()
 	case a.view == viewAudit:
 		body = a.auditView()
+	case a.view == viewSettings:
+		body = a.settingsView()
 	case a.snap == nil:
 		body = a.placeholder()
 	default:
@@ -301,6 +430,9 @@ func (a App) View() string {
 
 	foot := footerStyle.Render(a.footerLine())
 	out := title + "\n" + header + "\n" + body + "\n" + foot
+	if a.liveConfirmAuto {
+		out += "\n" + a.autoConfirmPanel()
+	}
 	if a.inputMode || a.draft != nil {
 		out += "\n" + a.orderPanel()
 	}
@@ -349,6 +481,9 @@ func (a App) headerLine() string {
 	parts = append(parts, hintStyle.Render("更新 "+s.At.Local().Format("15:04:05")))
 	g := a.guard
 	if a.exec != nil {
+		if a.autoOn {
+			parts = append(parts, warnStyle.Render("⚙ 自动执行"))
+		}
 		parts = append(parts, fmt.Sprintf("敞口 %.0f/%.0f · 在持 %d/%d",
 			g.ExposureUSDT, g.Limits.TotalExposureUSDT, g.OpenCount, g.Limits.MaxConcurrent))
 	}
@@ -378,9 +513,225 @@ func (a App) footerLine() string {
 		return "3/1 返回决策 · j/k 滚动 · 4 日志 · --settle 命令结算到期纸面单"
 	case viewAudit:
 		return "4/1 返回决策 · j/k 滚动 · 最新 200 条（submit/reject/settle/restore）"
+	case viewSettings:
+		return "a 自动执行开关 · [ / ] 阈值 ±5pp · 1/Esc 返回 · 重启后需重新确认"
 	default:
 		return "o 卖期权（选中“押注期权”行）/ d 申购双币赢（选中“投注双币赢”行）· p 持仓 · l 日志"
 	}
+}
+
+// settingsView 设置页（策略参数 + 自动执行开关 + 风控只读展示）。
+func (a App) settingsView() string {
+	if a.exec == nil {
+		return warnStyle.Render("  未接入执行器：设置不可用（只读推荐模式）")
+	}
+	g := a.exec.State()
+	autoTxt := errStyle.Render("关闭")
+	if a.autoOn {
+		autoTxt = okStyle.Render("开启")
+	}
+	lines := []string{
+		fmt.Sprintf("模式 %s  ·  标的 %s  ·  参数文件 settings.json", a.exec.Mode(), a.uly),
+		"",
+		"策略参数（[ / ] 调整阈值 ±5pp，下一次刷新生效）",
+		fmt.Sprintf("  期权边际阈值  : %.0f pp   （期权 APR 高出 DCY 不足此值 → 投注双币赢）", a.settings.MinOptionEdgePP),
+		fmt.Sprintf("  行权价最大偏差: %.2f%%", a.settings.MaxStrikeGapPct),
+		fmt.Sprintf("  期限窗口      : %.0f–%.0f 天（固定）", a.params.DaysMin, a.params.DaysMax),
+		fmt.Sprintf("  单笔建议上限  : %.0f USDT", a.params.CapitalCap),
+		"",
+		"风控硬上限（executor 强制，只读；启动时用 --limits 覆盖）",
+		fmt.Sprintf("  单笔 %.0f / 总敞口 %.0f USDT · 并行 %d 笔 · 日限 %d 笔",
+			g.Limits.PerOrderUSDT, g.Limits.TotalExposureUSDT, g.Limits.MaxConcurrent, g.Limits.MaxSessionsPerDay),
+		fmt.Sprintf("  实时：敞口 %.2f USDT · 在持 %d 笔 · 今日 %d 笔", g.ExposureUSDT, g.OpenCount, g.DayCount),
+		"",
+		"自动执行：按 a 切换 —— 当前 " + autoTxt,
+		fmt.Sprintf("  本次会话已自动提交 %d 单（同一产品/合约只做一次，间隔 ≥60s，每轮最多 1 单）", a.autoCount),
+		hintStyle.Render("  期权张数按 单笔上限÷现价 取整；BTC 默认 2000 USDT 不足 1 张 → 自动流向 DCY 申购"),
+	}
+	if a.exec.Mode() == executor.ModeLive {
+		lines = append(lines, warnStyle.Render("  ⚠ live 模式：开启需 y 二次确认；进程重启后强制回到关闭"))
+	}
+	if a.autoNote != "" {
+		lines = append(lines, "", "最近："+a.autoNote)
+	}
+	return a.window(lines)
+}
+
+// autoConfirmPanel 实盘开启自动执行的二次确认。
+func (a App) autoConfirmPanel() string {
+	return warnStyle.Render("┌ 开启实盘自动执行") + "\n" +
+		"  将按策略自动提交订单（仍受风控硬上限约束）。\n" +
+		"  进程重启后不会自动恢复，需重新确认。\n" +
+		"  " + okStyle.Render("y 确认开启") + "  " + errStyle.Render("n/Esc 取消")
+}
+
+// seedAutoDone 用已有持仓播种去重表：进程重启后不会对同一产品/合约重复自动下单。
+// 平台取数失败只影响去重强度（风控敞口仍由 executor 硬性约束）。
+func (a *App) seedAutoDone() {
+	if a.exec == nil {
+		return
+	}
+	pos, err := a.exec.Positions()
+	if err != nil {
+		return
+	}
+	for _, o := range pos.Sim {
+		if o.State != "open" {
+			continue
+		}
+		if o.Kind == "option" {
+			a.autoDone["opt|"+o.ProductID] = true
+		} else {
+			a.autoDone["dcd|"+o.ProductID] = true
+		}
+	}
+	for _, d := range pos.LiveDCD {
+		if d.State == "" || d.State == "open" {
+			a.autoDone["dcd|"+d.ProductID] = true
+		}
+	}
+	for _, p := range pos.LiveOptions {
+		a.autoDone["opt|"+p.InstID] = true
+	}
+}
+
+// toggleAuto 切换自动执行（live 需二次确认）。
+func (a App) toggleAuto() App {
+	if a.exec == nil {
+		a.flash, a.flashIsErr = "未接入执行器（只读模式）", true
+		return a
+	}
+	if !a.autoOn && a.exec.Mode() == executor.ModeLive {
+		a.liveConfirmAuto = true
+		return a
+	}
+	a.autoOn = !a.autoOn
+	a.settings.AutoTrade = a.autoOn
+	if !a.persistSettings() {
+		return a
+	}
+	if a.autoOn {
+		a.flash, a.flashIsErr = "⚙ 自动执行已开启（每 60s 最多 1 单，风控硬上限仍然生效）", false
+	} else {
+		a.flash, a.flashIsErr = "自动执行已关闭", false
+	}
+	return a
+}
+
+// adjustThreshold 调整期权边际阈值（百分点）。
+func (a App) adjustThreshold(delta float64) (tea.Model, tea.Cmd) {
+	pp := a.settings.MinOptionEdgePP + delta
+	if pp < 5 {
+		pp = 5
+	}
+	if pp > 100 {
+		pp = 100
+	}
+	a.settings.MinOptionEdgePP = pp
+	a.params.MinOptionEdge = pp / 100
+	if a.setter != nil {
+		a.setter.SetParams(a.params)
+	}
+	if a.persistSettings() {
+		a.flash = fmt.Sprintf("阈值 → %.0f pp（下一次刷新生效，r 立即刷新）", pp)
+		a.flashIsErr = false
+	}
+	return a, nil
+}
+
+// persistSettings 落盘；失败时写 flash 并返回 false（本次会话仍生效）。
+func (a App) persistSettings() bool {
+	if a.exec == nil {
+		return false
+	}
+	if err := a.exec.SaveSettings(a.settings); err != nil {
+		a.flash, a.flashIsErr = "✗ 设置保存失败（仅本次生效）: "+err.Error(), true
+		return false
+	}
+	return true
+}
+
+// autoCandidate 选本轮自动执行标的：按策略排序取第一笔「可下单且未自动做过」的候选。
+func (a App) autoCandidate() (*orderDraft, string) {
+	if a.snap == nil {
+		return nil, ""
+	}
+	if !a.autoSince.IsZero() && time.Since(a.autoSince) < autoCooldown {
+		return nil, ""
+	}
+	g := a.exec.State()
+	if g.DayRemaining <= 0 || g.OpenCount >= g.Limits.MaxConcurrent {
+		return nil, "自动跳过：并发或日笔数已达上限"
+	}
+	remaining := math.Min(g.Limits.PerOrderUSDT, g.RemainingUSDT)
+	if remaining <= 0 {
+		return nil, "自动跳过：单笔/总敞口额度已用尽"
+	}
+	spot := a.snap.SpotPrice
+
+	for _, d := range a.snap.Decisions {
+		switch d.Action {
+		case strategy.ActionBuyOption:
+			if !d.Row.OptMatched || spot <= 0 {
+				continue
+			}
+			sz := math.Floor(remaining / spot)
+			if sz < 1 {
+				continue // 单笔上限不足 1 张（BTC 默认额度即是此情形）
+			}
+			sz = math.Min(sz, 20) // 单轮防手滑上限
+			key := "opt|" + d.Row.OptInstID
+			if a.autoDone[key] {
+				continue
+			}
+			return &orderDraft{
+				kind:   "option",
+				instID: d.Row.OptInstID,
+				sz:     sz,
+				label: fmt.Sprintf("卖出 %s %.0f 张（期权 APR %.1f%% vs DCY %.1f%%，差 %.1fpp）",
+					d.Row.OptInstID, sz, d.Row.OptAPR*100, d.Row.DcyAPR*100, d.Row.Diff*100),
+			}, ""
+		case strategy.ActionSubscribeDual:
+			prod, ok := a.snap.Products[d.Row.ProductID]
+			if !ok {
+				continue
+			}
+			key := "dcd|" + prod.ProductID
+			if a.autoDone[key] {
+				continue
+			}
+			amt := d.SuggestedAmt
+			if amt <= 0 {
+				amt = remaining
+			}
+			if prod.NotionalCcy == "USDT" {
+				amt = math.Min(amt, remaining)
+			} else {
+				if spot <= 0 {
+					continue
+				}
+				amt = math.Min(amt, remaining/spot)
+			}
+			if prod.MinSize > 0 && amt < float64(prod.MinSize) {
+				continue
+			}
+			if prod.MaxSize > 0 && amt > float64(prod.MaxSize) {
+				amt = float64(prod.MaxSize)
+			}
+			if amt <= 0 {
+				continue
+			}
+			amt = math.Round(amt*1e8) / 1e8
+			return &orderDraft{
+				kind:    "dcd",
+				product: prod,
+				amt:     amt,
+				label: fmt.Sprintf("申购 %s %.4f %s（DCY APR %.1f%% vs 期权 %.1f%%，差 %.1fpp）",
+					prod.ProductID, amt, prod.NotionalCcy, d.Row.DcyAPR*100, d.Row.OptAPR*100, d.Row.Diff*100),
+			}, ""
+		}
+	}
+	return nil, "自动等待：本轮无可执行候选（额度不足或无对齐机会）"
 }
 
 // positionsView 渲染持仓视图（缓存 + 异步刷新；j/k 滚动）。

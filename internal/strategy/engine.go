@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/tp/coinoption/internal/okx"
@@ -70,19 +71,26 @@ func Build(dcds []okx.DCDProduct, instruments []okx.Instrument, tickers []okx.Op
 
 // clampCap 依据 DCY 产品的最小/最大申购规模与资金上限计算建议金额。
 // 上限 < 产品最小规模或产品无有效规模区间 → 返回 0（executor 侧拒绝）。
-// TODO(M3): capUSDT 为 USDT 口径，投资币种为 BTC/USDT 时需经现货价换算再校验。
+// capUSDT 为 USDT 口径；投资币种非 USDT 时按现价换算（BTC 产品极易触发上限）。
 func clampCap(row MatchRow, capUSDT float64) float64 {
 	if capUSDT <= 0 {
 		return 0
 	}
 	amt := capUSDT
+	if row.InvestCcy != "" && row.InvestCcy != "USDT" {
+		if row.Spot <= 0 {
+			return 0 // 无现价无法安全换算
+		}
+		amt = capUSDT / row.Spot
+	}
 	if row.DcyMaxSize > 0 && amt > row.DcyMaxSize {
 		amt = row.DcyMaxSize
 	}
 	if row.DcyMinSize > 0 && amt < row.DcyMinSize {
 		return 0 // 资金上限低于产品最小申购
 	}
-	return amt
+	// 保留 8 位小数，避免 0.0249999 这类浮点尾巴超出产品校验。
+	return math.Round(amt*1e8) / 1e8
 }
 
 // Sort 决策排序：可执行动作优先，同动作内 Diff 降序。

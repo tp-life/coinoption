@@ -108,6 +108,7 @@ func Match(dcds []okx.DCDProduct, instruments []okx.Instrument, tickers []okx.Op
 			DcyMaxSize: float64(d.MaxSize),
 			ExpTime:    exp,
 			Days:       exp.Sub(now).Hours() / 24,
+			Spot:       spotPrice,
 			DcyAPR:     NormalizeYield(float64(d.AnnualizedYield)),
 		}
 		if row.Days < 0 || row.DcyAPR <= 0 {

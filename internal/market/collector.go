@@ -26,8 +26,13 @@ type Snapshot struct {
 	Warn         string // 非致命提示（如 DCY 需 Key 的 401/500）
 }
 
-// Fetch 同步拉取一轮并用 strategy 引擎决策。
+// Fetch 同步拉取一轮并用 strategy 引擎决策（默认参数）。
 func Fetch(c *okx.Client, dcyUly string) (*Snapshot, error) {
+	return FetchWith(c, dcyUly, strategy.DefaultParams())
+}
+
+// FetchWith 指定策略参数拉取（Settings 页调参后使用）。
+func FetchWith(c *okx.Client, dcyUly string, p strategy.Params) (*Snapshot, error) {
 	parts := strings.Split(dcyUly, "-")
 	base := parts[0]
 
@@ -59,7 +64,7 @@ func Fetch(c *okx.Client, dcyUly string) (*Snapshot, error) {
 	}
 	snapshot.OptionCount = len(tickers)
 
-	snapshot.OptionRows = strategy.RankOptions(instruments, tickers, spotMap, time.Now(), strategy.DefaultParams())
+	snapshot.OptionRows = strategy.RankOptions(instruments, tickers, spotMap, time.Now(), p)
 
 	// 4. DCY 产品（尽力而为；无 Key/模拟盘下 401/500 → 降级为纯期权观察）
 	var dcds []okx.DCDProduct
@@ -82,7 +87,7 @@ func Fetch(c *okx.Client, dcyUly string) (*Snapshot, error) {
 		for _, p := range dcds {
 			snapshot.Products[p.ProductID] = p
 		}
-		snapshot.Decisions = strategy.Build(dcds, instruments, tickers, spotMap, time.Now(), strategy.DefaultParams())
+		snapshot.Decisions = strategy.Build(dcds, instruments, tickers, spotMap, time.Now(), p)
 	} else {
 		snapshot.Warn = "双币赢不可用（需实盘 API Key；模拟盘无金融产品）→ [" + strings.Join(warns, "; ") + "]"
 	}

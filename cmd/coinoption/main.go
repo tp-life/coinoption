@@ -113,7 +113,7 @@ func main() {
 			}
 		}
 		client := buildClient(*proxy, *apiKey, *secret, *passphrase, *demo)
-		run := ui.New(market.Fetcher{C: client}, ex, *uly)
+		run := ui.New(&market.Fetcher{C: client}, ex, *uly)
 		p := tea.NewProgram(run, tea.WithAltScreen())
 		if _, err := p.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)

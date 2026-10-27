@@ -57,6 +57,7 @@ type MatchRow struct {
 	DcyMaxSize float64 `json:"dcyMaxSize"`
 	ExpTime    time.Time
 	Days       float64 `json:"days"` // 距到期天数
+	Spot       float64 `json:"spot"` // 匹配时现价（USDT 口径，供金额换算）
 
 	// DCY 侧
 	DcyAPR float64 `json:"dcyApr"` // 年化（统一小数口径）

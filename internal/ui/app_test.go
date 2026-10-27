@@ -26,10 +26,30 @@ type fakeExec struct {
 	dcdCalls  int
 	lastInst  string
 	lastSz    float64
+	lastDCD   okx.DCDProduct
 	auditRows []store.AuditEvent
+	mode      executor.Mode
+	settings  store.Settings
 }
 
-func (f *fakeExec) Mode() executor.Mode { return executor.ModeSimLocal }
+func (f *fakeExec) Mode() executor.Mode {
+	if f.mode == "" {
+		return executor.ModeSimLocal
+	}
+	return f.mode
+}
+
+func (f *fakeExec) LoadSettings() (store.Settings, error) {
+	if f.settings == (store.Settings{}) {
+		return store.DefaultSettings(), nil
+	}
+	return f.settings, nil
+}
+
+func (f *fakeExec) SaveSettings(v store.Settings) error {
+	f.settings = v
+	return nil
+}
 func (f *fakeExec) SubmitOption(instID string, sz, lim float64) (executor.Outcome, error) {
 	f.optCalls++
 	f.lastInst, f.lastSz = instID, sz
@@ -37,6 +57,7 @@ func (f *fakeExec) SubmitOption(instID string, sz, lim float64) (executor.Outcom
 }
 func (f *fakeExec) SubmitDCD(p okx.DCDProduct, amt float64) (executor.Outcome, error) {
 	f.dcdCalls++
+	f.lastDCD = p
 	return executor.Outcome{Detail: "paper dcd ok", Sim: true}, nil
 }
 func (f *fakeExec) Positions() (executor.PositionsView, error) {
@@ -53,7 +74,14 @@ func (f *fakeExec) Positions() (executor.PositionsView, error) {
 func (f *fakeExec) Audit(n int) ([]store.AuditEvent, error) { return f.auditRows, nil }
 
 func (f *fakeExec) State() executor.GuardState {
-	return executor.GuardState{Limits: executor.DefaultLimits()}
+	l := executor.DefaultLimits()
+	return executor.GuardState{
+		OpenCount:     0,
+		ExposureUSDT:  0,
+		RemainingUSDT: l.TotalExposureUSDT,
+		DayRemaining:  l.MaxSessionsPerDay,
+		Limits:        l,
+	}
 }
 
 // ─── helpers ───
@@ -291,5 +319,206 @@ func TestTUIFetchErrorKeepsSnapshot(t *testing.T) {
 	}
 	if v := app.View(); !strings.Contains(v, "刷新失败") || !strings.Contains(v, "上次数据") {
 		t.Fatalf("应显式标注降级:\n%s", v)
+	}
+}
+
+// ─── Settings / 自动执行 ───
+
+func TestTUISettingsToggleAuto(t *testing.T) {
+	app, fe := bootApp(t)
+	m, _ := app.Update(key('5'))
+	app = m.(App)
+	if app.view != viewSettings {
+		t.Fatal("5 应切到设置页")
+	}
+	if !strings.Contains(app.View(), "自动执行") {
+		t.Fatalf("设置页缺少自动执行项:\n%s", app.View())
+	}
+	m, _ = app.Update(key('a'))
+	app = m.(App)
+	if !app.autoOn || !fe.settings.AutoTrade {
+		t.Fatalf("开启自动执行后未生效/未持久化: auto=%v saved=%v", app.autoOn, fe.settings.AutoTrade)
+	}
+	m, _ = app.Update(key('a'))
+	app = m.(App)
+	if app.autoOn || fe.settings.AutoTrade {
+		t.Fatal("再次按 a 应关闭并持久化")
+	}
+}
+
+func TestTUISettingsThresholdAdjust(t *testing.T) {
+	app, fe := bootApp(t)
+	m, _ := app.Update(key('5'))
+	app = m.(App)
+	m, _ = app.Update(key(']'))
+	app = m.(App)
+	m, _ = app.Update(key(']'))
+	app = m.(App)
+	if app.settings.MinOptionEdgePP != 30 || app.params.MinOptionEdge != 0.30 {
+		t.Fatalf("阈值调整不符: pp=%v edge=%v", app.settings.MinOptionEdgePP, app.params.MinOptionEdge)
+	}
+	if fe.settings.MinOptionEdgePP != 30 {
+		t.Fatalf("阈值未持久化: %+v", fe.settings)
+	}
+	// 下限保护
+	for i := 0; i < 10; i++ {
+		m, _ = app.Update(key('['))
+		app = m.(App)
+	}
+	if app.settings.MinOptionEdgePP != 5 {
+		t.Fatalf("阈值下限应夹到 5pp，实际 %v", app.settings.MinOptionEdgePP)
+	}
+}
+
+func TestTUIAutoExecutesDCDCandidate(t *testing.T) {
+	fe := &fakeExec{settings: store.Settings{MinOptionEdgePP: 20, MaxStrikeGapPct: 0.5, AutoTrade: true}}
+	a := New(fakeFetcher{snap: buildTestSnap()}, fe, "BTC-USDT")
+	if !a.autoOn {
+		t.Fatal("sim 模式应沿用持久化的自动执行开关")
+	}
+	m, _ := a.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	m, cmd := m.Update(snapMsg{snap: buildTestSnap()})
+	app := m.(App)
+	if cmd == nil {
+		t.Fatal("自动执行应产生提交命令")
+	}
+	msg, ok := runCmd(t, cmd).(orderResultMsg)
+	if !ok || msg.err != nil {
+		t.Fatalf("自动提交结果异常: %+v", msg)
+	}
+	if fe.dcdCalls != 1 || fe.lastDCD.ProductID != "BTC-USDT-261106-80000-P" {
+		t.Fatalf("应自动申购 DCY: calls=%d prod=%s", fe.dcdCalls, fe.lastDCD.ProductID)
+	}
+	if app.autoCount != 1 || app.autoNote == "" {
+		t.Fatalf("自动执行计数/说明未记录: %+v", app.autoNote)
+	}
+
+	// 冷却期内不重复；冷却结束后同产品也不重复。
+	m, cmd = app.Update(snapMsg{snap: buildTestSnap()})
+	app = m.(App)
+	if cmd != nil {
+		t.Fatal("冷却期内不应再次自动提交")
+	}
+	app.autoSince = time.Now().Add(-2 * time.Minute)
+	m, cmd = app.Update(snapMsg{snap: buildTestSnap()})
+	app = m.(App)
+	if cmd != nil || fe.dcdCalls != 1 {
+		t.Fatalf("同一产品不应自动重复下单: cmd=%v calls=%d", cmd != nil, fe.dcdCalls)
+	}
+	if !strings.Contains(app.autoNote, "自动等待") {
+		t.Fatalf("应记录等待原因: %q", app.autoNote)
+	}
+}
+
+func TestTUIAutoSkipsOptionWhenCapTooSmall(t *testing.T) {
+	// 期权行在前但单笔 2000 USDT < 1 张（约 8 万）→ 应跳过期权，落到 DCY。
+	fe := &fakeExec{settings: store.Settings{MinOptionEdgePP: 20, MaxStrikeGapPct: 0.5, AutoTrade: true}}
+	a := New(fakeFetcher{snap: buildTestSnap()}, fe, "BTC-USDT")
+	m, _ := a.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	m, cmd := m.Update(snapMsg{snap: buildTestSnap()})
+	if cmd == nil {
+		t.Fatal("应产生自动提交命令")
+	}
+	if fe.optCalls != 0 {
+		t.Fatal("单笔额度不足 1 张时不应卖期权")
+	}
+	_ = m
+}
+
+func TestTUILiveAutoRequiresConfirm(t *testing.T) {
+	fe := &fakeExec{mode: executor.ModeLive}
+	a := New(fakeFetcher{snap: buildTestSnap()}, fe, "BTC-USDT")
+	m, _ := a.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	m, _ = m.Update(snapMsg{snap: buildTestSnap()})
+	app := m.(App)
+	m, _ = app.Update(key('5'))
+	app = m.(App)
+	m, _ = app.Update(key('a'))
+	app = m.(App)
+	if app.autoOn || !app.liveConfirmAuto {
+		t.Fatal("live 模式开启自动执行应先进入二次确认")
+	}
+	if !strings.Contains(app.View(), "开启实盘自动执行") {
+		t.Fatalf("缺少 live 确认面板:\n%s", app.View())
+	}
+	m, _ = app.Update(key('y'))
+	app = m.(App)
+	if !app.autoOn || app.liveConfirmAuto {
+		t.Fatal("y 确认后应开启自动执行")
+	}
+	if !fe.settings.AutoTrade {
+		t.Fatal("确认后应持久化开关")
+	}
+}
+
+func TestTUILiveAutoForcedOffOnStartup(t *testing.T) {
+	fe := &fakeExec{mode: executor.ModeLive,
+		settings: store.Settings{MinOptionEdgePP: 20, MaxStrikeGapPct: 0.5, AutoTrade: true}}
+	a := New(fakeFetcher{snap: buildTestSnap()}, fe, "BTC-USDT")
+	if a.autoOn {
+		t.Fatal("live 启动必须强制关闭自动执行")
+	}
+	if fe.settings.AutoTrade {
+		t.Fatal("强制关闭应同步落盘，避免下次静默开启")
+	}
+	if !strings.Contains(a.flash, "强制关闭") {
+		t.Fatalf("应提示强制关闭: %q", a.flash)
+	}
+}
+
+// 真实 executor（sim-local + 临时 store）上的自动执行集成测试：
+// 锁定 UI→executor→guard→store 的契约，而不是 fake 行为。
+func TestTUIAutoIntegrationWithExecutor(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ex := executor.New(executor.ModeSimLocal, nil, executor.NewGuard(executor.DefaultLimits()), st,
+		func(ccy string) (float64, error) { return 79500, nil })
+	if err := ex.SaveSettings(store.Settings{
+		MinOptionEdgePP: 20, MaxStrikeGapPct: 0.5, AutoTrade: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	a := New(fakeFetcher{snap: buildTestSnap()}, ex, "BTC-USDT")
+	if !a.autoOn {
+		t.Fatal("应从 settings.json 载入自动执行开关")
+	}
+	m, _ := a.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	m, cmd := m.Update(snapMsg{snap: buildTestSnap()})
+	if cmd == nil {
+		t.Fatal("自动执行应产生提交命令")
+	}
+	msg := runCmd(t, cmd)
+	if res, ok := msg.(orderResultMsg); !ok || res.err != nil {
+		t.Fatalf("自动提交失败: %+v", msg)
+	}
+
+	pos, err := ex.Positions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pos.Sim) != 1 || pos.Sim[0].Kind != "dcd" {
+		t.Fatalf("应落一笔纸面 DCY 单: %+v", pos.Sim)
+	}
+	if pos.Guard.ExposureUSDT <= 0 || pos.Guard.OpenCount != 1 {
+		t.Fatalf("风控未登记: %+v", pos.Guard)
+	}
+	audit, err := ex.Audit(10)
+	if err != nil || len(audit) == 0 {
+		t.Fatalf("缺少审计记录: %+v err=%v", audit, err)
+	}
+
+	// 模拟进程重启：新 App 应从在持纸面单播种去重表，不再对同产品自动下单。
+	app2 := New(fakeFetcher{snap: buildTestSnap()}, ex, "BTC-USDT")
+	m, _ = app2.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	m, cmd = m.Update(snapMsg{snap: buildTestSnap()})
+	if cmd != nil {
+		t.Fatal("重启后不应重复自动申购同一产品")
+	}
+	if pos2, _ := ex.Positions(); len(pos2.Sim) != 1 {
+		t.Fatalf("不应新增纸面单: %d", len(pos2.Sim))
 	}
 }

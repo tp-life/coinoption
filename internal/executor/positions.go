@@ -214,3 +214,7 @@ func (e *Executor) Audit(n int) ([]store.AuditEvent, error) {
 	}
 	return rows, nil
 }
+
+// LoadSettings / SaveSettings TUI Settings 页的配置入口。
+func (e *Executor) LoadSettings() (store.Settings, error) { return e.st.LoadSettings() }
+func (e *Executor) SaveSettings(v store.Settings) error   { return e.st.SaveSettings(v) }
