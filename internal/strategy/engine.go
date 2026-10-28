@@ -1,8 +1,10 @@
 package strategy
 
 import (
+	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/tp/coinoption/internal/okx"
@@ -111,6 +113,39 @@ func Sort(ds []Decision) {
 			}
 		}
 	}
+}
+
+// SupportedOptionInsts 由决策中「已成功对齐」的期权 instId 派生：命中即视为
+// 该期权被双币赢链路支持。供 Web/TUI 在展示期权榜时丢弃未被支持的合约。
+func SupportedOptionInsts(ds []Decision) map[string]bool {
+	insts := make(map[string]bool, len(ds))
+	for _, d := range ds {
+		if d.Row.OptMatched && d.Row.OptInstID != "" {
+			insts[d.Row.OptInstID] = true
+		}
+	}
+	return insts
+}
+
+// FormatExpTime 将到期时间格式化为「YYYY-MM-DD HH:mm」（UTC），便于展示。
+func FormatExpTime(t time.Time) string {
+	return t.UTC().Format("2006-01-02") + " " + t.UTC().Format("15:04")
+}
+
+// ParseExpiry 解析用户输入的到期时间：RFC3339（如 2026-11-06T08:00:00Z）或
+// 纯日期（如 2026-11-06，按 UTC 当日 08:00 结算口径归一化）。
+func ParseExpiry(s string) (time.Time, error) {
+	v := strings.TrimSpace(s)
+	if v == "" {
+		return time.Time{}, errors.New("到期时间不能为空")
+	}
+	if t, err := time.Parse(time.RFC3339, v); err == nil {
+		return t.UTC(), nil
+	}
+	if t, err := time.Parse("2006-01-02", v); err == nil {
+		return time.Date(t.Year(), t.Month(), t.Day(), 8, 0, 0, 0, time.UTC), nil
+	}
+	return time.Time{}, fmt.Errorf("无法解析到期时间 %q（期望 RFC3339 如 2026-11-06T08:00:00Z，或日期 2026-11-06）", s)
 }
 
 // fmtErr 便捷错误封装。

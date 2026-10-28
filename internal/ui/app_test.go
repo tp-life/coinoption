@@ -322,6 +322,78 @@ func TestTUIFetchErrorKeepsSnapshot(t *testing.T) {
 	}
 }
 
+// ─── 币种快速切换 / 到期时间输入 ───
+
+func TestTUIUnderlyingCycle(t *testing.T) {
+	app, _ := bootApp(t)
+	m, _ := app.Update(key('u'))
+	app = m.(App)
+	if app.uly != "ETH-USDT" {
+		t.Fatalf("u 首次切换应为 ETH-USDT，实际 %s", app.uly)
+	}
+	m, _ = app.Update(key('u'))
+	app = m.(App)
+	if app.uly != "SOL-USDT" {
+		t.Fatalf("u 二次切换应为 SOL-USDT，实际 %s", app.uly)
+	}
+	m, _ = app.Update(key('u'))
+	app = m.(App)
+	if app.uly != "BTC-USDT" {
+		t.Fatalf("u 三次切换应回到 BTC-USDT，实际 %s", app.uly)
+	}
+}
+
+func TestTUIExpiryFilterFlow(t *testing.T) {
+	app, _ := bootApp(t)
+
+	// 默认：expFilter 为零 → 不过滤，保留全量决策。
+	m, _ := app.Update(snapMsg{snap: buildTestSnap()})
+	app = m.(App)
+	if len(app.snap.Decisions) != 2 {
+		t.Fatalf("默认应保留全量决策，实际 %d", len(app.snap.Decisions))
+	}
+
+	// e → 输入到期时间 → 回车确认 → expFilter 生效。
+	m, _ = app.Update(key('e'))
+	app = m.(App)
+	if !app.expMode {
+		t.Fatal("e 应进入到期输入")
+	}
+	app.expInput.SetValue("2026-11-06")
+	m, _ = app.Update(enter())
+	app = m.(App)
+	if app.expMode {
+		t.Fatal("回车后应退出到期输入")
+	}
+	if !app.expFilter.Equal(time.Date(2026, 11, 6, 8, 0, 0, 0, time.UTC)) {
+		t.Fatalf("expFilter 应为 2026-11-06T08:00Z，实际 %v", app.expFilter)
+	}
+
+	// 新快照按到期日过滤 → 决策清空（测试快照的到期是 now+10d，不命中 2026-11-06）。
+	m, _ = app.Update(snapMsg{snap: buildTestSnap()})
+	app = m.(App)
+	if len(app.snap.Decisions) != 0 {
+		t.Fatalf("按到期过滤后决策应清空，实际 %d", len(app.snap.Decisions))
+	}
+
+	// 非法输入 → 保持无过滤、给出错误提示。
+	app2, _ := bootApp(t)
+	m2, _ := app2.Update(key('e'))
+	app2 = m2.(App)
+	if !app2.expMode {
+		t.Fatal("app2 应进入到期输入")
+	}
+	app2.expInput.SetValue("not-a-date")
+	m2, _ = app2.Update(enter())
+	app2 = m2.(App)
+	if app2.expMode || !app2.expFilter.IsZero() {
+		t.Fatalf("非法到期输入应保持无过滤: expMode=%v expFilter=%v", app2.expMode, app2.expFilter)
+	}
+	if !app2.flashIsErr {
+		t.Fatalf("非法到期输入应给出错误提示: %q", app2.flash)
+	}
+}
+
 // ─── Settings / 自动执行 ───
 
 func TestTUISettingsToggleAuto(t *testing.T) {

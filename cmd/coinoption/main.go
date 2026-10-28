@@ -20,6 +20,7 @@ import (
 	"github.com/tp/coinoption/internal/okx"
 	"github.com/tp/coinoption/internal/strategy"
 	"github.com/tp/coinoption/internal/ui"
+	"github.com/tp/coinoption/internal/web"
 )
 
 func main() {
@@ -50,6 +51,8 @@ func main() {
 	apiKey := flag.String("key", os.Getenv("COINOPTION_API_KEY"), "API Key（环境变量 COINOPTION_API_KEY）")
 	secret := flag.String("secret", os.Getenv("COINOPTION_SECRET"), "API Secret（环境变量 COINOPTION_SECRET）")
 	passphrase := flag.String("passphrase", os.Getenv("COINOPTION_PASSPHRASE"), "API Passphrase（环境变量 COINOPTION_PASSPHRASE）")
+	webEnabled := flag.Bool("web", false, "启动 Web 展示服务：GET / 为决策看板页，GET /api/decisions 返回 JSON")
+	webAddr := flag.String("addr", ":8080", "Web 服务监听地址（--web 开启时生效）")
 	flag.Parse()
 
 	switch {
@@ -91,6 +94,15 @@ func main() {
 	case *optdebug:
 		if err := runOptDebug(*uly, *proxy, *apiKey, *secret, *passphrase, *demo); err != nil {
 			fmt.Fprintf(os.Stderr, "optdebug failed: %v\n", err)
+			os.Exit(1)
+		}
+	case *webEnabled:
+		// Web 展示服务：决策看板页 + JSON API（行情经 okx client 拉取）。
+		client := buildClient(*proxy, *apiKey, *secret, *passphrase, *demo)
+		srv := web.New(&market.Fetcher{C: client}, *uly, *webAddr)
+		fmt.Printf("web 服务已启动: http://0.0.0.0%s  (GET / 看板 / GET /api/decisions JSON)\n", *webAddr)
+		if err := srv.ListenAndServe(); err != nil {
+			fmt.Fprintf(os.Stderr, "web server failed: %v\n", err)
 			os.Exit(1)
 		}
 	default:

@@ -91,6 +91,21 @@ func FetchWith(c *okx.Client, dcyUly string, p strategy.Params) (*Snapshot, erro
 	} else {
 		snapshot.Warn = "双币赢不可用（需实盘 API Key；模拟盘无金融产品）→ [" + strings.Join(warns, "; ") + "]"
 	}
+
+	// 丢弃未被双币赢链路支持的期权榜行：决策中 OptMatched 成功的合约即为
+	// DCY 可承接的选项；DCY 不可用（纯期权观察）时保留全量供看板。
+	if len(snapshot.Decisions) > 0 {
+		supported := strategy.SupportedOptionInsts(snapshot.Decisions)
+		if len(supported) > 0 {
+			kept := snapshot.OptionRows[:0]
+			for _, or := range snapshot.OptionRows {
+				if supported[or.InstID] {
+					kept = append(kept, or)
+				}
+			}
+			snapshot.OptionRows = kept
+		}
+	}
 	return snapshot, nil
 }
 

@@ -25,6 +25,10 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 | `y` / `n` / `Esc` | 确认 / 取消 |
 | `j` / `k` | 持仓页滚动 |
 | `r` / `q` | 刷新 / 退出 |
+| `u` | 快速切换标的：`BTC-USDT → ETH-USDT → SOL-USDT → BTC-USDT`（立即重新拉取） |
+| `e` | 输入到期时间（RFC3339 如 `2026-11-06T08:00:00Z`，或日期 `2026-11-06`）→ 回车确认 → 按到期日过滤决策表 |
+
+> 到期时间输入：回车后按「到期日（UTC）」过滤决策/期权榜；展示统一为 `YYYY-MM-DD HH:mm` 格式。未输入时默认全量展示。
 
 刷新失败时保留上一次成功快照并在头部标红提示（不会清空决策表）；持仓页与日志页在可见时随 20s 心跳自动刷新。
 
@@ -80,6 +84,17 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 - 只读 GET 的瞬时故障（`50001/50026/50013/50004/50005`）可重试；**POST 一律不重试**，避免「已成交又重下一单」。
 - 签名/参数/白名单类错误（`50105/50106/50110` 等）立即失败并给出中文提示，不浪费重试。
 
+### Web 展示服务（M4 扩展）
+
+```bash
+./bin/coinoption --web --addr 0.0.0.0:8080
+```
+
+- `GET /` — 决策看板页（内嵌 HTML，自动 20s 轮询 `/api/decisions`）
+- `GET /api/decisions` — 当前决策 JSON（`At / Uly / OptionUly / SpotPrice / OptionCount / DcdCount / Decisions / OptionRows / Products / DCYAvailable / Warn`）
+
+> Web 页与 TUI 共用同一决策数据链路（okx client → market.Fetcher → strategy.Build）；期权榜在拉取后已过滤为「DCY 已支持对齐的合约」。
+
 ## 构建
 
 ```bash
@@ -103,7 +118,9 @@ go test ./internal/strategy/        # 黄金回归
 | `--mode` | — | `live` / `sim-okx`（期权走 Demo，DCY 本地纸面）/ `sim-local`（默认，全本地） |
 | `--store` | — | 数据目录，默认 `~/.coinoption` |
 | `--limits` | — | 风控覆盖 `"total,perOrder,concurrent,perDay"`（段序：总敞口 / 单笔 / 并行 / 日限；期权大名义验证需放宽），默认 `5000,2000,5,10` |
-| `--uly` | — | 标的，默认 `BTC-USDT`（支持 ETH-USDT/SOL-USDT） |
+| `--uly` | — | 标的，默认 `BTC-USDT`（支持 ETH-USDT/SOL-USDT；TUI 可用 `u` 快速切换） |
+| `--web` | — | 启动 Web 展示服务（决策看板） |
+| `--addr` | — | Web 服务监听地址（`--web` 开启时生效，默认 `:8080`） |
 
 > 运行模式在启动时固定（executor 装配后不可热切换）；Settings 页显示当前模式，切换需重启并指定 `--mode`。
 

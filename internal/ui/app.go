@@ -128,6 +128,11 @@ type App struct {
 	flashIsErr bool
 	guard      executor.GuardState
 
+	// 到期时间输入（RFC3339 / 日期）+ 按日过滤
+	expInput  textinput.Model
+	expMode   bool
+	expFilter time.Time
+
 	// 持仓/审计缓存（异步刷新，避免每次渲染都打网络）
 	pos      *executor.PositionsView
 	posErr   error
@@ -154,6 +159,10 @@ func New(f Fetcher, exec Executor, uly string) App {
 	ti.Placeholder = "数量"
 	ti.CharLimit = 24
 	ti.Width = 24
+	ei := textinput.New()
+	ei.Placeholder = "到期时间 RFC3339（如 2026-11-06T08:00:00Z）"
+	ei.CharLimit = 32
+	ei.Width = 32
 
 	// 载入用户设置（无 executor → 只读推荐，用默认值）。
 	st := store.DefaultSettings()
@@ -178,6 +187,7 @@ func New(f Fetcher, exec Executor, uly string) App {
 		uly:      uly,
 		table:    t,
 		input:    ti,
+		expInput: ei,
 		params:   p,
 		settings: st,
 		autoOn:   st.AutoTrade,
@@ -233,7 +243,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.errMsg = msg.err.Error()
 		} else {
 			a.errMsg = ""
-			a.snap = msg.snap
+			a.snap = a.applyExpiryFilter(msg.snap)
 			a.refs = a.buildRefs()
 			a.table.SetRows(a.buildRows())
 		}
@@ -287,6 +297,31 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case tea.KeyMsg:
+		// 0) 到期时间输入层（RFC3339 / 日期）
+		if a.expMode {
+			switch msg.String() {
+			case "esc":
+				a.expMode = false
+				a.expInput.Blur()
+				return a, nil
+			case "enter":
+				t, err := strategy.ParseExpiry(a.expInput.Value())
+				a.expMode = false
+				a.expInput.Blur()
+				if err != nil {
+					a.flash, a.flashIsErr = "✗ "+err.Error(), true
+					return a, nil
+				}
+				a.expFilter = t
+				a.flash = "到期过滤 → " + strategy.FormatExpTime(t)
+				a.flashIsErr = false
+				a.loading = true
+				return a, fetchCmd(a)
+			}
+			var cmd tea.Cmd
+			a.expInput, cmd = a.expInput.Update(msg)
+			return a, cmd
+		}
 		// 1) 数量输入层
 		if a.inputMode {
 			switch msg.String() {
@@ -365,6 +400,17 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			a.loading = true
 			return a, fetchCmd(a)
+		case "u":
+			// 快速切换标的（BTC-USDT / ETH-USDT / SOL-USDT）
+			a.uly = nextUnderlying(a.uly)
+			a.loading = true
+			a.flash = "标的切换 → " + a.uly
+			a.flashIsErr = false
+			return a, fetchCmd(a)
+		case "e":
+			// 进入到期时间输入（RFC3339 / 日期）
+			a = a.startExpiryInput()
+			return a, nil
 		case "p", "3":
 			app := a.togglePositions()
 			if app.view == viewPositions {
@@ -410,7 +456,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // View 渲染。
 func (a App) View() string {
 	title := titleStyle.Render("◈ coinoption") + "  " + a.modeChip() +
-		hintStyle.Render("  1 决策 / 3 持仓 / 4 日志 / 5 设置 · o 卖期权 · d 申购 · r 刷新 · q 退出")
+		hintStyle.Render("  1 决策 / 3 持仓 / 4 日志 / 5 设置 · o 卖期权 · d 申购 · r 刷新 · q 退出 · u 币种 / e 到期")
 
 	header := a.headerLine()
 
@@ -516,7 +562,7 @@ func (a App) footerLine() string {
 	case viewSettings:
 		return "a 自动执行开关 · [ / ] 阈值 ±5pp · 1/Esc 返回 · 重启后需重新确认"
 	default:
-		return "o 卖期权（选中“押注期权”行）/ d 申购双币赢（选中“投注双币赢”行）· p 持仓 · l 日志"
+		return "o 卖期权（选中“押注期权”行）/ d 申购双币赢（选中“投注双币赢”行）· p 持仓 · l 日志 · u 币种 / e 到期"
 	}
 }
 
@@ -992,6 +1038,70 @@ func (a App) togglePositions() App {
 	return a
 }
 
+// startExpiryInput 进入到期时间文本输入层。
+func (a App) startExpiryInput() App {
+	a.expMode = true
+	a.expInput.SetValue("")
+	a.expInput.Focus()
+	a.flash = "输入到期时间（RFC3339 如 2026-11-06T08:00:00Z，或日期 2026-11-06）"
+	a.flashIsErr = false
+	return a
+}
+
+// nextUnderlying 切换标的：BTC-USDT → ETH-USDT → SOL-USDT → BTC-USDT。
+func nextUnderlying(cur string) string {
+	order := []string{"BTC-USDT", "ETH-USDT", "SOL-USDT"}
+	for i, u := range order {
+		if u == cur {
+			return order[(i+1)%len(order)]
+		}
+	}
+	return order[0]
+}
+
+// applyExpiryFilter 按用户输入的到期时间过滤快照（按 UTC 天匹配）；
+// expFilter 为零表示不过滤（全量展示）。
+func (a App) applyExpiryFilter(snap *market.Snapshot) *market.Snapshot {
+	if snap == nil || a.expFilter.IsZero() {
+		return snap
+	}
+	day := a.expFilter.UTC().Format("2006-01-02")
+	decisions := []strategy.Decision{}
+	for _, d := range snap.Decisions {
+		if d.Row.ExpTime.UTC().Format("2006-01-02") == day {
+			decisions = append(decisions, d)
+		}
+	}
+	optionRows := []strategy.OptionRow{}
+	for _, or := range snap.OptionRows {
+		if instDay(or.InstID) == day {
+			optionRows = append(optionRows, or)
+		}
+	}
+	snap.Decisions = decisions
+	snap.OptionRows = optionRows
+	return snap
+}
+
+// instDay 从 OKX 期权 instId（如 BTC-USD-261106-80000-C）解析到期日（YYYY-MM-DD）。
+func instDay(instID string) string {
+	parts := strings.Split(instID, "-")
+	if len(parts) < 4 {
+		return ""
+	}
+	ymd := parts[2]
+	if len(ymd) != 6 {
+		return ""
+	}
+	year, err1 := strconv.Atoi("20" + ymd[:2])
+	month, err2 := strconv.Atoi(ymd[2:4])
+	day, err3 := strconv.Atoi(ymd[4:6])
+	if err1 != nil || err2 != nil || err3 != nil {
+		return ""
+	}
+	return time.Date(year, time.Month(month), day, 8, 0, 0, 0, time.UTC).Format("2006-01-02")
+}
+
 // ─── commands ───
 
 func fetchCmd(a App) tea.Cmd {
@@ -1068,6 +1178,7 @@ func (a App) buildRows() []table.Row {
 		rows = append(rows, table.Row{
 			actionLabel(d.Action),
 			product,
+			strategy.FormatExpTime(r.ExpTime),
 			string(r.OptType),
 			fmt.Sprintf("%.0f", r.Strike),
 			pct(r.DcyAPR), pct(r.OptAPR), pct(r.Diff),
@@ -1082,6 +1193,7 @@ func (a App) buildRows() []table.Row {
 		rows = append(rows, table.Row{
 			opportunityStyle.Render("期权榜"),
 			or.InstID,
+			strategy.FormatExpTime(orExpiry(or)),
 			string(or.OptType),
 			fmt.Sprintf("%.0f", or.Strike),
 			"—",
@@ -1096,12 +1208,32 @@ func (a App) buildRows() []table.Row {
 	return rows
 }
 
+// orExpiry 由期权 instId（yyMMdd 到期编码）构造到期时间（UTC 08:00）。
+func orExpiry(or strategy.OptionRow) time.Time {
+	parts := strings.Split(or.InstID, "-")
+	if len(parts) < 4 {
+		return time.Time{}
+	}
+	ymd := parts[2]
+	if len(ymd) != 6 {
+		return time.Time{}
+	}
+	year, err1 := strconv.Atoi("20" + ymd[:2])
+	month, err2 := strconv.Atoi(ymd[2:4])
+	day, err3 := strconv.Atoi(ymd[4:6])
+	if err1 != nil || err2 != nil || err3 != nil {
+		return time.Time{}
+	}
+	return time.Date(year, time.Month(month), day, 8, 0, 0, 0, time.UTC)
+}
+
 // ─── helpers ───
 
 func columns() []table.Column {
 	return []table.Column{
 		{Title: "建议", Width: 10},
 		{Title: "产品/合约", Width: 30},
+		{Title: "到期", Width: 12},
 		{Title: "T", Width: 2},
 		{Title: "行权价", Width: 9},
 		{Title: "DCY APR%", Width: 9},
