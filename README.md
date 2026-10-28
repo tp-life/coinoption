@@ -99,9 +99,10 @@ go test ./internal/strategy/        # 黄金回归
 | `--secret` | `COINOPTION_SECRET` | API Secret |
 | `--passphrase` | `COINOPTION_PASSPHRASE` | API Passphrase |
 | `--demo` | — | 公开行情/Demo 兼容标志（TUI 执行路径以 `--mode` 为准） |
+| `--optdebug` | — | 期权链诊断：到期日分布 × bid 覆盖 |
 | `--mode` | — | `live` / `sim-okx`（期权走 Demo，DCY 本地纸面）/ `sim-local`（默认，全本地） |
 | `--store` | — | 数据目录，默认 `~/.coinoption` |
-| `--limits` | — | 风控覆盖 `"总敞口,单笔,并行,日限"`，默认 `5000,2000,5,10`（期权大名义验证需放宽） |
+| `--limits` | — | 风控覆盖 `"total,perOrder,concurrent,perDay"`（段序：总敞口 / 单笔 / 并行 / 日限；期权大名义验证需放宽），默认 `5000,2000,5,10` |
 | `--uly` | — | 标的，默认 `BTC-USDT`（支持 ETH-USDT/SOL-USDT） |
 
 > 运行模式在启动时固定（executor 装配后不可热切换）；Settings 页显示当前模式，切换需重启并指定 `--mode`。
