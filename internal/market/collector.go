@@ -109,6 +109,30 @@ func FetchWith(c *okx.Client, dcyUly string, p strategy.Params) (*Snapshot, erro
 	return snapshot, nil
 }
 
+// FilterByExpiryDay 按到期日（UTC）过滤快照：只保留到期日匹配的决策与期权榜行。
+// day 为零值表示不过滤（全量）。供 Web API `?exp=` 与 TUI 到期过滤复用同一实现。
+func FilterByExpiryDay(snap *Snapshot, day time.Time) *Snapshot {
+	if snap == nil || day.IsZero() {
+		return snap
+	}
+	dayStr := day.UTC().Format("2006-01-02")
+	decisions := make([]strategy.Decision, 0, len(snap.Decisions))
+	for _, d := range snap.Decisions {
+		if d.Row.ExpTime.UTC().Format("2006-01-02") == dayStr {
+			decisions = append(decisions, d)
+		}
+	}
+	optionRows := make([]strategy.OptionRow, 0, len(snap.OptionRows))
+	for _, or := range snap.OptionRows {
+		if strategy.InstExpiryDay(or.InstID) == dayStr {
+			optionRows = append(optionRows, or)
+		}
+	}
+	snap.Decisions = decisions
+	snap.OptionRows = optionRows
+	return snap
+}
+
 func parseFloat(s string) float64 {
 	var v float64
 	_, _ = fmt.Sscan(s, &v)

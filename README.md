@@ -93,6 +93,17 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 - `GET /` — 决策看板页（内嵌 HTML，自动 20s 轮询 `/api/decisions`）
 - `GET /api/decisions` — 当前决策 JSON（`At / Uly / OptionUly / SpotPrice / OptionCount / DcdCount / Decisions / OptionRows / Products / DCYAvailable / Warn`）
 
+**Web 看板交互**：
+
+- 币种切换：页内「标的」按钮（BTC / ETH / SOL）→ 带 `uly` 重新拉取决策
+- 到期筛选：`<input type="date">` + 「筛选」按钮 → 带 `exp=YYYY-MM-DD` 按到期日过滤
+- 默认（不带参数）：标的取启动参数（默认 `BTC-USDT`），不过期筛选
+
+**Web API 参数**：
+
+- `GET /api/decisions?uly=BTC-USDT` — 指定标的（默认启动参数）
+- `GET /api/decisions?uly=BTC-USDT&exp=2026-11-06` — 按到期日（UTC）过滤决策/期权榜
+
 > Web 页与 TUI 共用同一决策数据链路（okx client → market.Fetcher → strategy.Build）；期权榜在拉取后已过滤为「DCY 已支持对齐的合约」。
 
 ## 构建

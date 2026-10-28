@@ -1065,41 +1065,7 @@ func (a App) applyExpiryFilter(snap *market.Snapshot) *market.Snapshot {
 	if snap == nil || a.expFilter.IsZero() {
 		return snap
 	}
-	day := a.expFilter.UTC().Format("2006-01-02")
-	decisions := []strategy.Decision{}
-	for _, d := range snap.Decisions {
-		if d.Row.ExpTime.UTC().Format("2006-01-02") == day {
-			decisions = append(decisions, d)
-		}
-	}
-	optionRows := []strategy.OptionRow{}
-	for _, or := range snap.OptionRows {
-		if instDay(or.InstID) == day {
-			optionRows = append(optionRows, or)
-		}
-	}
-	snap.Decisions = decisions
-	snap.OptionRows = optionRows
-	return snap
-}
-
-// instDay 从 OKX 期权 instId（如 BTC-USD-261106-80000-C）解析到期日（YYYY-MM-DD）。
-func instDay(instID string) string {
-	parts := strings.Split(instID, "-")
-	if len(parts) < 4 {
-		return ""
-	}
-	ymd := parts[2]
-	if len(ymd) != 6 {
-		return ""
-	}
-	year, err1 := strconv.Atoi("20" + ymd[:2])
-	month, err2 := strconv.Atoi(ymd[2:4])
-	day, err3 := strconv.Atoi(ymd[4:6])
-	if err1 != nil || err2 != nil || err3 != nil {
-		return ""
-	}
-	return time.Date(year, time.Month(month), day, 8, 0, 0, 0, time.UTC).Format("2006-01-02")
+	return market.FilterByExpiryDay(snap, a.expFilter)
 }
 
 // ─── commands ───

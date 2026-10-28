@@ -38,6 +38,23 @@ func TestParseExpiry(t *testing.T) {
 	}
 }
 
+func TestInstExpiryDay(t *testing.T) {
+	cases := []struct {
+		instID string
+		want   string
+	}{
+		{instID: "BTC-USD-261106-80000-C", want: "2026-11-06"},
+		{instID: "BTC-USD_UM-261106-74000-P", want: "2026-11-06"},
+		{instID: "BTC-USD-261107-82000-C", want: "2026-11-07"},
+		{instID: "bad", want: ""},
+	}
+	for _, c := range cases {
+		if got := InstExpiryDay(c.instID); got != c.want {
+			t.Fatalf("InstExpiryDay(%q) = %q, want %q", c.instID, got, c.want)
+		}
+	}
+}
+
 func TestSupportedOptionInsts(t *testing.T) {
 	ds := []Decision{
 		{Row: MatchRow{OptMatched: true, OptInstID: "BTC-USD-261106-80000-C"}},

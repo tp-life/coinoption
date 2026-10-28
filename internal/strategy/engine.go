@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -146,6 +147,26 @@ func ParseExpiry(s string) (time.Time, error) {
 		return time.Date(t.Year(), t.Month(), t.Day(), 8, 0, 0, 0, time.UTC), nil
 	}
 	return time.Time{}, fmt.Errorf("无法解析到期时间 %q（期望 RFC3339 如 2026-11-06T08:00:00Z，或日期 2026-11-06）", s)
+}
+
+// InstExpiryDay 从 OKX 期权 instId（如 BTC-USD-261106-80000-C）解析到期日（YYYY-MM-DD，UTC 08:00）。
+// 供 market / web / ui 等下游复用，避免重复实现。
+func InstExpiryDay(instID string) string {
+	parts := strings.Split(instID, "-")
+	if len(parts) < 4 {
+		return ""
+	}
+	ymd := parts[2]
+	if len(ymd) != 6 {
+		return ""
+	}
+	year, err1 := strconv.Atoi("20" + ymd[:2])
+	month, err2 := strconv.Atoi(ymd[2:4])
+	day, err3 := strconv.Atoi(ymd[4:6])
+	if err1 != nil || err2 != nil || err3 != nil {
+		return ""
+	}
+	return time.Date(year, time.Month(month), day, 8, 0, 0, 0, time.UTC).Format("2006-01-02")
 }
 
 // fmtErr 便捷错误封装。
