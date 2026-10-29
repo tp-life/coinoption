@@ -66,6 +66,8 @@ const indexHTML = `<!DOCTYPE html>
   .controls button { background:#0d1117; color:var(--txt); border:1px solid var(--line); padding:4px 12px; border-radius:4px; cursor:pointer; font-family:inherit; font-size:12px; }
   .controls button:hover { border-color:var(--accent); }
   .controls button.on { border-color:var(--accent); color:var(--accent); }
+  .controls button.side.on[data-side="C"] { border-color:var(--ok); color:var(--ok); }
+  .controls button.side.on[data-side="P"] { border-color:var(--err); color:var(--err); }
   .controls button.day { padding:4px 10px; }
   .controls input[type=date] { background:#0d1117; color:var(--txt); border:1px solid var(--line); padding:4px 8px; border-radius:4px; font-family:inherit; font-size:12px; }
   .controls .status { color:var(--warn); font-size:12px; }
@@ -94,6 +96,11 @@ const indexHTML = `<!DOCTYPE html>
   <button class="cur" data-uly="BTC-USDT">BTC</button>
   <button class="cur" data-uly="ETH-USDT">ETH</button>
   <button class="cur" data-uly="SOL-USDT">SOL</button>
+  <span class="sep">|</span>
+  <span class="lbl">方向</span>
+  <button class="side" data-side="">全部</button>
+  <button class="side" data-side="C">CALL</button>
+  <button class="side" data-side="P">PUT</button>
   <span class="sep">|</span>
   <span class="lbl">到期(UTC)</span>
   <span id="days"></span>
@@ -126,6 +133,7 @@ const indexHTML = `<!DOCTYPE html>
 <script>
 let curUly = "__DEFAULT_ULY__";
 let curExp = "";
+let curSide = "";
 let loading = false;
 
 function $(id) { return document.getElementById(id); }
@@ -192,11 +200,14 @@ function renderMeta(j) {
   $("meta").textContent = "标的 " + curUly + " · 现货 " + (j.spotPrice ?? "-") +
     " · 期权 " + (j.optionCount ?? "-") + "（" + (j.optionUly || "-") + "）" +
     " · DCY " + (j.dcyAvailable ? (j.dcdCount ?? 0) + " 个产品" : "未接入") +
-    " · 到期 " + (curExp || "全部") +
+    " · 组合 " + curUly + " · " + (curSide || "全部方向") + " · " + (curExp || "全部到期") +
     " · 更新 " + (t ? t.toLocaleTimeString("zh-CN", { hour12: false }) : "-") +
     (j.warn ? " · ⚠ " + j.warn : "");
   document.querySelectorAll(".cur").forEach(function (b) {
     b.classList.toggle("on", b.dataset.uly === curUly);
+  });
+  document.querySelectorAll(".side").forEach(function (b) {
+    b.classList.toggle("on", (b.dataset.side || "") === curSide);
   });
 }
 
@@ -237,7 +248,8 @@ function renderRows(j) {
     tr.className = "empty";
     const td = document.createElement("td");
     td.colSpan = 12;
-    td.textContent = curExp ? "该到期日无决策（试试「全部」或切换标的）" : "暂无决策行（DCY 可能不可用，或期权链无可用报价）";
+    const combo = curUly + " · " + (curSide || "全部方向") + " · " + (curExp || "全部到期");
+    td.textContent = "组合「" + combo + "」下无决策（试试切换方向/到期，或「全部」重置）";
     tr.appendChild(td);
     tb.appendChild(tr);
   }
@@ -250,6 +262,7 @@ async function load() {
   const params = new URLSearchParams();
   params.set("uly", curUly);
   if (curExp) params.set("exp", curExp);
+  if (curSide) params.set("side", curSide);
   try {
     const r = await fetch("/api/decisions?" + params.toString(), { cache: "no-store" });
     const j = await r.json();
@@ -272,8 +285,16 @@ function setExp(day) {
   load();
 }
 
+function setSide(side) {
+  curSide = side || "";
+  load();
+}
+
 document.querySelectorAll(".cur").forEach(function (b) {
   b.addEventListener("click", function () { curUly = b.dataset.uly; load(); });
+});
+document.querySelectorAll(".side").forEach(function (b) {
+  b.addEventListener("click", function () { setSide(b.dataset.side); });
 });
 $("expApply").addEventListener("click", function () { setExp($("exp").value); });
 $("exp").addEventListener("change", function () { setExp($("exp").value); });
@@ -312,12 +333,23 @@ func New(fetcher SnapshotFetcher, uly string, addr string) *http.Server {
 			}
 			day = t
 		}
+		var side rune
+		switch s := strings.ToUpper(strings.TrimSpace(q.Get("side"))); s {
+		case "":
+		case "C":
+			side = 'C'
+		case "P":
+			side = 'P'
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "side 只能是 C（CALL）或 P（PUT）"})
+			return
+		}
 		snap, err := c.snapshot(snapUly)
 		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusOK, market.FilterByExpiryDay(snap, day))
+		writeJSON(w, http.StatusOK, market.FilterSnapshot(snap, day, side))
 	})
 	return &http.Server{Addr: addr, Handler: mux}
 }

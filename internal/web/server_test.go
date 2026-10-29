@@ -37,7 +37,7 @@ func testSnap() *market.Snapshot {
 		Decisions: []strategy.Decision{
 			{
 				Row: strategy.MatchRow{
-					ProductID: "BTC-USDT-261106-80000-C", ExpTime: day(6),
+					ProductID: "BTC-USDT-261106-80000-C", OptType: 'C', ExpTime: day(6),
 					OptInstID: "BTC-USD-261106-80000-C", OptMatched: true,
 					Strike: 80000, DcyAPR: 0.12, OptAPR: 0.35, Diff: 0.23,
 					Days: 8, StrikeErrPct: 0.1, InvestCcy: "USDT",
@@ -47,15 +47,15 @@ func testSnap() *market.Snapshot {
 				SuggestedAmt: 2000,
 			},
 			{
-				Row:          strategy.MatchRow{ProductID: "BTC-USDT-261113-78000-C", ExpTime: day(13), DcyAPR: 0.2, OptAPR: 0.22, Diff: 0.02, Days: 15},
+				Row:          strategy.MatchRow{ProductID: "BTC-USDT-261113-78000-P", OptType: 'P', ExpTime: day(13), DcyAPR: 0.2, OptAPR: 0.22, Diff: 0.02, Days: 15},
 				Action:       strategy.ActionSubscribeDual,
 				ReasonCode:   "diff_small",
 				SuggestedAmt: 500,
 			},
 		},
 		OptionRows: []strategy.OptionRow{
-			{InstID: "BTC-USD-261106-79000-C", OptAPR: 0.4, Strike: 79000, Days: 8},
-			{InstID: "BTC-USD-261113-77000-C", OptAPR: 0.3, Strike: 77000, Days: 15},
+			{InstID: "BTC-USD-261106-79000-C", OptType: 'C', OptAPR: 0.4, Strike: 79000, Days: 8},
+			{InstID: "BTC-USD-261113-77000-P", OptType: 'P', OptAPR: 0.3, Strike: 77000, Days: 15},
 		},
 	}
 }
@@ -100,6 +100,9 @@ func TestIndexPageContainsControls(t *testing.T) {
 		"卖出期权收权利金",
 		"<th>方向</th>",
 		"<th>操作</th>",
+		`data-side=""`,
+		`data-side="C"`,
+		`data-side="P"`,
 	} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("首页缺少 %q", want)
@@ -176,6 +179,62 @@ func TestAPIExpiryFilter(t *testing.T) {
 	}
 	if len(j.Decisions) != 1 || len(j.OptionRows) != 1 {
 		t.Fatalf("按 11-06 过滤后 decisions=%d optionRows=%d", len(j.Decisions), len(j.OptionRows))
+	}
+}
+
+func TestAPISideFilter(t *testing.T) {
+	ts := newTestServer(t, &fakeFetcher{snap: testSnap()})
+	cases := []struct {
+		side       string
+		decisions  int
+		optionRows int
+	}{
+		{side: "C", decisions: 1, optionRows: 1},
+		{side: "P", decisions: 1, optionRows: 1},
+		{side: "c", decisions: 1, optionRows: 1}, // 大小写不敏感
+	}
+	for _, c := range cases {
+		code, body := get(t, ts.URL+"/api/decisions?side="+c.side)
+		if code != http.StatusOK {
+			t.Fatalf("side=%s API = %d: %s", c.side, code, body)
+		}
+		var j struct {
+			Decisions  []json.RawMessage `json:"decisions"`
+			OptionRows []json.RawMessage `json:"optionRows"`
+		}
+		if err := json.Unmarshal(body, &j); err != nil {
+			t.Fatalf("side=%s decode: %v", c.side, err)
+		}
+		if len(j.Decisions) != c.decisions || len(j.OptionRows) != c.optionRows {
+			t.Fatalf("side=%s decisions=%d optionRows=%d，期望 %d/%d",
+				c.side, len(j.Decisions), len(j.OptionRows), c.decisions, c.optionRows)
+		}
+	}
+}
+
+func TestAPICombinedSideAndExpiry(t *testing.T) {
+	ts := newTestServer(t, &fakeFetcher{snap: testSnap()})
+	var j struct {
+		Decisions  []json.RawMessage `json:"decisions"`
+		OptionRows []json.RawMessage `json:"optionRows"`
+	}
+	code, body := get(t, ts.URL+"/api/decisions?exp=2026-11-06&side=P")
+	if code != http.StatusOK {
+		t.Fatalf("API = %d: %s", code, body)
+	}
+	if err := json.Unmarshal(body, &j); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(j.Decisions) != 0 || len(j.OptionRows) != 0 {
+		t.Fatalf("11-06 + PUT 应为空，实际 decisions=%d optionRows=%d", len(j.Decisions), len(j.OptionRows))
+	}
+}
+
+func TestAPIInvalidSide(t *testing.T) {
+	ts := newTestServer(t, &fakeFetcher{snap: testSnap()})
+	code, body := get(t, ts.URL+"/api/decisions?side=X")
+	if code != http.StatusBadRequest {
+		t.Fatalf("非法 side 应返回 400，实际 %d: %s", code, body)
 	}
 }
 

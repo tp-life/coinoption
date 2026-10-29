@@ -90,6 +90,7 @@ const (
 	pickerNone pickerKind = iota
 	pickerUnderlying
 	pickerExpiry
+	pickerSide
 )
 
 // pickerItem 弹窗中的一行。
@@ -151,7 +152,10 @@ type App struct {
 	expMode   bool
 	expFilter time.Time
 
-	// 弹窗选择（标的 / 到期日）
+	// 方向过滤：0 全部 / 'C' CALL（高卖） / 'P' PUT（低买）
+	sideFilter rune
+
+	// 弹窗选择（标的 / 到期日 / 方向）
 	picker    pickerKind
 	pickerIdx int
 
@@ -266,7 +270,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			a.errMsg = ""
 			a.snapRaw = msg.snap
-			a.snap = a.applyExpiryFilter(msg.snap)
+			a.snap = a.applyFilters(msg.snap)
 			a.refs = a.buildRefs()
 			a.table.SetRows(a.buildRows())
 		}
@@ -320,7 +324,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case tea.KeyMsg:
-		// 0) 弹窗选择层（标的 / 到期日）：↑/↓ 或 j/k + Enter，Esc 取消
+		// 0) 弹窗选择层（标的 / 到期日 / 方向）：↑/↓ 或 j/k + Enter，Esc 取消
 		if a.picker != pickerNone {
 			items := a.pickerItems()
 			switch msg.String() {
@@ -448,15 +452,16 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			return a, tea.Quit
 		case "esc":
-			// 清除到期筛选（回到全量）；无筛选时无操作。
-			if !a.expFilter.IsZero() {
+			// 清除全部筛选（方向 + 到期，回到全量）；无筛选时无操作。
+			if !a.expFilter.IsZero() || a.sideFilter != 0 {
 				a.expFilter = time.Time{}
+				a.sideFilter = 0
 				if a.snapRaw != nil {
 					a.snap = a.snapRaw
 					a.refs = a.buildRefs()
 					a.table.SetRows(a.buildRows())
 				}
-				a.flash, a.flashIsErr = "已清除到期筛选（全量）", false
+				a.flash, a.flashIsErr = "已清除筛选（全量）", false
 			}
 			return a, nil
 		case "r":
@@ -469,6 +474,10 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "e":
 			// 弹窗选择到期日（全部 / 各到期日 / 手动输入）
 			a = a.openExpiryPicker()
+			return a, nil
+		case "t":
+			// 弹窗选择方向（全部 / CALL 高卖 / PUT 低买）
+			a = a.openSidePicker()
 			return a, nil
 		case "p", "3":
 			app := a.togglePositions()
@@ -518,7 +527,7 @@ func (a App) View() string {
 		hintStyle.Render("  1 决策 / 3 持仓 / 4 日志 / 5 设置 · q 退出")
 
 	header := a.headerLine()
-	bar := a.expiryBar()
+	bar := a.filterBar()
 
 	var body string
 	switch {
@@ -565,14 +574,29 @@ func (a App) View() string {
 
 // emptyHint 表格无行时的可操作提示。
 func (a App) emptyHint() string {
-	if !a.expFilter.IsZero() {
-		return warnStyle.Render("  ⚠ 到期筛选 " + a.expFilter.UTC().Format("2006-01-02") +
-			" 下无匹配行：e 修改到期 / Esc 清除筛选")
+	if !a.expFilter.IsZero() || a.sideFilter != 0 {
+		return warnStyle.Render("  ⚠ 当前组合「" + a.filterSummary() +
+			"」无匹配行：e 改到期 / t 改方向 / Esc 清除")
 	}
 	if a.snap != nil && !a.snap.DCYAvailable {
 		return hintStyle.Render("  本轮无 DCY 产品（需实盘 API Key）——仅期权观察；r 重试")
 	}
 	return hintStyle.Render("  本轮无对齐决策：可调整阈值（5 设置）或 r 刷新")
+}
+
+// filterSummary 当前组合摘要：标的 [· 方向] [· 到期]，未筛选时显示「全部」。
+func (a App) filterSummary() string {
+	parts := []string{a.uly}
+	if a.sideFilter != 0 {
+		parts = append(parts, strategy.OptTypeName(a.sideFilter))
+	}
+	if !a.expFilter.IsZero() {
+		parts = append(parts, a.expFilter.UTC().Format("2006-01-02"))
+	}
+	if len(parts) == 1 {
+		parts = append(parts, "全部")
+	}
+	return strings.Join(parts, " · ")
 }
 
 // detailLine 当前选中行的补充信息（完整合约、方向、偏差、原因），弥补主表列宽限制。
@@ -694,8 +718,8 @@ func (a App) footerLine() string {
 	case viewSettings:
 		return "a 自动执行开关 · [ / ] 阈值 ±5pp · 1/Esc 返回 · 重启后需重新确认"
 	default:
-		keys := "o 卖期权 / d 申购双币赢 · p 持仓 · l 日志 · u 币种 / e 到期"
-		if !a.expFilter.IsZero() {
+		keys := "o 卖期权 / d 申购双币赢 · p 持仓 · l 日志 · u 币种 / e 到期 / t 方向"
+		if !a.expFilter.IsZero() || a.sideFilter != 0 {
 			keys += " · Esc 清除筛选"
 		}
 		return keys
@@ -1200,6 +1224,25 @@ func (a App) openUnderlyingPicker() App {
 	return a
 }
 
+// openSidePicker 打开方向弹窗（当前筛选项预选中）。
+func (a App) openSidePicker() App {
+	a.picker = pickerSide
+	a.pickerIdx = 0
+	cur := ""
+	if a.sideFilter != 0 {
+		cur = string(a.sideFilter)
+	}
+	for i, it := range a.pickerItems() {
+		if it.value == cur {
+			a.pickerIdx = i
+			break
+		}
+	}
+	a.flash = ""
+	a.flashIsErr = false
+	return a
+}
+
 // openExpiryPicker 打开到期日弹窗（当前筛选项预选中）。
 func (a App) openExpiryPicker() App {
 	a.picker = pickerExpiry
@@ -1235,6 +1278,13 @@ func (a App) pickerItems() []pickerItem {
 		}
 		items = append(items, pickerItem{label: "手动输入日期…", value: "__manual__"})
 		return items
+	case pickerSide:
+		c := a.sideCounts()
+		return []pickerItem{
+			{label: "全部方向", value: "", note: fmt.Sprintf("%d 行", c[0])},
+			{label: "CALL 看涨（高卖）", value: "C", note: fmt.Sprintf("%d 行", c['C'])},
+			{label: "PUT 看跌（低买）", value: "P", note: fmt.Sprintf("%d 行", c['P'])},
+		}
 	}
 	return nil
 }
@@ -1258,10 +1308,10 @@ func (a App) applyPicker(it pickerItem) (tea.Model, tea.Cmd) {
 			return a.startExpiryInput(), nil
 		case "":
 			a.expFilter = time.Time{}
-			a.snap = a.snapRaw
+			a.snap = a.applyFilters(a.snapRaw)
 			a.refs = a.buildRefs()
 			a.table.SetRows(a.buildRows())
-			a.flash, a.flashIsErr = "已清除到期筛选（全量）", false
+			a.flash, a.flashIsErr = "已清除到期筛选 · 当前组合 "+a.filterSummary(), false
 			return a, nil
 		}
 		t, err := time.Parse("2006-01-02", it.value)
@@ -1270,16 +1320,28 @@ func (a App) applyPicker(it pickerItem) (tea.Model, tea.Cmd) {
 			return a, nil
 		}
 		a.expFilter = time.Date(t.Year(), t.Month(), t.Day(), 8, 0, 0, 0, time.UTC)
-		a.snap = a.applyExpiryFilter(a.snapRaw)
+		a.snap = a.applyFilters(a.snapRaw)
 		a.refs = a.buildRefs()
 		a.table.SetRows(a.buildRows())
-		a.flash, a.flashIsErr = "到期筛选 → "+it.value, false
+		a.flash, a.flashIsErr = "当前组合 → "+a.filterSummary(), false
+		return a, nil
+	case pickerSide:
+		switch it.value {
+		case "":
+			a.sideFilter = 0
+		default:
+			a.sideFilter = rune(it.value[0])
+		}
+		a.snap = a.applyFilters(a.snapRaw)
+		a.refs = a.buildRefs()
+		a.table.SetRows(a.buildRows())
+		a.flash, a.flashIsErr = "当前组合 → "+a.filterSummary(), false
 		return a, nil
 	}
 	return a, nil
 }
 
-// pickerView 弹窗渲染（标的 / 到期日）。
+// pickerView 弹窗渲染（标的 / 到期日 / 方向）。
 func (a App) pickerView() string {
 	items := a.pickerItems()
 	if len(items) == 0 {
@@ -1288,6 +1350,9 @@ func (a App) pickerView() string {
 	title := "选择标的"
 	if a.picker == pickerExpiry {
 		title = "选择到期日（UTC）"
+	}
+	if a.picker == pickerSide {
+		title = "选择方向（CALL / PUT）"
 	}
 	lines := []string{warnStyle.Render("┌ " + title)}
 	for i, it := range items {
@@ -1307,13 +1372,42 @@ func (a App) pickerView() string {
 	return strings.Join(lines, "\n")
 }
 
-// applyExpiryFilter 按用户输入的到期时间过滤快照（按 UTC 天匹配）；
-// expFilter 为零表示不过滤（全量展示）。
-func (a App) applyExpiryFilter(snap *market.Snapshot) *market.Snapshot {
-	if snap == nil || a.expFilter.IsZero() {
-		return snap
+// applyFilters 同时应用方向（CALL/PUT）与到期日（UTC）筛选；
+// 两者均为空时返回原快照（全量）。
+func (a App) applyFilters(snap *market.Snapshot) *market.Snapshot {
+	return market.FilterSnapshot(snap, a.expFilter, a.sideFilter)
+}
+
+// sideKey 方向归一：'C'/'c' → 'C'，'P'/'p' → 'P'，其它 → 0（全部）。
+func sideKey(t rune) rune {
+	switch t {
+	case 'C', 'c':
+		return 'C'
+	case 'P', 'p':
+		return 'P'
 	}
-	return market.FilterByExpiryDay(snap, a.expFilter)
+	return 0
+}
+
+// sideCounts 当前到期筛选下各方向的行数（0 = 全部），用于方向弹窗展示。
+func (a App) sideCounts() map[rune]int {
+	s := a.snapRaw
+	if s == nil {
+		s = a.snap
+	}
+	out := map[rune]int{}
+	if s == nil {
+		return out
+	}
+	base := market.FilterSnapshot(s, a.expFilter, 0)
+	out[0] = len(base.Decisions) + len(base.OptionRows)
+	for _, d := range base.Decisions {
+		out[sideKey(d.Row.OptType)]++
+	}
+	for _, or := range base.OptionRows {
+		out[sideKey(or.OptType)]++
+	}
+	return out
 }
 
 // expiryCount 到期日及其可选行数（决策 + 期权榜）。
@@ -1323,7 +1417,7 @@ type expiryCount struct {
 }
 
 // expiryCounts 汇总当前快照中出现的到期日（UTC），按日期升序。
-// 统计基于未过滤快照，筛选激活时仍能看到全部可选到期日。
+// 统计基于未过滤快照并叠加当前方向筛选，筛选激活时仍能看到全部可选到期日。
 func (a App) expiryCounts() []expiryCount {
 	s := a.snapRaw
 	if s == nil {
@@ -1332,6 +1426,7 @@ func (a App) expiryCounts() []expiryCount {
 	if s == nil {
 		return nil
 	}
+	s = market.FilterSnapshot(s, time.Time{}, a.sideFilter)
 	seen := map[string]int{}
 	var days []string
 	add := func(day string) {
@@ -1357,37 +1452,61 @@ func (a App) expiryCounts() []expiryCount {
 	return out
 }
 
-// expiryBar 到期日快捷展示条：全部 / 各到期日(行数)，当前筛选高亮。
-func (a App) expiryBar() string {
+// filterBar 当前组合条：标的·方向·到期 + 方向/到期快捷项，当前筛选高亮。
+// 到期 chip 按终端宽度自动截断，避免换行破坏表格布局。
+func (a App) filterBar() string {
 	ds := a.expiryCounts()
-	if len(ds) == 0 {
-		return ""
+	sc := a.sideCounts()
+	parts := []string{
+		hintStyle.Render("组合"), infoStyle.Render(a.filterSummary()),
+		hintStyle.Render("· 方向"),
 	}
-	filtered := !a.expFilter.IsZero()
-	curDay := ""
-	if filtered {
-		curDay = a.expFilter.UTC().Format("2006-01-02")
-	}
-	parts := []string{hintStyle.Render("到期")}
-	if !filtered {
-		parts = append(parts, okStyle.Render("[全部]"))
-	} else {
-		parts = append(parts, hintStyle.Render("全部"))
-	}
-	for i, d := range ds {
-		if i >= 10 {
-			parts = append(parts, hintStyle.Render("…"))
-			break
-		}
-		txt := fmt.Sprintf("%s(%d)", d.day[5:], d.n)
-		if d.day == curDay {
-			parts = append(parts, warnStyle.Render("["+txt+"]"))
+	for _, it := range []struct {
+		label string
+		v     rune
+	}{
+		{"全部", 0}, {"CALL", 'C'}, {"PUT", 'P'},
+	} {
+		txt := fmt.Sprintf("%s(%d)", it.label, sc[it.v])
+		if a.sideFilter == it.v {
+			parts = append(parts, okStyle.Render("["+txt+"]"))
 		} else {
 			parts = append(parts, hintStyle.Render(txt))
 		}
 	}
-	parts = append(parts, hintStyle.Render("· e 选择 / Esc 清除"))
-	return " " + strings.Join(parts, "  ")
+	line := " " + strings.Join(parts, "  ")
+	tail := hintStyle.Render("  ·  t/e 选择 / Esc 清除")
+	width := a.width
+	if width <= 0 {
+		width = 120
+	}
+	limit := width - lipgloss.Width(tail) - 2
+	if len(ds) > 0 {
+		line += hintStyle.Render("  · 到期  ")
+		if a.expFilter.IsZero() {
+			line += okStyle.Render("[全部]")
+		} else {
+			line += hintStyle.Render("[全部]")
+		}
+		curDay := ""
+		if !a.expFilter.IsZero() {
+			curDay = a.expFilter.UTC().Format("2006-01-02")
+		}
+		for _, d := range ds {
+			txt := fmt.Sprintf("%s(%d)", d.day[5:], d.n)
+			chip := hintStyle.Render(txt)
+			if d.day == curDay {
+				chip = warnStyle.Render("[" + txt + "]")
+			}
+			candidate := line + "  " + chip
+			if lipgloss.Width(candidate) > limit {
+				line += hintStyle.Render("  …")
+				break
+			}
+			line = candidate
+		}
+	}
+	return line + tail
 }
 
 // expPanel 到期时间输入面板（含可用到期日提示）。

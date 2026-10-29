@@ -112,24 +112,62 @@ func FetchWith(c *okx.Client, dcyUly string, p strategy.Params) (*Snapshot, erro
 // FilterByExpiryDay 按到期日（UTC）过滤快照：只保留到期日匹配的决策与期权榜行。
 // day 为零值表示不过滤（全量）。返回浅拷贝，不修改入参（快照可被缓存复用）。
 func FilterByExpiryDay(snap *Snapshot, day time.Time) *Snapshot {
-	if snap == nil || day.IsZero() {
+	return FilterSnapshot(snap, day, 0)
+}
+
+// FilterSnapshot 组合筛选：到期日（UTC，day 零值为全部）+ 方向（0 全部 / 'C' CALL / 'P' PUT）。
+// 同时作用于决策行与期权榜。返回浅拷贝，不修改入参（快照可被缓存复用）。
+func FilterSnapshot(snap *Snapshot, day time.Time, side rune) *Snapshot {
+	if snap == nil {
+		return nil
+	}
+	side = normalizeSide(side)
+	if day.IsZero() && side == 0 {
 		return snap
 	}
-	dayStr := day.UTC().Format("2006-01-02")
+	dayStr := ""
+	if !day.IsZero() {
+		dayStr = day.UTC().Format("2006-01-02")
+	}
+	sideOK := func(t rune) bool {
+		if side == 0 {
+			return true
+		}
+		return normalizeSide(t) == side
+	}
 	out := *snap
 	out.Decisions = make([]strategy.Decision, 0, len(snap.Decisions))
 	for _, d := range snap.Decisions {
-		if d.Row.ExpTime.UTC().Format("2006-01-02") == dayStr {
-			out.Decisions = append(out.Decisions, d)
+		if dayStr != "" && d.Row.ExpTime.UTC().Format("2006-01-02") != dayStr {
+			continue
 		}
+		if !sideOK(d.Row.OptType) {
+			continue
+		}
+		out.Decisions = append(out.Decisions, d)
 	}
 	out.OptionRows = make([]strategy.OptionRow, 0, len(snap.OptionRows))
 	for _, or := range snap.OptionRows {
-		if strategy.InstExpiryDay(or.InstID) == dayStr {
-			out.OptionRows = append(out.OptionRows, or)
+		if dayStr != "" && strategy.InstExpiryDay(or.InstID) != dayStr {
+			continue
 		}
+		if !sideOK(or.OptType) {
+			continue
+		}
+		out.OptionRows = append(out.OptionRows, or)
 	}
 	return &out
+}
+
+// normalizeSide 把方向统一为大写 C/P；其它值视为「全部」（0）。
+func normalizeSide(t rune) rune {
+	switch t {
+	case 'C', 'c':
+		return 'C'
+	case 'P', 'p':
+		return 'P'
+	}
+	return 0
 }
 
 func parseFloat(s string) float64 {

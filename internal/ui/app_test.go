@@ -390,6 +390,99 @@ func TestTUIExpiryPickerSelectDay(t *testing.T) {
 	}
 }
 
+func TestTUISidePickerFilter(t *testing.T) {
+	app, _ := bootApp(t)
+
+	// t → 方向弹窗，当前「全部」预选中。
+	m, _ := app.Update(key('t'))
+	app = m.(App)
+	if app.picker != pickerSide {
+		t.Fatal("t 应打开方向弹窗")
+	}
+	v := app.View()
+	for _, want := range []string{"选择方向", "全部方向", "CALL 看涨（高卖）", "PUT 看跌（低买）"} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("方向弹窗缺少 %q:\n%s", want, v)
+		}
+	}
+
+	// ↓↓ → PUT → Enter。
+	m, _ = app.Update(down())
+	app = m.(App)
+	m, _ = app.Update(down())
+	app = m.(App)
+	m, _ = app.Update(enter())
+	app = m.(App)
+	if app.sideFilter != 'P' {
+		t.Fatalf("sideFilter 应为 P，实际 %q", app.sideFilter)
+	}
+	if len(app.snap.Decisions) != 1 || app.snap.Decisions[0].Row.OptType != 'P' {
+		t.Fatalf("PUT 过滤后应只剩 1 条 PUT 决策，实际 %d", len(app.snap.Decisions))
+	}
+	if len(app.refs) != 1 {
+		t.Fatalf("PUT 过滤后应只剩 1 行，实际 %d", len(app.refs))
+	}
+	if !strings.Contains(app.View(), "BTC-USDT · PUT") {
+		t.Fatalf("组合摘要应显示 BTC-USDT · PUT:\n%s", app.View())
+	}
+
+	// Esc → 清除方向筛选，恢复全部。
+	m, _ = app.Update(esc())
+	app = m.(App)
+	if app.sideFilter != 0 || len(app.refs) != 2 {
+		t.Fatalf("Esc 应清空方向筛选，实际 side=%q refs=%d", app.sideFilter, len(app.refs))
+	}
+}
+
+func TestTUISideAndExpiryCombo(t *testing.T) {
+	app, _ := bootApp(t)
+
+	// 方向 → CALL
+	m, _ := app.Update(key('t'))
+	app = m.(App)
+	m, _ = app.Update(down())
+	app = m.(App)
+	m, _ = app.Update(enter())
+	app = m.(App)
+	if app.sideFilter != 'C' {
+		t.Fatalf("sideFilter 应为 C，实际 %q", app.sideFilter)
+	}
+
+	// 到期 → 第一个可用到期日
+	m, _ = app.Update(key('e'))
+	app = m.(App)
+	m, _ = app.Update(down())
+	app = m.(App)
+	m, _ = app.Update(enter())
+	app = m.(App)
+	if app.expFilter.IsZero() {
+		t.Fatal("expFilter 应生效")
+	}
+	if len(app.snap.Decisions) != 1 || len(app.refs) != 1 {
+		t.Fatalf("CALL + 同日应只剩 1 行，实际 decisions=%d refs=%d", len(app.snap.Decisions), len(app.refs))
+	}
+	if !strings.Contains(app.View(), "BTC-USDT · CALL · ") {
+		t.Fatalf("组合摘要应显示 CALL + 到期日:\n%s", app.View())
+	}
+
+	// 方向弹窗计数应叠加到期筛选：CALL 1 行 / PUT 1 行 / 全部 2 行。
+	m, _ = app.Update(key('t'))
+	app = m.(App)
+	v := app.View()
+	if !strings.Contains(v, "CALL 看涨（高卖）  1 行") || !strings.Contains(v, "PUT 看跌（低买）  1 行") {
+		t.Fatalf("方向弹窗计数未叠加到期筛选:\n%s", v)
+	}
+	m, _ = app.Update(esc())
+	app = m.(App)
+
+	// Esc 清除全部筛选。
+	m, _ = app.Update(esc())
+	app = m.(App)
+	if app.sideFilter != 0 || !app.expFilter.IsZero() || len(app.refs) != 2 {
+		t.Fatalf("Esc 应清除全部筛选: side=%q exp=%v refs=%d", app.sideFilter, app.expFilter, len(app.refs))
+	}
+}
+
 func TestTUIExpiryManualInput(t *testing.T) {
 	app, _ := bootApp(t)
 	// e → 弹窗 → 选择「手动输入日期…」
