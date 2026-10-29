@@ -322,24 +322,93 @@ func TestTUIFetchErrorKeepsSnapshot(t *testing.T) {
 	}
 }
 
-// ─── 币种快速切换 / 到期时间输入 ───
+// ─── 弹窗选择（标的 / 到期日） ───
 
-func TestTUIUnderlyingCycle(t *testing.T) {
+func TestTUIUnderlyingPicker(t *testing.T) {
 	app, _ := bootApp(t)
+
+	// u → 弹窗，当前标的（BTC）预选中
 	m, _ := app.Update(key('u'))
 	app = m.(App)
+	if app.picker != pickerUnderlying {
+		t.Fatal("u 应打开标的弹窗")
+	}
+	if !strings.Contains(app.View(), "选择标的") {
+		t.Fatalf("标的弹窗未渲染:\n%s", app.View())
+	}
+	// ↓ → ETH-USDT → Enter
+	m, _ = app.Update(down())
+	app = m.(App)
+	m, cmd := app.Update(enter())
+	app = m.(App)
+	if app.picker != pickerNone {
+		t.Fatal("确认后应关闭弹窗")
+	}
 	if app.uly != "ETH-USDT" {
-		t.Fatalf("u 首次切换应为 ETH-USDT，实际 %s", app.uly)
+		t.Fatalf("应切换到 ETH-USDT，实际 %s", app.uly)
 	}
+	if cmd == nil {
+		t.Fatal("切换标的后应触发刷新命令")
+	}
+	// Esc 取消不改标的
 	m, _ = app.Update(key('u'))
 	app = m.(App)
-	if app.uly != "SOL-USDT" {
-		t.Fatalf("u 二次切换应为 SOL-USDT，实际 %s", app.uly)
-	}
-	m, _ = app.Update(key('u'))
+	m, _ = app.Update(esc())
 	app = m.(App)
-	if app.uly != "BTC-USDT" {
-		t.Fatalf("u 三次切换应回到 BTC-USDT，实际 %s", app.uly)
+	if app.picker != pickerNone || app.uly != "ETH-USDT" {
+		t.Fatalf("Esc 应取消弹窗且不改标的: picker=%v uly=%s", app.picker, app.uly)
+	}
+}
+
+func TestTUIExpiryPickerSelectDay(t *testing.T) {
+	app, _ := bootApp(t)
+	m, _ := app.Update(key('e'))
+	app = m.(App)
+	if app.picker != pickerExpiry {
+		t.Fatal("e 应打开到期弹窗")
+	}
+	v := app.View()
+	if !strings.Contains(v, "选择到期日") || !strings.Contains(v, "全部（不过滤）") || !strings.Contains(v, "手动输入日期") {
+		t.Fatalf("到期弹窗内容不完整:\n%s", v)
+	}
+	// 第 0 项「全部」→ ↓ 到第一个到期日 → Enter
+	m, _ = app.Update(down())
+	app = m.(App)
+	m, _ = app.Update(enter())
+	app = m.(App)
+	want := buildTestSnap().Decisions[0].Row.ExpTime.UTC().Format("2006-01-02")
+	if app.expFilter.UTC().Format("2006-01-02") != want {
+		t.Fatalf("expFilter 应为 %s，实际 %v", want, app.expFilter)
+	}
+	// 测试快照两笔决策同日 → 过滤后仍为 2 行
+	if len(app.snap.Decisions) != 2 {
+		t.Fatalf("同日决策应保留 2 条，实际 %d", len(app.snap.Decisions))
+	}
+}
+
+func TestTUIExpiryManualInput(t *testing.T) {
+	app, _ := bootApp(t)
+	// e → 弹窗 → 选择「手动输入日期…」
+	m, _ := app.Update(key('e'))
+	app = m.(App)
+	for i := 0; i < 6; i++ { // 指针饱和到最后一项
+		m, _ = app.Update(down())
+		app = m.(App)
+	}
+	m, _ = app.Update(enter())
+	app = m.(App)
+	if !app.expMode {
+		t.Fatal("「手动输入日期…」应打开到期输入面板")
+	}
+	v := app.View()
+	if !strings.Contains(v, "到期时间筛选") || !strings.Contains(v, "可用到期") {
+		t.Fatalf("到期输入面板未渲染:\n%s", v)
+	}
+	app.expInput.SetValue("2026-11-06")
+	m, _ = app.Update(enter())
+	app = m.(App)
+	if !app.expFilter.Equal(time.Date(2026, 11, 6, 8, 0, 0, 0, time.UTC)) {
+		t.Fatalf("expFilter 应为 2026-11-06T08:00Z，实际 %v", app.expFilter)
 	}
 }
 
@@ -353,11 +422,17 @@ func TestTUIExpiryFilterFlow(t *testing.T) {
 		t.Fatalf("默认应保留全量决策，实际 %d", len(app.snap.Decisions))
 	}
 
-	// e → 输入到期时间 → 回车确认 → expFilter 生效。
+	// e → 弹窗 → 手动输入 → 回车确认 → expFilter 生效。
 	m, _ = app.Update(key('e'))
 	app = m.(App)
+	for i := 0; i < 6; i++ {
+		m, _ = app.Update(down())
+		app = m.(App)
+	}
+	m, _ = app.Update(enter())
+	app = m.(App)
 	if !app.expMode {
-		t.Fatal("e 应进入到期输入")
+		t.Fatal("应进入到期输入")
 	}
 	app.expInput.SetValue("2026-11-06")
 	m, _ = app.Update(enter())
@@ -380,6 +455,12 @@ func TestTUIExpiryFilterFlow(t *testing.T) {
 	app2, _ := bootApp(t)
 	m2, _ := app2.Update(key('e'))
 	app2 = m2.(App)
+	for i := 0; i < 6; i++ {
+		m2, _ = app2.Update(down())
+		app2 = m2.(App)
+	}
+	m2, _ = app2.Update(enter())
+	app2 = m2.(App)
 	if !app2.expMode {
 		t.Fatal("app2 应进入到期输入")
 	}
@@ -394,19 +475,6 @@ func TestTUIExpiryFilterFlow(t *testing.T) {
 	}
 }
 
-func TestTUIExpiryPanelRendered(t *testing.T) {
-	app, _ := bootApp(t)
-	m, _ := app.Update(key('e'))
-	app = m.(App)
-	v := app.View()
-	if !strings.Contains(v, "到期时间筛选") {
-		t.Fatalf("e 后应渲染到期输入面板:\n%s", v)
-	}
-	if !strings.Contains(v, "可用到期") {
-		t.Fatalf("到期面板应提示可用到期日:\n%s", v)
-	}
-}
-
 func TestTUIExpiryClearRestoresRows(t *testing.T) {
 	app, _ := bootApp(t)
 	if len(app.refs) != 2 {
@@ -414,6 +482,12 @@ func TestTUIExpiryClearRestoresRows(t *testing.T) {
 	}
 	// 应用 2026-11-06 与测试快照（now+10d）不匹配 → 0 行
 	m, _ := app.Update(key('e'))
+	app = m.(App)
+	for i := 0; i < 6; i++ {
+		m, _ = app.Update(down())
+		app = m.(App)
+	}
+	m, _ = app.Update(enter())
 	app = m.(App)
 	app.expInput.SetValue("2026-11-06")
 	m, _ = app.Update(enter())

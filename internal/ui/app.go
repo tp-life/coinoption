@@ -83,6 +83,22 @@ const (
 	rowOption
 )
 
+// pickerKind TUI 弹窗选择类型。
+type pickerKind int
+
+const (
+	pickerNone pickerKind = iota
+	pickerUnderlying
+	pickerExpiry
+)
+
+// pickerItem 弹窗中的一行。
+type pickerItem struct {
+	label string
+	value string
+	note  string
+}
+
 type rowRef struct {
 	kind rowKind
 	idx  int
@@ -134,6 +150,10 @@ type App struct {
 	expInput  textinput.Model
 	expMode   bool
 	expFilter time.Time
+
+	// 弹窗选择（标的 / 到期日）
+	picker    pickerKind
+	pickerIdx int
 
 	// 持仓/审计缓存（异步刷新，避免每次渲染都打网络）
 	pos      *executor.PositionsView
@@ -300,7 +320,33 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case tea.KeyMsg:
-		// 0) 到期时间输入层（RFC3339 / 日期）
+		// 0) 弹窗选择层（标的 / 到期日）：↑/↓ 或 j/k + Enter，Esc 取消
+		if a.picker != pickerNone {
+			items := a.pickerItems()
+			switch msg.String() {
+			case "esc", "q":
+				a.picker = pickerNone
+				return a, nil
+			case "up", "k":
+				if a.pickerIdx > 0 {
+					a.pickerIdx--
+				}
+				return a, nil
+			case "down", "j":
+				if a.pickerIdx < len(items)-1 {
+					a.pickerIdx++
+				}
+				return a, nil
+			case "enter":
+				if a.pickerIdx >= 0 && a.pickerIdx < len(items) {
+					return a.applyPicker(items[a.pickerIdx])
+				}
+				a.picker = pickerNone
+				return a, nil
+			}
+			return a, nil
+		}
+		// 1) 到期时间输入层（RFC3339 / 日期）
 		if a.expMode {
 			switch msg.String() {
 			case "esc":
@@ -417,15 +463,12 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.loading = true
 			return a, fetchCmd(a)
 		case "u":
-			// 快速切换标的（BTC-USDT / ETH-USDT / SOL-USDT）
-			a.uly = nextUnderlying(a.uly)
-			a.loading = true
-			a.flash = "标的切换 → " + a.uly
-			a.flashIsErr = false
-			return a, fetchCmd(a)
+			// 弹窗选择标的（BTC-USDT / ETH-USDT / SOL-USDT）
+			a = a.openUnderlyingPicker()
+			return a, nil
 		case "e":
-			// 进入到期时间输入（RFC3339 / 日期）
-			a = a.startExpiryInput()
+			// 弹窗选择到期日（全部 / 各到期日 / 手动输入）
+			a = a.openExpiryPicker()
 			return a, nil
 		case "p", "3":
 			app := a.togglePositions()
@@ -502,6 +545,9 @@ func (a App) View() string {
 		out += "\n" + bar
 	}
 	out += "\n" + body + "\n" + foot
+	if a.picker != pickerNone {
+		out += "\n" + a.pickerView()
+	}
 	if a.liveConfirmAuto {
 		out += "\n" + a.autoConfirmPanel()
 	}
@@ -583,7 +629,7 @@ func (a App) headerLine() string {
 		return a.placeholder()
 	}
 	parts := []string{
-		"标的 " + colors.Spot.Render(s.Uly) + hintStyle.Render("（u 切换）"),
+		"标的 " + colors.Spot.Render(s.Uly) + hintStyle.Render("（u 选择）"),
 		fmt.Sprintf("现货 %s", colors.Spot.Render(fmt.Sprintf("%.2f", s.SpotPrice))),
 		fmt.Sprintf("期权 %d · 底层 %s", s.OptionCount, s.OptionUly),
 	}
@@ -1123,15 +1169,126 @@ func (a App) startExpiryInput() App {
 	return a
 }
 
-// nextUnderlying 切换标的：BTC-USDT → ETH-USDT → SOL-USDT → BTC-USDT。
-func nextUnderlying(cur string) string {
-	order := []string{"BTC-USDT", "ETH-USDT", "SOL-USDT"}
-	for i, u := range order {
-		if u == cur {
-			return order[(i+1)%len(order)]
+// openUnderlyingPicker 打开标的弹窗（当前标的预选中）。
+func (a App) openUnderlyingPicker() App {
+	a.picker = pickerUnderlying
+	a.pickerIdx = 0
+	for i, it := range a.pickerItems() {
+		if it.value == a.uly {
+			a.pickerIdx = i
+			break
 		}
 	}
-	return order[0]
+	a.flash = ""
+	a.flashIsErr = false
+	return a
+}
+
+// openExpiryPicker 打开到期日弹窗（当前筛选项预选中）。
+func (a App) openExpiryPicker() App {
+	a.picker = pickerExpiry
+	a.pickerIdx = 0
+	cur := ""
+	if !a.expFilter.IsZero() {
+		cur = a.expFilter.UTC().Format("2006-01-02")
+	}
+	for i, it := range a.pickerItems() {
+		if it.value == cur {
+			a.pickerIdx = i
+			break
+		}
+	}
+	a.flash = ""
+	a.flashIsErr = false
+	return a
+}
+
+// pickerItems 当前弹窗的可选项。
+func (a App) pickerItems() []pickerItem {
+	switch a.picker {
+	case pickerUnderlying:
+		return []pickerItem{
+			{label: "BTC-USDT", value: "BTC-USDT", note: "比特币"},
+			{label: "ETH-USDT", value: "ETH-USDT", note: "以太坊"},
+			{label: "SOL-USDT", value: "SOL-USDT", note: "Solana"},
+		}
+	case pickerExpiry:
+		items := []pickerItem{{label: "全部（不过滤）", value: ""}}
+		for _, d := range a.expiryCounts() {
+			items = append(items, pickerItem{label: d.day, value: d.day, note: fmt.Sprintf("%d 行", d.n)})
+		}
+		items = append(items, pickerItem{label: "手动输入日期…", value: "__manual__"})
+		return items
+	}
+	return nil
+}
+
+// applyPicker 应用弹窗选择。
+func (a App) applyPicker(it pickerItem) (tea.Model, tea.Cmd) {
+	kind := a.picker
+	a.picker = pickerNone
+	switch kind {
+	case pickerUnderlying:
+		if it.value == a.uly {
+			return a, nil
+		}
+		a.uly = it.value
+		a.loading = true
+		a.flash, a.flashIsErr = "标的切换 → "+it.value, false
+		return a, fetchCmd(a)
+	case pickerExpiry:
+		switch it.value {
+		case "__manual__":
+			return a.startExpiryInput(), nil
+		case "":
+			a.expFilter = time.Time{}
+			a.snap = a.snapRaw
+			a.refs = a.buildRefs()
+			a.table.SetRows(a.buildRows())
+			a.flash, a.flashIsErr = "已清除到期筛选（全量）", false
+			return a, nil
+		}
+		t, err := time.Parse("2006-01-02", it.value)
+		if err != nil {
+			a.flash, a.flashIsErr = "✗ 无法解析到期日 "+it.value, true
+			return a, nil
+		}
+		a.expFilter = time.Date(t.Year(), t.Month(), t.Day(), 8, 0, 0, 0, time.UTC)
+		a.snap = a.applyExpiryFilter(a.snapRaw)
+		a.refs = a.buildRefs()
+		a.table.SetRows(a.buildRows())
+		a.flash, a.flashIsErr = "到期筛选 → "+it.value, false
+		return a, nil
+	}
+	return a, nil
+}
+
+// pickerView 弹窗渲染（标的 / 到期日）。
+func (a App) pickerView() string {
+	items := a.pickerItems()
+	if len(items) == 0 {
+		return ""
+	}
+	title := "选择标的"
+	if a.picker == pickerExpiry {
+		title = "选择到期日（UTC）"
+	}
+	lines := []string{warnStyle.Render("┌ " + title)}
+	for i, it := range items {
+		cursor := "  "
+		label := it.label
+		if i == a.pickerIdx {
+			cursor = "▸ "
+			label = okStyle.Render(label)
+		}
+		line := "│ " + cursor + label
+		if it.note != "" {
+			line += hintStyle.Render("  " + it.note)
+		}
+		lines = append(lines, line)
+	}
+	lines = append(lines, hintStyle.Render("└ ↑/↓ 选择 · Enter 确认 · Esc 取消"))
+	return strings.Join(lines, "\n")
 }
 
 // applyExpiryFilter 按用户输入的到期时间过滤快照（按 UTC 天匹配）；
@@ -1213,7 +1370,7 @@ func (a App) expiryBar() string {
 			parts = append(parts, hintStyle.Render(txt))
 		}
 	}
-	parts = append(parts, hintStyle.Render("· e 输入日期 / Esc 清除"))
+	parts = append(parts, hintStyle.Render("· e 选择 / Esc 清除"))
 	return " " + strings.Join(parts, "  ")
 }
 
