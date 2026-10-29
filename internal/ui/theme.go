@@ -9,11 +9,10 @@ var (
 	infoStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 	footerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).PaddingTop(1)
 
-	okStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)  // 绿：卖出期权 / CALL
-	primaryStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Bold(true)  // 蓝：申购双币赢
-	warnStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true) // 黄：警告/不可对齐
-	errStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true) // 红：错误
-	opportunityStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	okStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)  // 绿：卖出期权 / CALL
+	primaryStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("81")).Bold(true)  // 蓝：申购双币赢
+	warnStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true) // 黄：警告/不可对齐
+	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true) // 红：错误
 
 	// 内嵌高亮
 	colors = struct{ Spot lipgloss.Style }{Spot: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("82"))}

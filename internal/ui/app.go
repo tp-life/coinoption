@@ -248,7 +248,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.width, a.height = msg.Width, msg.Height
 		a.table.SetColumns(columnsFor(msg.Width))
 		a.table.SetWidth(min(a.width, 132))
-		a.table.SetHeight(max(5, msg.Height-10))
+		a.table.SetHeight(max(5, msg.Height-11))
 		return a, nil
 
 	case tickMsg:
@@ -624,17 +624,21 @@ func (a App) detailLine() string {
 		return hintStyle.Render(" " + strings.Join(parts, "  ·  "))
 	}
 	or := a.snap.OptionRows[ref.idx]
-	return hintStyle.Render(fmt.Sprintf(" %s · %s · 到期 %s 08:00 · 行权 %.0f · 期权 APR %.2f%% · 结算 %s · 参考排名，下单请选中上方决策行",
+	return hintStyle.Render(fmt.Sprintf(" %s · %s · 到期 %s 08:00 · 行权 %.0f · 期权 APR %.2f%% · 结算 %s · 期权卖方（SELL）排名，下单请选中上方决策行",
 		or.InstID, strategy.OptTypeName(or.OptType), strategy.InstExpiryDay(or.InstID), or.Strike, or.OptAPR*100, or.SettleCcy))
 }
 
-// legendLine 方向/操作图例：解决「C/P 到底是什么意思、买还是卖」的歧义。
+// legendLine 方向/操作图例：明确「CALL/PUT」与「买/卖」的对应关系（两行避免窄屏换行）。
 func (a App) legendLine() string {
-	return hintStyle.Render(" 方向 ") +
+	line1 := hintStyle.Render(" 方向 ") +
 		okStyle.Render("CALL 看涨") + hintStyle.Render(" / ") +
-		errStyle.Render("PUT 看跌") + hintStyle.Render("  ·  操作 ") +
-		okStyle.Render("卖=卖出期权收权利金") + hintStyle.Render("  ·  ") +
-		primaryStyle.Render("申购=双币赢") + hintStyle.Render("（高卖投入币 / 低买投入 USDT）")
+		errStyle.Render("PUT 看跌") + hintStyle.Render("  ·  ") +
+		okStyle.Render("卖CALL / 卖PUT = SELL") + hintStyle.Render("（卖出期权，收权利金）")
+	line2 := hintStyle.Render(" 申购DCY：") +
+		primaryStyle.Render("高卖→到期卖币") + hintStyle.Render(" / ") +
+		primaryStyle.Render("低买→到期买币") + hintStyle.Render("  ·  ") +
+		warnStyle.Render("本工具仅卖期权（SELL），不买入期权")
+	return line1 + "\n" + line2
 }
 
 func (a App) placeholder() string {
@@ -1617,7 +1621,7 @@ func (a App) buildRows() []table.Row {
 
 	for _, or := range a.snap.OptionRows {
 		rows = append(rows, table.Row{
-			opportunityStyle.Render("期权榜"),
+			okStyle.Render("卖出期权"),
 			or.InstID,
 			strategy.FormatExpTime(orExpiry(or)),
 			strategy.OptTypeName(or.OptType),
@@ -1723,7 +1727,11 @@ func tradeDesc(d strategy.Decision) string {
 	case strategy.ActionBuyOption:
 		return "卖出" + strategy.OptTypeName(d.Row.OptType) + "（开空收权利金）"
 	case strategy.ActionSubscribeDual:
-		return "申购双币赢·" + strategy.DcySideName(d.Row.OptType)
+		coin := "卖币"
+		if sideKey(d.Row.OptType) == 'P' {
+			coin = "买币"
+		}
+		return "申购双币赢·" + strategy.DcySideName(d.Row.OptType) + "（到期" + coin + "）"
 	}
 	return "不可对齐（不下单）"
 }

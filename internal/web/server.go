@@ -112,9 +112,11 @@ const indexHTML = `<!DOCTYPE html>
 <div class="legend">
   <span class="call">CALL 看涨</span> / <span class="put">PUT 看跌</span>
   <span class="sep">｜</span>
-  <span class="sell">卖=卖出期权收权利金（开空）</span>
+  <span class="sell">卖CALL / 卖PUT = SELL（卖出期权，收权利金）</span>
   <span class="sep">｜</span>
-  <span class="sub">申购=双币赢</span><span>（高卖投入币 / 低买投入 USDT）</span>
+  <span class="sub">申购DCY</span><span>（高卖→到期卖币 / 低买→到期买币）</span>
+  <span class="sep">｜</span>
+  <span>本工具仅卖期权，不买入期权</span>
 </div>
 <main>
   <div class="wrap">
@@ -222,7 +224,7 @@ function renderRows(j) {
     const r = isDec ? d.row : d;
     const tr = document.createElement("tr");
     const cells = [
-      { v: isDec ? actTxt(d) : "期权榜", c: isDec ? cls(d.action) : "none" },
+      { v: isDec ? actTxt(d) : "卖出期权", c: isDec ? cls(d.action) : "buy" },
       { v: r.productId || r.instId || "-" },
       { v: isDec ? expStr(r.expTime) : optDay(r.instId) },
       { v: optTypeName(r.optType), c: typeCls(r.optType) },

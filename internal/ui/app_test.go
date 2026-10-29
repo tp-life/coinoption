@@ -636,11 +636,28 @@ func TestTUIDecisionLabelsShowSideAndAction(t *testing.T) {
 		"CALL", "PUT", // T 列展示方向名称
 		"卖CALL", "申购低买", // 操作列明确买/卖
 		"卖出CALL（开空收权利金）", // 详情行一句话方向
-		"申购=双币赢",         // 图例
+		"SELL", "仅卖期权",   // 明确 SELL 语义
 	} {
 		if !strings.Contains(v, want) {
 			t.Fatalf("界面应包含 %q:\n%s", want, v)
 		}
+	}
+}
+
+func TestTUIOptionRowsShowSell(t *testing.T) {
+	app, _ := bootApp(t)
+	snap := buildTestSnap()
+	snap.OptionRows = []strategy.OptionRow{
+		{InstID: "BTC-USD-261106-80000-C", OptType: 'C', OptAPR: 0.5, Strike: 80000, Days: 10},
+	}
+	m, _ := app.Update(snapMsg{snap: snap})
+	app = m.(App)
+	rows := app.table.Rows()
+	if len(rows) != 3 {
+		t.Fatalf("应渲染 2 条决策 + 1 条期权榜，实际 %d", len(rows))
+	}
+	if !strings.Contains(rows[2][0], "卖出期权") {
+		t.Fatalf("期权榜行的操作列应为「卖出期权」（SELL），实际 %q", rows[2][0])
 	}
 }
 
