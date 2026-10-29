@@ -4,11 +4,47 @@ package web
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/tp/coinoption/internal/market"
 	"github.com/tp/coinoption/internal/strategy"
 )
+
+// SnapshotFetcher 拉取指定标的的快照（*market.Fetcher 实现；便于测试注入）。
+type SnapshotFetcher interface {
+	FetchSnapshot(uly string) (*market.Snapshot, error)
+}
+
+// cacheTTL 快照缓存时长：避免每次页面轮询都打 OKX（DCD 接口限速 1 req/s）。
+const cacheTTL = 15 * time.Second
+
+type cacheEntry struct {
+	snap *market.Snapshot
+	at   time.Time
+}
+
+// cachedFetcher 带 TTL 的快照缓存（单锁串行化，个人工具场景足够）。
+type cachedFetcher struct {
+	f       SnapshotFetcher
+	mu      sync.Mutex
+	entries map[string]cacheEntry
+}
+
+func (c *cachedFetcher) snapshot(uly string) (*market.Snapshot, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.entries[uly]; ok && time.Since(e.at) < cacheTTL {
+		return e.snap, nil
+	}
+	snap, err := c.f.FetchSnapshot(uly)
+	if err != nil {
+		return nil, err
+	}
+	c.entries[uly] = cacheEntry{snap: snap, at: time.Now()}
+	return snap, nil
+}
 
 // indexHTML 决策看板页（内嵌，无需外部静态文件）。
 const indexHTML = `<!DOCTYPE html>
@@ -25,19 +61,24 @@ const indexHTML = `<!DOCTYPE html>
   header h1 { font-size:15px; margin:0 0 6px; font-weight:600; }
   header .sub { color:var(--mut); font-size:12px; }
   .controls { padding:10px 20px; border-bottom:1px solid var(--line); display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-  .controls .lbl { color:var(--mut); }
-  .controls .cur { background:#0d1117; color:var(--txt); border:1px solid var(--line); padding:4px 12px; border-radius:4px; cursor:pointer; font-family:inherit; font-size:12px; }
-  .controls .cur.on { border-color: var(--accent); color: var(--accent); }
+  .controls .lbl { color:var(--mut); font-size:12px; }
+  .controls .sep { color:var(--line); }
+  .controls button { background:#0d1117; color:var(--txt); border:1px solid var(--line); padding:4px 12px; border-radius:4px; cursor:pointer; font-family:inherit; font-size:12px; }
+  .controls button:hover { border-color:var(--accent); }
+  .controls button.on { border-color:var(--accent); color:var(--accent); }
+  .controls button.day { padding:4px 10px; }
   .controls input[type=date] { background:#0d1117; color:var(--txt); border:1px solid var(--line); padding:4px 8px; border-radius:4px; font-family:inherit; font-size:12px; }
-  .controls .mini { background:#0d1117; color:var(--txt); border:1px solid var(--line); padding:4px 12px; border-radius:4px; cursor:pointer; font-family:inherit; font-size:12px; }
-  main { padding:16px 20px; }
+  .controls .status { color:var(--warn); font-size:12px; }
+  main { padding:12px 20px 20px; }
+  .wrap { overflow-x:auto; }
   table { border-collapse: collapse; width:100%; }
   th, td { border:1px solid var(--line); padding:6px 10px; text-align:right; white-space:nowrap; }
-  th { background:#0d1117; color:var(--mut); font-weight:600; position:sticky; top:0; }
-  td:first-child, th:first-child, td:nth-child(2), th:nth-child(2) { text-align:left; }
+  th { background:#0d1117; color:var(--mut); font-weight:600; position:sticky; top:0; z-index:1; }
+  td:nth-child(1), th:nth-child(1), td:nth-child(2), th:nth-child(2) { text-align:left; }
   tbody tr:hover { background:#161b26; }
-  .buy { color: var(--ok); } .dual { color: var(--accent); } .none { color: var(--mut); } .unaligned { color: var(--warn); }
-  #meta { margin-bottom:12px; color:var(--mut); font-size:12px; }
+  .buy { color:var(--ok); font-weight:600; } .dual { color:var(--accent); font-weight:600; } .none { color:var(--mut); } .unaligned { color:var(--warn); }
+  .pos { color:var(--ok); } .neg { color:var(--mut); }
+  .empty td { text-align:center; color:var(--mut); padding:24px; }
 </style>
 </head>
 <body>
@@ -51,96 +92,188 @@ const indexHTML = `<!DOCTYPE html>
   <button class="cur" data-uly="ETH-USDT">ETH</button>
   <button class="cur" data-uly="SOL-USDT">SOL</button>
   <span class="sep">|</span>
-  <span class="lbl">到期</span>
+  <span class="lbl">到期(UTC)</span>
+  <span id="days"></span>
   <input type="date" id="exp" value="" />
-  <button class="mini" id="expApply">筛选</button>
+  <button id="expApply">筛选</button>
+  <button id="expClear">全部</button>
+  <span class="status" id="status"></span>
 </div>
 <main>
-  <table>
-    <thead>
-      <tr><th>建议</th><th>产品/合约</th><th>到期</th><th>DCY APR</th><th>期权 APR</th><th>差</th><th>建议金额</th></tr>
-    </thead>
-    <tbody id="rows"></tbody>
-  </table>
+  <div class="wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>建议</th><th>产品/合约</th><th>到期(UTC)</th><th>T</th><th>行权价</th>
+          <th>DCY APR%</th><th>期权 APR%</th><th>差%</th><th>天</th>
+          <th>偏差%</th><th>原因</th><th>建议金额</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
 </main>
 <script>
-function expStr(iso) { return (iso || "").slice(0, 16).replace("T", " "); }
+let curUly = "__DEFAULT_ULY__";
+let curExp = "";
+let loading = false;
+
+function $(id) { return document.getElementById(id); }
+
+function pad(n) { return String(n).padStart(2, "0"); }
+
+function expStr(iso) {
+  if (!iso) return "-";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "-";
+  return d.getUTCFullYear() + "-" + pad(d.getUTCMonth() + 1) + "-" + pad(d.getUTCDate()) +
+    " " + pad(d.getUTCHours()) + ":" + pad(d.getUTCMinutes());
+}
+
+function instDay(instId) {
+  const p = (instId || "").split("-");
+  if (p.length < 4 || p[2].length !== 6) return "";
+  return "20" + p[2].slice(0, 2) + "-" + p[2].slice(2, 4) + "-" + p[2].slice(4, 6);
+}
+
+function optDay(instId) {
+  const day = instDay(instId);
+  return day ? expStr(day + "T08:00:00Z") : "-";
+}
+
+function pct(v) { return v == null ? "-" : (v * 100).toFixed(2); }
+
 function actTxt(a) { return a === "buy_option" ? "押注期权" : a === "subscribe_dual" ? "投注双币赢" : a === "unaligned" ? "不可对齐" : "—"; }
 function cls(a) { return a === "buy_option" ? "buy" : a === "subscribe_dual" ? "dual" : a === "unaligned" ? "unaligned" : "none"; }
-async function load(uly, exp) {
-  const meta = document.getElementById("meta");
+
+function expiryDays(decisions, optionRows) {
+  const m = new Map();
+  const add = function (day) { if (!day) return; m.set(day, (m.get(day) || 0) + 1); };
+  for (const d of decisions) {
+    const r = d.row || {};
+    add(r.expTime ? r.expTime.slice(0, 10) : instDay(r.optInstId));
+  }
+  for (const or of optionRows) add(instDay(or.instId));
+  return Array.from(m.entries()).sort(function (a, b) { return a[0] < b[0] ? -1 : 1; });
+}
+
+function renderDays(days) {
+  const box = $("days");
+  box.innerHTML = "";
+  for (const [day, n] of days.slice(0, 12)) {
+    const b = document.createElement("button");
+    b.className = "day" + (day === curExp ? " on" : "");
+    b.textContent = day.slice(5) + "(" + n + ")";
+    b.addEventListener("click", function () { setExp(day); });
+    box.appendChild(b);
+  }
+}
+
+function renderMeta(j) {
+  const t = j.at ? new Date(j.at) : null;
+  $("meta").textContent = "标的 " + curUly + " · 现货 " + (j.spotPrice ?? "-") +
+    " · 期权 " + (j.optionCount ?? "-") + "（" + (j.optionUly || "-") + "）" +
+    " · DCY " + (j.dcyAvailable ? (j.dcdCount ?? 0) + " 个产品" : "未接入") +
+    " · 到期 " + (curExp || "全部") +
+    " · 更新 " + (t ? t.toLocaleTimeString("zh-CN", { hour12: false }) : "-") +
+    (j.warn ? " · ⚠ " + j.warn : "");
+  document.querySelectorAll(".cur").forEach(function (b) {
+    b.classList.toggle("on", b.dataset.uly === curUly);
+  });
+}
+
+function renderRows(j) {
+  const decisions = j.decisions || [];
+  const optionRows = j.optionRows || [];
+  const rows = decisions.length > 0 ? decisions : optionRows;
+  const tb = $("rows");
+  tb.innerHTML = "";
+  for (const d of rows) {
+    const isDec = !!d.row;
+    const r = isDec ? d.row : d;
+    const tr = document.createElement("tr");
+    const cells = [
+      { v: isDec ? actTxt(d.action) : "期权榜", c: isDec ? cls(d.action) : "none" },
+      { v: r.productId || r.instId || "-" },
+      { v: isDec ? expStr(r.expTime) : optDay(r.instId) },
+      { v: r.optType || "-" },
+      { v: r.strike != null ? Math.round(r.strike) : "-" },
+      { v: isDec ? pct(r.dcyApr) : "-" },
+      { v: pct(r.optApr) },
+      { v: isDec ? pct(r.diff) : "-", c: isDec ? (r.diff > 0 ? "pos" : (r.diff < 0 ? "neg" : "")) : "" },
+      { v: r.days != null ? Math.round(r.days) : "-" },
+      { v: isDec && r.strikeErrPct != null ? r.strikeErrPct.toFixed(2) : "-" },
+      { v: isDec ? (d.reasonCode || "-") : "options_rank" },
+      { v: isDec && d.suggestedAmt ? Math.round(d.suggestedAmt) + " " + (r.investCcy || "") : "-" },
+    ];
+    for (const c of cells) {
+      const td = document.createElement("td");
+      td.textContent = c.v;
+      if (c.c) td.className = c.c;
+      tr.appendChild(td);
+    }
+    tb.appendChild(tr);
+  }
+  if (rows.length === 0) {
+    const tr = document.createElement("tr");
+    tr.className = "empty";
+    const td = document.createElement("td");
+    td.colSpan = 12;
+    td.textContent = curExp ? "该到期日无决策（试试「全部」或切换标的）" : "暂无决策行（DCY 可能不可用，或期权链无可用报价）";
+    tr.appendChild(td);
+    tb.appendChild(tr);
+  }
+}
+
+async function load() {
+  if (loading) return;
+  loading = true;
+  $("status").textContent = "刷新中…";
   const params = new URLSearchParams();
-  params.set("uly", uly);
-  if (exp) params.set("exp", exp);
+  params.set("uly", curUly);
+  if (curExp) params.set("exp", curExp);
   try {
     const r = await fetch("/api/decisions?" + params.toString(), { cache: "no-store" });
     const j = await r.json();
-    const decisions = j.Decisions || [];
-    const optionRows = j.OptionRows || [];
-    const rows = decisions.length > 0 ? decisions : optionRows;
-    meta.textContent = "标的 " + uly + " · 期权底层 " + (j.OptionUly || "-") + " · 现货 " + (j.SpotPrice ?? "-") +
-      " · 期权合约 " + (j.OptionCount ?? "-") + " · DCY 产品 " + (j.DcdCount ?? "-") + " · 到期 " + (exp || "全部") +
-      " · 更新 " + (j.At ? new Date(j.At).toLocaleTimeString("zh-CN", { hour12: false }) : "-") +
-      (j.Warn ? " · " + j.Warn : "");
-    document.querySelectorAll(".cur").forEach(function (b) { b.classList.toggle("on", b.dataset.uly === uly); });
-    const tb = document.querySelector("#rows");
-    tb.innerHTML = "";
-    for (const d of rows) {
-      const r = d.Row || d;
-      const instId = r.InstID || r.ProductID || "-";
-      const expTime = r.ExpTime || null;
-      const tr = document.createElement("tr");
-      const tds = [
-        ["建议", actTxt(d.Action), cls(d.Action)],
-        ["产品/合约", instId, ""],
-        ["到期", expTime ? expStr(expTime) : "-", ""],
-        ["DCY APR", r.DcyAPR != null ? (r.DcyAPR * 100).toFixed(2) + "%" : "-"],
-        ["期权 APR", r.OptAPR != null ? (r.OptAPR * 100).toFixed(2) + "%" : "-"],
-        ["差", r.Diff != null ? (r.Diff * 100).toFixed(2) + "pp" : "-"],
-        ["建议金额", r.SuggestedAmt != null ? (r.SuggestedAmt | 0) + " " + (r.InvestCcy || "") : "-"],
-      ];
-      for (const t of tds) {
-        const td = document.createElement("td");
-        td.textContent = t[1];
-        if (t[2]) td.className = t[2];
-        if (t[0] === "建议") td.textContent = t[1];
-        tr.appendChild(td);
-      }
-      tb.appendChild(tr);
-    }
-    if (rows.length === 0) {
-      const tr = document.createElement("tr");
-      const td = document.createElement("td");
-      td.colSpan = 7;
-      td.textContent = "暂无符合条件的行（DCY 可能不可用或无决策）";
-      tr.appendChild(td);
-      tb.appendChild(tr);
-    }
+    if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+    renderMeta(j);
+    renderDays(expiryDays(j.decisions || [], j.optionRows || []));
+    renderRows(j);
+    $("status").textContent = "";
   } catch (e) {
-    meta.textContent = "加载失败: " + e;
+    $("meta").textContent = "加载失败：" + e.message;
+    $("status").textContent = "";
+  } finally {
+    loading = false;
   }
 }
-function setUly(u) {
-  const btns = document.querySelectorAll(".cur");
-  for (const b of btns) { b.classList.toggle("on", b.dataset.uly === u); }
-  return load(u, curExp);
+
+function setExp(day) {
+  curExp = day || "";
+  $("exp").value = curExp;
+  load();
 }
-document.getElementById("expApply").addEventListener("click", function () { curExp = document.getElementById("exp").value; load(curUly, curExp); });
-document.getElementById("exp").addEventListener("change", function () { curExp = document.getElementById("exp").value; load(curUly, curExp); });
-document.querySelectorAll(".cur").forEach(function (b) { b.addEventListener("click", function () { curUly = b.dataset.uly; load(curUly, curExp); }); });
-setInterval(function () { load(curUly, curExp); }, 20000);
-load("BTC-USDT", "");
+
+document.querySelectorAll(".cur").forEach(function (b) {
+  b.addEventListener("click", function () { curUly = b.dataset.uly; load(); });
+});
+$("expApply").addEventListener("click", function () { setExp($("exp").value); });
+$("exp").addEventListener("change", function () { setExp($("exp").value); });
+$("expClear").addEventListener("click", function () { setExp(""); });
+setInterval(load, 20000);
+load();
 </script>
 </body>
 </html>`
 
 // New 组装 HTTP server：addr 监听；fetcher 负责拉取决策快照。
-func New(fetcher *market.Fetcher, uly string, addr string) *http.Server {
+func New(fetcher SnapshotFetcher, uly string, addr string) *http.Server {
+	c := &cachedFetcher{f: fetcher, entries: make(map[string]cacheEntry, 4)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(indexHTML))
+		_, _ = w.Write([]byte(strings.ReplaceAll(indexHTML, "__DEFAULT_ULY__", uly)))
 	})
 	mux.HandleFunc("/api/decisions", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -154,24 +287,27 @@ func New(fetcher *market.Fetcher, uly string, addr string) *http.Server {
 		}
 		var day time.Time
 		if expStr := q.Get("exp"); expStr != "" {
-			if t, err := strategy.ParseExpiry(expStr); err == nil {
-				day = t
+			t, err := strategy.ParseExpiry(expStr)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
 			}
+			day = t
 		}
-		snap, err := fetcher.FetchSnapshot(snapUly)
+		snap, err := c.snapshot(snapUly)
 		if err != nil {
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.WriteHeader(http.StatusBadGateway)
-			_ = json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 			return
 		}
-		snap = market.FilterByExpiryDay(snap, day)
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		enc := json.NewEncoder(w)
-		enc.SetEscapeHTML(false)
-		if err := enc.Encode(snap); err != nil {
-			http.Error(w, `{"error":"encode failed"}`, http.StatusInternalServerError)
-		}
+		writeJSON(w, http.StatusOK, market.FilterByExpiryDay(snap, day))
 	})
 	return &http.Server{Addr: addr, Handler: mux}
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(v)
 }

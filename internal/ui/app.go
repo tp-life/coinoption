@@ -4,6 +4,7 @@ package ui
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -110,6 +111,7 @@ type App struct {
 	uly     string
 
 	snap    *market.Snapshot
+	snapRaw *market.Snapshot // 未过滤快照（清除到期筛选时恢复）
 	refs    []rowRef
 	errMsg  string
 	loading bool
@@ -160,9 +162,9 @@ func New(f Fetcher, exec Executor, uly string) App {
 	ti.CharLimit = 24
 	ti.Width = 24
 	ei := textinput.New()
-	ei.Placeholder = "到期时间 RFC3339（如 2026-11-06T08:00:00Z）"
+	ei.Placeholder = "2026-11-06 或 2026-11-06T08:00:00Z"
 	ei.CharLimit = 32
-	ei.Width = 32
+	ei.Width = 40
 
 	// 载入用户设置（无 executor → 只读推荐，用默认值）。
 	st := store.DefaultSettings()
@@ -220,9 +222,9 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		a.width, a.height = msg.Width, msg.Height
-		title := titleStyle.Render("coinoption · OKX 双币赢 vs 期权 APR")
+		a.table.SetColumns(columnsFor(msg.Width))
 		a.table.SetWidth(min(a.width, 132))
-		a.table.SetHeight(msg.Height - lipgloss.Height(title) - 3)
+		a.table.SetHeight(max(5, msg.Height-9))
 		return a, nil
 
 	case tickMsg:
@@ -243,6 +245,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.errMsg = msg.err.Error()
 		} else {
 			a.errMsg = ""
+			a.snapRaw = msg.snap
 			a.snap = a.applyExpiryFilter(msg.snap)
 			a.refs = a.buildRefs()
 			a.table.SetRows(a.buildRows())
@@ -303,6 +306,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "esc":
 				a.expMode = false
 				a.expInput.Blur()
+				a.flash = ""
 				return a, nil
 			case "enter":
 				t, err := strategy.ParseExpiry(a.expInput.Value())
@@ -397,6 +401,18 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return a, tea.Quit
+		case "esc":
+			// 清除到期筛选（回到全量）；无筛选时无操作。
+			if !a.expFilter.IsZero() {
+				a.expFilter = time.Time{}
+				if a.snapRaw != nil {
+					a.snap = a.snapRaw
+					a.refs = a.buildRefs()
+					a.table.SetRows(a.buildRows())
+				}
+				a.flash, a.flashIsErr = "已清除到期筛选（全量）", false
+			}
+			return a, nil
 		case "r":
 			a.loading = true
 			return a, fetchCmd(a)
@@ -456,9 +472,10 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // View 渲染。
 func (a App) View() string {
 	title := titleStyle.Render("◈ coinoption") + "  " + a.modeChip() +
-		hintStyle.Render("  1 决策 / 3 持仓 / 4 日志 / 5 设置 · o 卖期权 · d 申购 · r 刷新 · q 退出 · u 币种 / e 到期")
+		hintStyle.Render("  1 决策 / 3 持仓 / 4 日志 / 5 设置 · q 退出")
 
 	header := a.headerLine()
+	bar := a.expiryBar()
 
 	var body string
 	switch {
@@ -472,17 +489,67 @@ func (a App) View() string {
 		body = a.placeholder()
 	default:
 		body = a.table.View()
+		if len(a.refs) == 0 {
+			body += "\n" + a.emptyHint()
+		} else {
+			body += "\n" + a.detailLine()
+		}
 	}
 
 	foot := footerStyle.Render(a.footerLine())
-	out := title + "\n" + header + "\n" + body + "\n" + foot
+	out := title + "\n" + header
+	if bar != "" {
+		out += "\n" + bar
+	}
+	out += "\n" + body + "\n" + foot
 	if a.liveConfirmAuto {
 		out += "\n" + a.autoConfirmPanel()
+	}
+	if a.expMode {
+		out += "\n" + a.expPanel()
 	}
 	if a.inputMode || a.draft != nil {
 		out += "\n" + a.orderPanel()
 	}
 	return out
+}
+
+// emptyHint 表格无行时的可操作提示。
+func (a App) emptyHint() string {
+	if !a.expFilter.IsZero() {
+		return warnStyle.Render("  ⚠ 到期筛选 " + a.expFilter.UTC().Format("2006-01-02") +
+			" 下无匹配行：e 修改到期 / Esc 清除筛选")
+	}
+	if a.snap != nil && !a.snap.DCYAvailable {
+		return hintStyle.Render("  本轮无 DCY 产品（需实盘 API Key）——仅期权观察；r 重试")
+	}
+	return hintStyle.Render("  本轮无对齐决策：可调整阈值（5 设置）或 r 刷新")
+}
+
+// detailLine 当前选中行的补充信息（完整合约、偏差、原因），弥补主表列宽限制。
+func (a App) detailLine() string {
+	ref, ok := a.currentRef()
+	if !ok || a.snap == nil {
+		return ""
+	}
+	if ref.kind == rowDecision {
+		d := a.snap.Decisions[ref.idx]
+		r := d.Row
+		parts := []string{r.ProductID}
+		if r.OptInstID != "" {
+			parts = append(parts, "→ "+r.OptInstID)
+		}
+		parts = append(parts, fmt.Sprintf("到期 %s（%s）", strategy.FormatExpTime(r.ExpTime), string(r.OptType)))
+		parts = append(parts, fmt.Sprintf("行权 %.0f · 偏差 %+.2f%%", r.Strike, r.StrikeErrPct))
+		parts = append(parts, "原因 "+d.ReasonCode)
+		if d.SuggestedAmt > 0 {
+			parts = append(parts, fmt.Sprintf("建议 %.0f %s", d.SuggestedAmt, r.InvestCcy))
+		}
+		return hintStyle.Render(" " + strings.Join(parts, "  ·  "))
+	}
+	or := a.snap.OptionRows[ref.idx]
+	return hintStyle.Render(fmt.Sprintf(" %s · 到期 %s 08:00 · 行权 %.0f%s · 期权 APR %.2f%% · 结算 %s",
+		or.InstID, strategy.InstExpiryDay(or.InstID), or.Strike, string(or.OptType), or.OptAPR*100, or.SettleCcy))
 }
 
 func (a App) placeholder() string {
@@ -516,13 +583,17 @@ func (a App) headerLine() string {
 		return a.placeholder()
 	}
 	parts := []string{
-		fmt.Sprintf("现货 %s = %s", s.Uly, colors.Spot.Render(fmt.Sprintf("%.2f", s.SpotPrice))),
-		fmt.Sprintf("期权底层 %s（%d 合约）", s.OptionUly, s.OptionCount),
+		"标的 " + colors.Spot.Render(s.Uly) + hintStyle.Render("（u 切换）"),
+		fmt.Sprintf("现货 %s", colors.Spot.Render(fmt.Sprintf("%.2f", s.SpotPrice))),
+		fmt.Sprintf("期权 %d · 底层 %s", s.OptionCount, s.OptionUly),
 	}
 	if s.DCYAvailable {
 		parts = append(parts, fmt.Sprintf("DCY 产品 %d", s.DcdCount))
 	} else {
 		parts = append(parts, warnStyle.Render("DCY 未接入 ⚠"))
+	}
+	if a.loading {
+		parts = append(parts, warnStyle.Render("⏳ 刷新中"))
 	}
 	parts = append(parts, hintStyle.Render("更新 "+s.At.Local().Format("15:04:05")))
 	g := a.guard
@@ -562,7 +633,11 @@ func (a App) footerLine() string {
 	case viewSettings:
 		return "a 自动执行开关 · [ / ] 阈值 ±5pp · 1/Esc 返回 · 重启后需重新确认"
 	default:
-		return "o 卖期权（选中“押注期权”行）/ d 申购双币赢（选中“投注双币赢”行）· p 持仓 · l 日志 · u 币种 / e 到期"
+		keys := "o 卖期权 / d 申购双币赢 · p 持仓 · l 日志 · u 币种 / e 到期"
+		if !a.expFilter.IsZero() {
+			keys += " · Esc 清除筛选"
+		}
+		return keys
 	}
 }
 
@@ -1043,7 +1118,7 @@ func (a App) startExpiryInput() App {
 	a.expMode = true
 	a.expInput.SetValue("")
 	a.expInput.Focus()
-	a.flash = "输入到期时间（RFC3339 如 2026-11-06T08:00:00Z，或日期 2026-11-06）"
+	a.flash = ""
 	a.flashIsErr = false
 	return a
 }
@@ -1066,6 +1141,101 @@ func (a App) applyExpiryFilter(snap *market.Snapshot) *market.Snapshot {
 		return snap
 	}
 	return market.FilterByExpiryDay(snap, a.expFilter)
+}
+
+// expiryCount 到期日及其可选行数（决策 + 期权榜）。
+type expiryCount struct {
+	day string
+	n   int
+}
+
+// expiryCounts 汇总当前快照中出现的到期日（UTC），按日期升序。
+// 统计基于未过滤快照，筛选激活时仍能看到全部可选到期日。
+func (a App) expiryCounts() []expiryCount {
+	s := a.snapRaw
+	if s == nil {
+		s = a.snap
+	}
+	if s == nil {
+		return nil
+	}
+	seen := map[string]int{}
+	var days []string
+	add := func(day string) {
+		if day == "" {
+			return
+		}
+		if _, ok := seen[day]; !ok {
+			days = append(days, day)
+		}
+		seen[day]++
+	}
+	for _, d := range s.Decisions {
+		add(d.Row.ExpTime.UTC().Format("2006-01-02"))
+	}
+	for _, or := range s.OptionRows {
+		add(strategy.InstExpiryDay(or.InstID))
+	}
+	sort.Strings(days)
+	out := make([]expiryCount, 0, len(days))
+	for _, day := range days {
+		out = append(out, expiryCount{day: day, n: seen[day]})
+	}
+	return out
+}
+
+// expiryBar 到期日快捷展示条：全部 / 各到期日(行数)，当前筛选高亮。
+func (a App) expiryBar() string {
+	ds := a.expiryCounts()
+	if len(ds) == 0 {
+		return ""
+	}
+	filtered := !a.expFilter.IsZero()
+	curDay := ""
+	if filtered {
+		curDay = a.expFilter.UTC().Format("2006-01-02")
+	}
+	parts := []string{hintStyle.Render("到期")}
+	if !filtered {
+		parts = append(parts, okStyle.Render("[全部]"))
+	} else {
+		parts = append(parts, hintStyle.Render("全部"))
+	}
+	for i, d := range ds {
+		if i >= 10 {
+			parts = append(parts, hintStyle.Render("…"))
+			break
+		}
+		txt := fmt.Sprintf("%s(%d)", d.day[5:], d.n)
+		if d.day == curDay {
+			parts = append(parts, warnStyle.Render("["+txt+"]"))
+		} else {
+			parts = append(parts, hintStyle.Render(txt))
+		}
+	}
+	parts = append(parts, hintStyle.Render("· e 输入日期 / Esc 清除"))
+	return " " + strings.Join(parts, "  ")
+}
+
+// expPanel 到期时间输入面板（含可用到期日提示）。
+func (a App) expPanel() string {
+	lines := []string{
+		warnStyle.Render("┌ 到期时间筛选（UTC）"),
+		"  " + a.expInput.View(),
+	}
+	if ds := a.expiryCounts(); len(ds) > 0 {
+		labels := make([]string, 0, len(ds))
+		for i, d := range ds {
+			if i >= 10 {
+				labels = append(labels, "…")
+				break
+			}
+			labels = append(labels, fmt.Sprintf("%s(%d)", d.day, d.n))
+		}
+		lines = append(lines, hintStyle.Render("  可用到期：")+strings.Join(labels, "  "))
+	}
+	lines = append(lines, "  "+hintStyle.Render("Enter 应用 · Esc 取消 · 例：2026-11-06 或 2026-11-06T08:00:00Z"))
+	return strings.Join(lines, "\n")
 }
 
 // ─── commands ───
@@ -1147,10 +1317,8 @@ func (a App) buildRows() []table.Row {
 			strategy.FormatExpTime(r.ExpTime),
 			string(r.OptType),
 			fmt.Sprintf("%.0f", r.Strike),
-			pct(r.DcyAPR), pct(r.OptAPR), pct(r.Diff),
+			pct(r.DcyAPR), pct(r.OptAPR), diffCell(r.Diff),
 			fmt.Sprintf("%.0f", r.Days),
-			flip(r.StrikeErrPct),
-			d.ReasonCode,
 			amt,
 		})
 	}
@@ -1166,8 +1334,6 @@ func (a App) buildRows() []table.Row {
 			pct(or.OptAPR),
 			"—",
 			fmt.Sprintf("%.0f", or.Days),
-			"—",
-			"options_rank",
 			"—",
 		})
 	}
@@ -1196,19 +1362,33 @@ func orExpiry(or strategy.OptionRow) time.Time {
 // ─── helpers ───
 
 func columns() []table.Column {
+	return columnsFor(132)
+}
+
+// columnsFor 按终端宽度生成列宽（bubbles table 每个单元格左右各 1 格内边距）。
+// 固定列 78 + 2×列数；剩余宽度给「产品/合约」，宽度不足时最小 14。
+func columnsFor(totalWidth int) []table.Column {
+	const ncol = 10
+	budget := totalWidth - 2*ncol
+	const fixed = 10 + 16 + 2 + 9 + 9 + 10 + 8 + 4 + 10 // 建议/到期/T/行权/DCY/期权/差/天/金额
+	product := budget - fixed
+	if product < 14 {
+		product = 14
+	}
+	if product > 34 {
+		product = 34
+	}
 	return []table.Column{
 		{Title: "建议", Width: 10},
-		{Title: "产品/合约", Width: 30},
-		{Title: "到期", Width: 12},
+		{Title: "产品/合约", Width: product},
+		{Title: "到期(UTC)", Width: 16},
 		{Title: "T", Width: 2},
 		{Title: "行权价", Width: 9},
 		{Title: "DCY APR%", Width: 9},
 		{Title: "期权 APR%", Width: 10},
 		{Title: "差%", Width: 8},
 		{Title: "天", Width: 4},
-		{Title: "偏差%", Width: 7},
-		{Title: "原因", Width: 18},
-		{Title: "建议金额", Width: 12},
+		{Title: "建议金额", Width: 10},
 	}
 }
 
@@ -1219,11 +1399,16 @@ func pct(v float64) string {
 	return fmt.Sprintf("%.2f", v*100)
 }
 
-func flip(v float64) string {
-	if v == 0 {
-		return "0.0"
+// diffCell 年化差值：正（期权更优）绿色，负（期权更差）弱化。
+func diffCell(v float64) string {
+	switch {
+	case v > 0:
+		return okStyle.Render(pct(v))
+	case v < 0:
+		return hintStyle.Render(pct(v))
+	default:
+		return pct(v)
 	}
-	return strconv.FormatFloat(v, 'f', 3, 64)
 }
 
 func actionLabel(a strategy.Action) string {

@@ -13,17 +13,17 @@ import (
 
 // Snapshot 一次采集的完整结果（TUI 唯一数据源）。
 type Snapshot struct {
-	At           time.Time
-	Uly          string // DCY 侧标的（BTC-USDT）
-	OptionUly    string // 期权侧底层（BTC-USD）
-	SpotPrice    float64
-	OptionCount  int
-	DcdCount     int
-	Decisions    []strategy.Decision       // DCY↔期权 对齐决策（可能为空）
-	OptionRows   []strategy.OptionRow      // 期权侧机会榜（始终有）
-	Products     map[string]okx.DCDProduct // productId → 产品（TUI 申购用）
-	DCYAvailable bool
-	Warn         string // 非致命提示（如 DCY 需 Key 的 401/500）
+	At           time.Time                 `json:"at"`
+	Uly          string                    `json:"uly"`       // DCY 侧标的（BTC-USDT）
+	OptionUly    string                    `json:"optionUly"` // 期权侧底层（BTC-USD）
+	SpotPrice    float64                   `json:"spotPrice"`
+	OptionCount  int                       `json:"optionCount"`
+	DcdCount     int                       `json:"dcdCount"`
+	Decisions    []strategy.Decision       `json:"decisions"`  // DCY↔期权 对齐决策（可能为空）
+	OptionRows   []strategy.OptionRow      `json:"optionRows"` // 期权侧机会榜（始终有）
+	Products     map[string]okx.DCDProduct `json:"products"`   // productId → 产品（TUI 申购用）
+	DCYAvailable bool                      `json:"dcyAvailable"`
+	Warn         string                    `json:"warn"` // 非致命提示（如 DCY 需 Key 的 401/500）
 }
 
 // Fetch 同步拉取一轮并用 strategy 引擎决策（默认参数）。
@@ -110,27 +110,26 @@ func FetchWith(c *okx.Client, dcyUly string, p strategy.Params) (*Snapshot, erro
 }
 
 // FilterByExpiryDay 按到期日（UTC）过滤快照：只保留到期日匹配的决策与期权榜行。
-// day 为零值表示不过滤（全量）。供 Web API `?exp=` 与 TUI 到期过滤复用同一实现。
+// day 为零值表示不过滤（全量）。返回浅拷贝，不修改入参（快照可被缓存复用）。
 func FilterByExpiryDay(snap *Snapshot, day time.Time) *Snapshot {
 	if snap == nil || day.IsZero() {
 		return snap
 	}
 	dayStr := day.UTC().Format("2006-01-02")
-	decisions := make([]strategy.Decision, 0, len(snap.Decisions))
+	out := *snap
+	out.Decisions = make([]strategy.Decision, 0, len(snap.Decisions))
 	for _, d := range snap.Decisions {
 		if d.Row.ExpTime.UTC().Format("2006-01-02") == dayStr {
-			decisions = append(decisions, d)
+			out.Decisions = append(out.Decisions, d)
 		}
 	}
-	optionRows := make([]strategy.OptionRow, 0, len(snap.OptionRows))
+	out.OptionRows = make([]strategy.OptionRow, 0, len(snap.OptionRows))
 	for _, or := range snap.OptionRows {
 		if strategy.InstExpiryDay(or.InstID) == dayStr {
-			optionRows = append(optionRows, or)
+			out.OptionRows = append(out.OptionRows, or)
 		}
 	}
-	snap.Decisions = decisions
-	snap.OptionRows = optionRows
-	return snap
+	return &out
 }
 
 func parseFloat(s string) float64 {

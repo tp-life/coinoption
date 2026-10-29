@@ -26,9 +26,12 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 | `j` / `k` | 持仓页滚动 |
 | `r` / `q` | 刷新 / 退出 |
 | `u` | 快速切换标的：`BTC-USDT → ETH-USDT → SOL-USDT → BTC-USDT`（立即重新拉取） |
-| `e` | 输入到期时间（RFC3339 如 `2026-11-06T08:00:00Z`，或日期 `2026-11-06`）→ 回车确认 → 按到期日过滤决策表 |
+| `e` | 打开到期时间筛选面板：可输入 RFC3339（`2026-11-06T08:00:00Z`）或日期（`2026-11-06`），面板内展示全部可用到期日 |
+| `Esc` | 清除到期筛选，恢复全量（有筛选时） |
 
-> 到期时间输入：回车后按「到期日（UTC）」过滤决策/期权榜；展示统一为 `YYYY-MM-DD HH:mm` 格式。未输入时默认全量展示。
+> 到期时间筛选：表头上方的「到期」快捷栏展示所有可选到期日及行数（如 `11-06(12)`），当前筛选项高亮；回车后按「到期日（UTC）」过滤决策/期权榜，展示统一为 `YYYY-MM-DD HH:mm`（UTC）。未筛选时默认全量展示，表内「全部」高亮。
+
+> 主表列宽随终端宽度自适应（120 列下不裁切）：建议 / 产品·合约 / 到期(UTC) / T / 行权价 / DCY APR / 期权 APR / 差 / 天 / 建议金额。选中行下方详情行展示完整产品与期权合约、到期、行权价、偏差、原因与建议金额。
 
 刷新失败时保留上一次成功快照并在头部标红提示（不会清空决策表）；持仓页与日志页在可见时随 20s 心跳自动刷新。
 
@@ -91,18 +94,19 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 ```
 
 - `GET /` — 决策看板页（内嵌 HTML，自动 20s 轮询 `/api/decisions`）
-- `GET /api/decisions` — 当前决策 JSON（`At / Uly / OptionUly / SpotPrice / OptionCount / DcdCount / Decisions / OptionRows / Products / DCYAvailable / Warn`）
+- `GET /api/decisions` — 当前决策 JSON（camelCase：`at / uly / optionUly / spotPrice / optionCount / dcdCount / decisions / optionRows / products / dcyAvailable / warn`）；`decisions[].row` 含 `productId / expTime / dcyApr / optApr / diff / strike / days / strikeErrPct / investCcy / optInstId`，`decisions[]` 含 `action / reasonCode / suggestedAmt`
 
 **Web 看板交互**：
 
-- 币种切换：页内「标的」按钮（BTC / ETH / SOL）→ 带 `uly` 重新拉取决策
-- 到期筛选：`<input type="date">` + 「筛选」按钮 → 带 `exp=YYYY-MM-DD` 按到期日过滤
-- 默认（不带参数）：标的取启动参数（默认 `BTC-USDT`），不过期筛选
+- 币种切换：页内「标的」按钮（BTC / ETH / SOL）→ 带 `uly` 重新拉取决策（当前选中高亮）
+- 到期筛选：快捷到期按钮（如 `11-06(12)`，按快照自动生成）+ 日期选择器 + 「筛选」/「全部」按钮
+- 表格列与 TUI 对齐：建议 / 产品·合约 / 到期(UTC) / T / 行权价 / DCY APR / 期权 APR / 差 / 天 / 偏差 / 原因 / 建议金额
+- 快照服务端缓存 15s，避免每个页面轮询都打 OKX（DCD 限速 1 req/s）
 
 **Web API 参数**：
 
 - `GET /api/decisions?uly=BTC-USDT` — 指定标的（默认启动参数）
-- `GET /api/decisions?uly=BTC-USDT&exp=2026-11-06` — 按到期日（UTC）过滤决策/期权榜
+- `GET /api/decisions?uly=BTC-USDT&exp=2026-11-06` — 按到期日（UTC）过滤决策/期权榜；非法日期返回 400
 
 > Web 页与 TUI 共用同一决策数据链路（okx client → market.Fetcher → strategy.Build）；期权榜在拉取后已过滤为「DCY 已支持对齐的合约」。
 

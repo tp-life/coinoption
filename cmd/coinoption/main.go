@@ -51,7 +51,7 @@ func main() {
 	apiKey := flag.String("key", os.Getenv("COINOPTION_API_KEY"), "API Key（环境变量 COINOPTION_API_KEY）")
 	secret := flag.String("secret", os.Getenv("COINOPTION_SECRET"), "API Secret（环境变量 COINOPTION_SECRET）")
 	passphrase := flag.String("passphrase", os.Getenv("COINOPTION_PASSPHRASE"), "API Passphrase（环境变量 COINOPTION_PASSPHRASE）")
-	webEnabled := flag.Bool("web", false, "启动 Web 展示服务：GET / 为决策看板页，GET /api/decisions 返回 JSON")
+	webEnabled := flag.Bool("web", false, "启动 Web 看板（GET /；API：/api/decisions?uly=BTC-USDT&exp=2026-11-06）")
 	webAddr := flag.String("addr", ":8080", "Web 服务监听地址（--web 开启时生效）")
 	flag.Parse()
 

@@ -38,26 +38,26 @@ func DefaultParams() Params {
 
 // Decision 策略层输出 —— 与 executor/UI 之间的唯一契约。
 type Decision struct {
-	Row          MatchRow
-	Action       Action
-	ReasonCode   string // "option_apr_higher" | "diff_small" | "option_apr_worse" | "strike_gap_too_big" | "no_option_quote"
-	SuggestedAmt float64
-	Ts           time.Time
+	Row          MatchRow  `json:"row"`
+	Action       Action    `json:"action"`
+	ReasonCode   string    `json:"reasonCode"` // "option_apr_higher" | "diff_small" | "option_apr_worse" | "strike_gap_too_big" | "no_option_quote"
+	SuggestedAmt float64   `json:"suggestedAmt"`
+	Ts           time.Time `json:"ts"`
 }
 
 // MatchRow 一条「双币赢产品 ↔ 期权」对齐结果。
 // 纯数据，可直接落库 / 渲染 / 序列化。
 type MatchRow struct {
-	ProductID  string  `json:"productId"`
-	Uly        string  `json:"uly"`
-	OptType    rune    `json:"optType"` // 'C' 高卖 / 'P' 低买
-	Strike     float64 `json:"strike"`
-	InvestCcy  string  `json:"investCcy"`
-	DcyMinSize float64 `json:"dcyMinSize"` // 产品最小/最大申购规模（投资币种）
-	DcyMaxSize float64 `json:"dcyMaxSize"`
-	ExpTime    time.Time
-	Days       float64 `json:"days"` // 距到期天数
-	Spot       float64 `json:"spot"` // 匹配时现价（USDT 口径，供金额换算）
+	ProductID  string    `json:"productId"`
+	Uly        string    `json:"uly"`
+	OptType    rune      `json:"optType"` // 'C' 高卖 / 'P' 低买
+	Strike     float64   `json:"strike"`
+	InvestCcy  string    `json:"investCcy"`
+	DcyMinSize float64   `json:"dcyMinSize"` // 产品最小/最大申购规模（投资币种）
+	DcyMaxSize float64   `json:"dcyMaxSize"`
+	ExpTime    time.Time `json:"expTime"` // 到期时间（UTC）
+	Days       float64   `json:"days"`    // 距到期天数
+	Spot       float64   `json:"spot"`    // 匹配时现价（USDT 口径，供金额换算）
 
 	// DCY 侧
 	DcyAPR float64 `json:"dcyApr"` // 年化（统一小数口径）

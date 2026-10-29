@@ -394,6 +394,82 @@ func TestTUIExpiryFilterFlow(t *testing.T) {
 	}
 }
 
+func TestTUIExpiryPanelRendered(t *testing.T) {
+	app, _ := bootApp(t)
+	m, _ := app.Update(key('e'))
+	app = m.(App)
+	v := app.View()
+	if !strings.Contains(v, "到期时间筛选") {
+		t.Fatalf("e 后应渲染到期输入面板:\n%s", v)
+	}
+	if !strings.Contains(v, "可用到期") {
+		t.Fatalf("到期面板应提示可用到期日:\n%s", v)
+	}
+}
+
+func TestTUIExpiryClearRestoresRows(t *testing.T) {
+	app, _ := bootApp(t)
+	if len(app.refs) != 2 {
+		t.Fatalf("初始行数 %d", len(app.refs))
+	}
+	// 应用 2026-11-06 与测试快照（now+10d）不匹配 → 0 行
+	m, _ := app.Update(key('e'))
+	app = m.(App)
+	app.expInput.SetValue("2026-11-06")
+	m, _ = app.Update(enter())
+	app = m.(App)
+	m, _ = app.Update(snapMsg{snap: buildTestSnap()})
+	app = m.(App)
+	if len(app.refs) != 0 {
+		t.Fatalf("筛选后应为 0 行，实际 %d", len(app.refs))
+	}
+	if !strings.Contains(app.View(), "无匹配行") {
+		t.Fatalf("空表格应有提示:\n%s", app.View())
+	}
+	// Esc 清除筛选 → 恢复全量
+	m, _ = app.Update(esc())
+	app = m.(App)
+	if !app.expFilter.IsZero() {
+		t.Fatalf("Esc 应清除 expFilter，实际 %v", app.expFilter)
+	}
+	if len(app.refs) != 2 {
+		t.Fatalf("清除后应恢复 2 行，实际 %d", len(app.refs))
+	}
+}
+
+func TestTUIExpiryBarDays(t *testing.T) {
+	app, _ := bootApp(t)
+	if len(app.expiryCounts()) == 0 {
+		t.Fatal("expiryCounts 不应为空")
+	}
+	if v := app.View(); !strings.Contains(v, "全部") {
+		t.Fatalf("到期快捷栏应显示「全部」:\n%s", v)
+	}
+}
+
+func TestTUIDetailLineShowsReason(t *testing.T) {
+	app, _ := bootApp(t)
+	v := app.View()
+	for _, want := range []string{"原因 test", "偏差", "BTC-USD-261106-80000-C"} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("选中行详情应包含 %q:\n%s", want, v)
+		}
+	}
+}
+
+func TestTUIColumnsFitWidth(t *testing.T) {
+	app, _ := bootApp(t)
+	m, _ := app.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	app = m.(App)
+	total := 0
+	for _, c := range app.table.Columns() {
+		total += c.Width + 2 // 单元格左右内边距各 1
+	}
+	if total > 120 {
+		t.Fatalf("终端 120 宽时列宽总和 %d 超宽", total)
+	}
+}
+
 // ─── Settings / 自动执行 ───
 
 func TestTUISettingsToggleAuto(t *testing.T) {
