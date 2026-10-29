@@ -244,7 +244,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		a.width, a.height = msg.Width, msg.Height
 		a.table.SetColumns(columnsFor(msg.Width))
 		a.table.SetWidth(min(a.width, 132))
-		a.table.SetHeight(max(5, msg.Height-9))
+		a.table.SetHeight(max(5, msg.Height-10))
 		return a, nil
 
 	case tickMsg:
@@ -541,6 +541,9 @@ func (a App) View() string {
 
 	foot := footerStyle.Render(a.footerLine())
 	out := title + "\n" + header
+	if a.view == viewTable && a.snap != nil {
+		out += "\n" + a.legendLine()
+	}
 	if bar != "" {
 		out += "\n" + bar
 	}
@@ -572,7 +575,7 @@ func (a App) emptyHint() string {
 	return hintStyle.Render("  本轮无对齐决策：可调整阈值（5 设置）或 r 刷新")
 }
 
-// detailLine 当前选中行的补充信息（完整合约、偏差、原因），弥补主表列宽限制。
+// detailLine 当前选中行的补充信息（完整合约、方向、偏差、原因），弥补主表列宽限制。
 func (a App) detailLine() string {
 	ref, ok := a.currentRef()
 	if !ok || a.snap == nil {
@@ -585,8 +588,11 @@ func (a App) detailLine() string {
 		if r.OptInstID != "" {
 			parts = append(parts, "→ "+r.OptInstID)
 		}
-		parts = append(parts, fmt.Sprintf("到期 %s（%s）", strategy.FormatExpTime(r.ExpTime), string(r.OptType)))
+		parts = append(parts, fmt.Sprintf("%s · 到期 %s", tradeDesc(d), strategy.FormatExpTime(r.ExpTime)))
 		parts = append(parts, fmt.Sprintf("行权 %.0f · 偏差 %+.2f%%", r.Strike, r.StrikeErrPct))
+		if d.Action == strategy.ActionSubscribeDual && r.InvestCcy != "" {
+			parts = append(parts, "投入 "+r.InvestCcy)
+		}
 		parts = append(parts, "原因 "+d.ReasonCode)
 		if d.SuggestedAmt > 0 {
 			parts = append(parts, fmt.Sprintf("建议 %.0f %s", d.SuggestedAmt, r.InvestCcy))
@@ -594,8 +600,17 @@ func (a App) detailLine() string {
 		return hintStyle.Render(" " + strings.Join(parts, "  ·  "))
 	}
 	or := a.snap.OptionRows[ref.idx]
-	return hintStyle.Render(fmt.Sprintf(" %s · 到期 %s 08:00 · 行权 %.0f%s · 期权 APR %.2f%% · 结算 %s",
-		or.InstID, strategy.InstExpiryDay(or.InstID), or.Strike, string(or.OptType), or.OptAPR*100, or.SettleCcy))
+	return hintStyle.Render(fmt.Sprintf(" %s · %s · 到期 %s 08:00 · 行权 %.0f · 期权 APR %.2f%% · 结算 %s · 参考排名，下单请选中上方决策行",
+		or.InstID, strategy.OptTypeName(or.OptType), strategy.InstExpiryDay(or.InstID), or.Strike, or.OptAPR*100, or.SettleCcy))
+}
+
+// legendLine 方向/操作图例：解决「C/P 到底是什么意思、买还是卖」的歧义。
+func (a App) legendLine() string {
+	return hintStyle.Render(" 方向 ") +
+		okStyle.Render("CALL 看涨") + hintStyle.Render(" / ") +
+		errStyle.Render("PUT 看跌") + hintStyle.Render("  ·  操作 ") +
+		okStyle.Render("卖=卖出期权收权利金") + hintStyle.Render("  ·  ") +
+		primaryStyle.Render("申购=双币赢") + hintStyle.Render("（高卖投入币 / 低买投入 USDT）")
 }
 
 func (a App) placeholder() string {
@@ -701,7 +716,7 @@ func (a App) settingsView() string {
 		fmt.Sprintf("模式 %s  ·  标的 %s  ·  参数文件 settings.json", a.exec.Mode(), a.uly),
 		"",
 		"策略参数（[ / ] 调整阈值 ±5pp，下一次刷新生效）",
-		fmt.Sprintf("  期权边际阈值  : %.0f pp   （期权 APR 高出 DCY 不足此值 → 投注双币赢）", a.settings.MinOptionEdgePP),
+		fmt.Sprintf("  期权边际阈值  : %.0f pp   （期权 APR 高出 DCY 不足此值 → 申购双币赢）", a.settings.MinOptionEdgePP),
 		fmt.Sprintf("  行权价最大偏差: %.2f%%", a.settings.MaxStrikeGapPct),
 		fmt.Sprintf("  期限窗口      : %.0f–%.0f 天（固定）", a.params.DaysMin, a.params.DaysMax),
 		fmt.Sprintf("  单笔建议上限  : %.0f USDT", a.params.CapitalCap),
@@ -855,8 +870,8 @@ func (a App) autoCandidate() (*orderDraft, string) {
 				kind:   "option",
 				instID: d.Row.OptInstID,
 				sz:     sz,
-				label: fmt.Sprintf("卖出 %s %.0f 张（期权 APR %.1f%% vs DCY %.1f%%，差 %.1fpp）",
-					d.Row.OptInstID, sz, d.Row.OptAPR*100, d.Row.DcyAPR*100, d.Row.Diff*100),
+				label: fmt.Sprintf("卖出 %s %s %.0f 张（期权 APR %.1f%% vs DCY %.1f%%，差 %.1fpp）",
+					strategy.OptTypeName(d.Row.OptType), d.Row.OptInstID, sz, d.Row.OptAPR*100, d.Row.DcyAPR*100, d.Row.Diff*100),
 			}, ""
 		case strategy.ActionSubscribeDual:
 			prod, ok := a.snap.Products[d.Row.ProductID]
@@ -1044,13 +1059,14 @@ func (a App) startOption() (tea.Model, tea.Cmd) {
 	}
 	d := a.snap.Decisions[ref.idx]
 	if d.Action != strategy.ActionBuyOption || !d.Row.OptMatched {
-		a.flash, a.flashIsErr = "该行建议不是“押注期权”", true
+		a.flash, a.flashIsErr = "该行建议不是「卖出期权」", true
 		return a, nil
 	}
 	a.draft = &orderDraft{
 		kind:   "option",
 		instID: d.Row.OptInstID,
-		label:  fmt.Sprintf("卖出 %s（行权 %.0f，%s 到期，期权 APR %.2f%%）", d.Row.OptInstID, d.Row.Strike, d.Row.ExpTime.Format("2006-01-02"), d.Row.OptAPR*100),
+		label: fmt.Sprintf("卖出 %s %s（行权 %.0f，%s 到期，期权 APR %.2f%%）",
+			strategy.OptTypeName(d.Row.OptType), d.Row.OptInstID, d.Row.Strike, d.Row.ExpTime.Format("2006-01-02"), d.Row.OptAPR*100),
 	}
 	a.inputMode = true
 	a.input.SetValue("1")
@@ -1070,7 +1086,7 @@ func (a App) startDCD() (tea.Model, tea.Cmd) {
 	}
 	d := a.snap.Decisions[ref.idx]
 	if d.Action != strategy.ActionSubscribeDual {
-		a.flash, a.flashIsErr = "该行建议不是“投注双币赢”", true
+		a.flash, a.flashIsErr = "该行建议不是「申购双币赢」", true
 		return a, nil
 	}
 	prod, ok := a.snap.Products[d.Row.ProductID]
@@ -1088,9 +1104,9 @@ func (a App) startDCD() (tea.Model, tea.Cmd) {
 	a.draft = &orderDraft{
 		kind:    "dcd",
 		product: prod,
-		label: fmt.Sprintf("申购 %s：行权 %.0f，absYield %.6f（APR %.2f%%），到期 %s",
-			prod.ProductID, float64(prod.Strike), float64(prod.AbsYield),
-			float64(prod.AnnualizedYield)*100, time.UnixMilli(int64(prod.ExpTime)).Format("2006-01-02")),
+		label: fmt.Sprintf("申购双币赢·%s %s：行权 %.0f，absYield %.6f（APR %.2f%%），投入 %s，到期 %s",
+			strategy.DcySideName(d.Row.OptType), prod.ProductID, float64(prod.Strike), float64(prod.AbsYield),
+			float64(prod.AnnualizedYield)*100, prod.NotionalCcy, time.UnixMilli(int64(prod.ExpTime)).Format("2006-01-02")),
 	}
 	a.inputMode = true
 	a.input.SetValue(strconv.FormatFloat(def, 'f', -1, 64))
@@ -1469,10 +1485,10 @@ func (a App) buildRows() []table.Row {
 			amt = fmt.Sprintf("%.0f %s", d.SuggestedAmt, r.InvestCcy)
 		}
 		rows = append(rows, table.Row{
-			actionLabel(d.Action),
+			decisionLabel(d),
 			product,
 			strategy.FormatExpTime(r.ExpTime),
-			string(r.OptType),
+			strategy.OptTypeName(r.OptType),
 			fmt.Sprintf("%.0f", r.Strike),
 			pct(r.DcyAPR), pct(r.OptAPR), diffCell(r.Diff),
 			fmt.Sprintf("%.0f", r.Days),
@@ -1485,7 +1501,7 @@ func (a App) buildRows() []table.Row {
 			opportunityStyle.Render("期权榜"),
 			or.InstID,
 			strategy.FormatExpTime(orExpiry(or)),
-			string(or.OptType),
+			strategy.OptTypeName(or.OptType),
 			fmt.Sprintf("%.0f", or.Strike),
 			"—",
 			pct(or.OptAPR),
@@ -1527,7 +1543,7 @@ func columns() []table.Column {
 func columnsFor(totalWidth int) []table.Column {
 	const ncol = 10
 	budget := totalWidth - 2*ncol
-	const fixed = 10 + 16 + 2 + 9 + 9 + 10 + 8 + 4 + 10 // 建议/到期/T/行权/DCY/期权/差/天/金额
+	const fixed = 10 + 16 + 5 + 9 + 9 + 10 + 8 + 4 + 10 // 操作/到期/方向/行权/DCY/期权/差/天/金额
 	product := budget - fixed
 	if product < 14 {
 		product = 14
@@ -1536,10 +1552,10 @@ func columnsFor(totalWidth int) []table.Column {
 		product = 34
 	}
 	return []table.Column{
-		{Title: "建议", Width: 10},
+		{Title: "操作", Width: 10},
 		{Title: "产品/合约", Width: product},
 		{Title: "到期(UTC)", Width: 16},
-		{Title: "T", Width: 2},
+		{Title: "方向", Width: 5},
 		{Title: "行权价", Width: 9},
 		{Title: "DCY APR%", Width: 9},
 		{Title: "期权 APR%", Width: 10},
@@ -1568,17 +1584,29 @@ func diffCell(v float64) string {
 	}
 }
 
-func actionLabel(a strategy.Action) string {
-	switch a {
+// decisionLabel 决策行的「操作」列：明确买/卖与 CALL/PUT。
+func decisionLabel(d strategy.Decision) string {
+	switch d.Action {
 	case strategy.ActionBuyOption:
-		return okStyle.Render("押注期权")
+		return okStyle.Render("卖" + strategy.OptTypeName(d.Row.OptType))
 	case strategy.ActionSubscribeDual:
-		return primaryStyle.Render("投注双币赢")
+		return primaryStyle.Render("申购" + strategy.DcySideName(d.Row.OptType))
 	case strategy.ActionUnaligned:
 		return warnStyle.Render("不可对齐")
 	default:
 		return "—"
 	}
+}
+
+// tradeDesc 一句话说明该行的真实交易方向（买/卖 + CALL/PUT）。
+func tradeDesc(d strategy.Decision) string {
+	switch d.Action {
+	case strategy.ActionBuyOption:
+		return "卖出" + strategy.OptTypeName(d.Row.OptType) + "（开空收权利金）"
+	case strategy.ActionSubscribeDual:
+		return "申购双币赢·" + strategy.DcySideName(d.Row.OptType)
+	}
+	return "不可对齐（不下单）"
 }
 
 func min(x, y int) int {

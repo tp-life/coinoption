@@ -69,6 +69,9 @@ const indexHTML = `<!DOCTYPE html>
   .controls button.day { padding:4px 10px; }
   .controls input[type=date] { background:#0d1117; color:var(--txt); border:1px solid var(--line); padding:4px 8px; border-radius:4px; font-family:inherit; font-size:12px; }
   .controls .status { color:var(--warn); font-size:12px; }
+  .legend { padding:6px 20px; border-bottom:1px solid var(--line); color:var(--mut); font-size:12px; }
+  .legend .call { color:var(--ok); font-weight:600; } .legend .put { color:var(--err); font-weight:600; }
+  .legend .sell { color:var(--ok); } .legend .sub { color:var(--accent); }
   main { padding:12px 20px 20px; }
   .wrap { overflow-x:auto; }
   table { border-collapse: collapse; width:100%; }
@@ -99,12 +102,19 @@ const indexHTML = `<!DOCTYPE html>
   <button id="expClear">全部</button>
   <span class="status" id="status"></span>
 </div>
+<div class="legend">
+  <span class="call">CALL 看涨</span> / <span class="put">PUT 看跌</span>
+  <span class="sep">｜</span>
+  <span class="sell">卖=卖出期权收权利金（开空）</span>
+  <span class="sep">｜</span>
+  <span class="sub">申购=双币赢</span><span>（高卖投入币 / 低买投入 USDT）</span>
+</div>
 <main>
   <div class="wrap">
     <table>
       <thead>
         <tr>
-          <th>建议</th><th>产品/合约</th><th>到期(UTC)</th><th>T</th><th>行权价</th>
+          <th>操作</th><th>产品/合约</th><th>到期(UTC)</th><th>方向</th><th>行权价</th>
           <th>DCY APR%</th><th>期权 APR%</th><th>差%</th><th>天</th>
           <th>偏差%</th><th>原因</th><th>建议金额</th>
         </tr>
@@ -143,8 +153,16 @@ function optDay(instId) {
 
 function pct(v) { return v == null ? "-" : (v * 100).toFixed(2); }
 
-function actTxt(a) { return a === "buy_option" ? "押注期权" : a === "subscribe_dual" ? "投注双币赢" : a === "unaligned" ? "不可对齐" : "—"; }
+function optTypeName(t) { return t === "C" || t === "c" ? "CALL" : t === "P" || t === "p" ? "PUT" : "-"; }
+function dcySideName(t) { return t === "C" || t === "c" ? "高卖" : t === "P" || t === "p" ? "低买" : "—"; }
+function actTxt(d) {
+  if (d.action === "buy_option") return "卖" + optTypeName(d.row && d.row.optType);
+  if (d.action === "subscribe_dual") return "申购" + dcySideName(d.row && d.row.optType);
+  if (d.action === "unaligned") return "不可对齐";
+  return "—";
+}
 function cls(a) { return a === "buy_option" ? "buy" : a === "subscribe_dual" ? "dual" : a === "unaligned" ? "unaligned" : "none"; }
+function typeCls(t) { return optTypeName(t) === "CALL" ? "buy" : optTypeName(t) === "PUT" ? "unaligned" : "none"; }
 
 function expiryDays(decisions, optionRows) {
   const m = new Map();
@@ -193,10 +211,10 @@ function renderRows(j) {
     const r = isDec ? d.row : d;
     const tr = document.createElement("tr");
     const cells = [
-      { v: isDec ? actTxt(d.action) : "期权榜", c: isDec ? cls(d.action) : "none" },
+      { v: isDec ? actTxt(d) : "期权榜", c: isDec ? cls(d.action) : "none" },
       { v: r.productId || r.instId || "-" },
       { v: isDec ? expStr(r.expTime) : optDay(r.instId) },
-      { v: r.optType || "-" },
+      { v: optTypeName(r.optType), c: typeCls(r.optType) },
       { v: r.strike != null ? Math.round(r.strike) : "-" },
       { v: isDec ? pct(r.dcyApr) : "-" },
       { v: pct(r.optApr) },

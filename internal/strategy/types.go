@@ -72,3 +72,25 @@ type MatchRow struct {
 
 	Diff float64 `json:"diff"` // apr_opt − apr_dcy（年化）
 }
+
+// OptTypeName 期权方向展示名：C → CALL（看涨），P → PUT（看跌）。
+func OptTypeName(t rune) string {
+	switch t {
+	case 'C', 'c':
+		return "CALL"
+	case 'P', 'p':
+		return "PUT"
+	}
+	return "—"
+}
+
+// DcySideName 双币赢方向的中文说明：C → 高卖（投入币），P → 低买（投入 USDT）。
+func DcySideName(t rune) string {
+	switch t {
+	case 'C', 'c':
+		return "高卖"
+	case 'P', 'p':
+		return "低买"
+	}
+	return "—"
+}

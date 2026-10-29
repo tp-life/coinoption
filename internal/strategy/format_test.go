@@ -55,6 +55,28 @@ func TestInstExpiryDay(t *testing.T) {
 	}
 }
 
+func TestOptTypeNames(t *testing.T) {
+	cases := []struct {
+		side rune
+		opt  string
+		dcy  string
+	}{
+		{side: 'C', opt: "CALL", dcy: "高卖"},
+		{side: 'P', opt: "PUT", dcy: "低买"},
+		{side: 'c', opt: "CALL", dcy: "高卖"},
+		{side: 'p', opt: "PUT", dcy: "低买"},
+		{side: 'X', opt: "—", dcy: "—"},
+	}
+	for _, c := range cases {
+		if got := OptTypeName(c.side); got != c.opt {
+			t.Fatalf("OptTypeName(%q) = %q, want %q", c.side, got, c.opt)
+		}
+		if got := DcySideName(c.side); got != c.dcy {
+			t.Fatalf("DcySideName(%q) = %q, want %q", c.side, got, c.dcy)
+		}
+	}
+}
+
 func TestSupportedOptionInsts(t *testing.T) {
 	ds := []Decision{
 		{Row: MatchRow{OptMatched: true, OptInstID: "BTC-USD-261106-80000-C"}},

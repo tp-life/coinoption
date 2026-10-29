@@ -89,13 +89,17 @@ func (f *fakeExec) State() executor.GuardState {
 func buildTestSnap() *market.Snapshot {
 	now := time.Now()
 	mk := func(action strategy.Action, pid string, optMatched bool) strategy.Decision {
+		side := rune('C')
+		if strings.HasSuffix(pid, "-P") {
+			side = 'P'
+		}
 		return strategy.Decision{
 			Action:       action,
 			ReasonCode:   "test",
 			SuggestedAmt: 100,
 			Ts:           now,
 			Row: strategy.MatchRow{
-				ProductID: pid, Uly: "BTC-USD", OptType: 'C', Strike: 80000,
+				ProductID: pid, Uly: "BTC-USD", OptType: side, Strike: 80000,
 				InvestCcy: "USDT", DcyAPR: 0.3, OptAPR: 0.6, Diff: 0.3,
 				Days: 10, ExpTime: now.Add(10 * 24 * time.Hour),
 				OptMatched: optMatched, OptInstID: "BTC-USD-261106-80000-C",
@@ -527,6 +531,22 @@ func TestTUIDetailLineShowsReason(t *testing.T) {
 	for _, want := range []string{"原因 test", "偏差", "BTC-USD-261106-80000-C"} {
 		if !strings.Contains(v, want) {
 			t.Fatalf("选中行详情应包含 %q:\n%s", want, v)
+		}
+	}
+}
+
+func TestTUIDecisionLabelsShowSideAndAction(t *testing.T) {
+	app, _ := bootApp(t)
+	v := app.View()
+	for _, want := range []string{
+		"方向", "操作", // 列头
+		"CALL", "PUT", // T 列展示方向名称
+		"卖CALL", "申购低买", // 操作列明确买/卖
+		"卖出CALL（开空收权利金）", // 详情行一句话方向
+		"申购=双币赢",         // 图例
+	} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("界面应包含 %q:\n%s", want, v)
 		}
 	}
 }

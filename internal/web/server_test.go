@@ -95,6 +95,11 @@ func TestIndexPageContainsControls(t *testing.T) {
 		`id="exp"`,
 		`id="expClear"`,
 		"到期(UTC)",
+		"CALL 看涨",
+		"PUT 看跌",
+		"卖出期权收权利金",
+		"<th>方向</th>",
+		"<th>操作</th>",
 	} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("首页缺少 %q", want)
