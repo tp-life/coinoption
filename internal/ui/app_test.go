@@ -648,16 +648,33 @@ func TestTUIOptionRowsShowSell(t *testing.T) {
 	app, _ := bootApp(t)
 	snap := buildTestSnap()
 	snap.OptionRows = []strategy.OptionRow{
-		{InstID: "BTC-USD-261106-80000-C", OptType: 'C', OptAPR: 0.5, Strike: 80000, Days: 10},
+		{InstID: "BTC-USD-261106-80000-C", OptType: 'C', OptAPR: 0.5, APRValid: true, BidPx: "0.02",
+			Strike: 80000, SpotPx: 79500, StrikeDiff: 500, StrikeDiffPct: 0.63, Days: 10},
 	}
 	m, _ := app.Update(snapMsg{snap: snap})
 	app = m.(App)
-	rows := app.table.Rows()
-	if len(rows) != 3 {
-		t.Fatalf("应渲染 2 条决策 + 1 条期权榜，实际 %d", len(rows))
+	// 决策页只渲染 DCY 决策（2 条），期权链不再混排进来。
+	if rows := app.table.Rows(); len(rows) != 2 {
+		t.Fatalf("决策页应只渲染 2 条决策，实际 %d", len(rows))
 	}
-	if !strings.Contains(rows[2][0], "卖出期权") {
-		t.Fatalf("期权榜行的操作列应为「卖出期权」（SELL），实际 %q", rows[2][0])
+	// 按 2 切到完整期权链页。
+	m, _ = app.Update(key('2'))
+	app = m.(App)
+	if app.view != viewChain {
+		t.Fatal("2 应切到期权链视图")
+	}
+	rows := app.table.Rows()
+	if len(rows) != 1 {
+		t.Fatalf("期权链页应渲染 1 条期权，实际 %d", len(rows))
+	}
+	if !strings.Contains(rows[0][0], "卖出期权") {
+		t.Fatalf("期权链行的操作列应为「卖出期权」（SELL），实际 %q", rows[0][0])
+	}
+	// 按 1 回决策页，行数恢复为决策数。
+	m, _ = app.Update(key('1'))
+	app = m.(App)
+	if app.view != viewTable || len(app.table.Rows()) != 2 {
+		t.Fatalf("1 应回到决策页（2 条），实际 view=%v rows=%d", app.view, len(app.table.Rows()))
 	}
 }
 
@@ -873,4 +890,87 @@ func TestTUIAutoIntegrationWithExecutor(t *testing.T) {
 	if pos2, _ := ex.Positions(); len(pos2.Sim) != 1 {
 		t.Fatalf("不应新增纸面单: %d", len(pos2.Sim))
 	}
+}
+
+// 方向/本位筛选切换后写入 settings.json（重启恢复）。
+func TestTUIFiltersPersistToSettings(t *testing.T) {
+	app, fe := bootApp(t)
+
+	// t → PUT
+	m, _ := app.Update(key('t'))
+	app = m.(App)
+	m, _ = app.Update(down()) // 全部 → CALL
+	app = m.(App)
+	m, _ = app.Update(down()) // CALL → PUT
+	app = m.(App)
+	m, _ = app.Update(enter())
+	app = m.(App)
+	if app.sideFilter != 'P' {
+		t.Fatalf("方向筛选应为 PUT，实际 %q", app.sideFilter)
+	}
+	if fe.settings.SideFilter != "P" {
+		t.Fatalf("settings.SideFilter 应落盘为 P，实际 %q", fe.settings.SideFilter)
+	}
+
+	// b → U本位
+	m, _ = app.Update(key('b'))
+	app = m.(App)
+	m, _ = app.Update(down()) // 全部 → 币本位
+	app = m.(App)
+	m, _ = app.Update(down()) // 币本位 → U本位
+	app = m.(App)
+	m, _ = app.Update(enter())
+	app = m.(App)
+	if app.settleFilter != 'U' {
+		t.Fatalf("本位筛选应为 U，实际 %q", app.settleFilter)
+	}
+	if fe.settings.SettleFilter != "U" {
+		t.Fatalf("settings.SettleFilter 应落盘为 U，实际 %q", fe.settings.SettleFilter)
+	}
+
+	// 重启（同一 fakeExec 持有 settings）→ 筛选恢复。
+	app2 := New(fakeFetcher{snap: buildTestSnap()}, fe, "BTC-USDT")
+	if app2.sideFilter != 'P' || app2.settleFilter != 'U' {
+		t.Fatalf("重启后应恢复 P/U 筛选，实际 %q/%q", app2.sideFilter, app2.settleFilter)
+	}
+
+	// Esc 清除并同步落盘。
+	m, _ = app.Update(esc())
+	app = m.(App)
+	if app.sideFilter != 0 || app.settleFilter != 0 {
+		t.Fatalf("Esc 后筛选应清空，实际 %q/%q", app.sideFilter, app.settleFilter)
+	}
+	if fe.settings.SideFilter != "" || fe.settings.SettleFilter != "" {
+		t.Fatalf("清除后 settings 应为空，实际 %q/%q", fe.settings.SideFilter, fe.settings.SettleFilter)
+	}
+}
+
+// 每行单元格数必须与表头列数一致（新增/删除列时防止错位）。
+func TestTUIRowsMatchColumns(t *testing.T) {
+	app, _ := bootApp(t)
+	m, _ := app.Update(tea.WindowSizeMsg{Width: 132, Height: 40})
+	app = m.(App)
+	snap := buildTestSnap()
+	snap.OptionRows = []strategy.OptionRow{
+		{InstID: "BTC-USD-261106-80000-C", OptType: 'C', OptAPR: 0.5, APRValid: true,
+			BidPx: "0.02", Strike: 80000, SpotPx: 79500, Days: 10},
+	}
+	m, _ = app.Update(snapMsg{snap: snap})
+	app = m.(App)
+	check := func(page string) {
+		cols := len(app.table.Columns())
+		rows := app.table.Rows()
+		if len(rows) == 0 {
+			t.Fatalf("%s 应渲染表格行", page)
+		}
+		for i, r := range rows {
+			if len(r) != cols {
+				t.Fatalf("%s 第 %d 行列数 %d ≠ 表头列数 %d", page, i, len(r), cols)
+			}
+		}
+	}
+	check("决策页")
+	m, _ = app.Update(key('2'))
+	app = m.(App)
+	check("期权链页")
 }

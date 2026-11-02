@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -31,14 +32,16 @@ func parseOptInstID(instId string) (uly string, strike float64, optType rune, ym
 
 // buildOptQuotes 由期权 instruments + tickers 构建归一化报价。
 // instruments 提供 expTime/ctVal 等静态信息；tickers 提供盘口。
-func buildOptQuotes(instruments []okx.Instrument, tickers []okx.OptionTicker) []OptQuote {
+// requireBid=true 时跳过无买盘的合约（决策匹配用）；false 时保留整条链
+// （机会榜展示用，无买盘档位仍展示报价，只是算不出卖方 APR）。
+func buildOptQuotes(instruments []okx.Instrument, tickers []okx.OptionTicker, requireBid bool) []OptQuote {
 	insByID := make(map[string]okx.Instrument, len(instruments))
 	for _, i := range instruments {
 		insByID[i.InstID] = i
 	}
 	out := make([]OptQuote, 0, len(tickers))
 	for _, t := range tickers {
-		if t.BidPx == "" {
+		if requireBid && t.BidPx == "" {
 			continue // 买盘为空 → 无法做卖方
 		}
 		uly, strike, optType, ymd, ok := parseOptInstID(t.InstID)
@@ -52,6 +55,7 @@ func buildOptQuotes(instruments []okx.Instrument, tickers []okx.OptionTicker) []
 			Strike:  strike,
 			BidPx:   t.BidPx,
 			AskPx:   t.AskPx,
+			MarkPx:  t.MarkPx,
 		}
 		if ins, has := insByID[t.InstID]; has {
 			if v, err := strconv.ParseFloat(ins.CtVal, 64); err == nil {
@@ -84,13 +88,16 @@ func buildOptQuotes(instruments []okx.Instrument, tickers []okx.OptionTicker) []
 //
 // 匹配规则：
 //  1. optType 同向：DCY 的 P（低买） ↔ 期权 P（卖 put）；C ↔ C
-//  2. 底层同名：DCDProduct.Uly（BTC-USD）对期权链；USDT 本位变体（_UM）视为同标的
+//  2. 底层同名：按标的币比较（BTC-USDT ↔ BTC-USD ↔ BTC-USD_UM 均视为同标的）
 //  3. 行权价：完全相等优先，否则取最近档位并记录偏差
-//  4. 到期日：同日优先（OKX DCY 与期权同为 UTC 08:00 结算），否则 ±1 天窗口内最近
+//  4. 到期日：同日优先（UTC 结算，但 DCY 与期权的结算时刻可能不同），否则 ±1 天窗口内最近
 func Match(dcds []okx.DCDProduct, instruments []okx.Instrument, tickers []okx.OptionTicker,
 	spot map[string]float64, now time.Time) []MatchRow {
 
-	opts := buildOptQuotes(instruments, tickers)
+	// 候选包含无买盘档位：优先选「有买盘且最近」的可成交档；若该到期日
+	// 全部没有买盘，仍建立展示层对齐（OptMatched=true，但不产生动作），
+	// 避免「合约明明存在」却显示未对齐。
+	opts := buildOptQuotes(instruments, tickers, false)
 	rows := make([]MatchRow, 0, len(dcds))
 
 	for _, d := range dcds {
@@ -117,18 +124,29 @@ func Match(dcds []okx.DCDProduct, instruments []okx.Instrument, tickers []okx.Op
 		}
 
 		// 找最近匹配期权（同底层 + 同向 + 同到期日 ±1 天，行权价最近优先）
-		var best OptQuote
-		bestScore := 1e18
-		found := false
+		var best, bestAny OptQuote
+		bestScore, bestAnyScore := 1e18, 1e18
+		found, foundAny := false, false
 		for _, q := range opts {
 			if q.OptType != row.OptType || namingDiff(q.Uly, d.Uly) {
 				continue
 			}
-			absDays := q.Expiry.Sub(exp).Hours() / 24
-			if absDays < 0 || absDays > 1 {
+			// 到期日窗口 ±1 天：DCY 与期权同为 UTC 结算，但结算时刻可能
+			// 不同（币本位期权 08:00、DCY/UM 可能 16:00）。必须取绝对值，
+			// 否则「期权到期早于 DCY 8 小时」会被误判为窗口外 → 未对齐。
+			absDays := math.Abs(q.Expiry.Sub(exp).Hours() / 24)
+			if absDays > 1 {
 				continue
 			}
 			score := math.Abs(strikeGapPct(q.Strike, float64(d.Strike), spotPrice)) + absDays*0.01
+			if !foundAny || score < bestAnyScore {
+				bestAnyScore = score
+				bestAny = q
+				foundAny = true
+			}
+			if q.BidPx == "" {
+				continue
+			}
 			if !found || score < bestScore {
 				bestScore = score
 				best = q
@@ -136,13 +154,26 @@ func Match(dcds []okx.DCDProduct, instruments []okx.Instrument, tickers []okx.Op
 			}
 		}
 		if !found {
+			// 有合约但无买盘：只做展示对齐（箭头/合约号），动作仍按
+			// no_option_quote 处理，不给出可执行建议。
+			if foundAny {
+				row.OptMatched = true
+				row.OptInstID = bestAny.InstID
+				row.OptSettleCcy = bestAny.SettleCcy
+				row.StrikeErrPct = strikeGapPct(bestAny.Strike, float64(d.Strike), spotPrice)
+			}
 			rows = append(rows, row)
 			continue
 		}
 
 		aprOpt, _, err := ShortOptionAPR(best, spotPrice, now)
 		if err != nil {
-			rows = append(rows, row) // 盘口缺失等，视同无期权报价
+			// 有盘口但无法计算 APR：同样保留展示对齐。
+			row.OptMatched = true
+			row.OptInstID = best.InstID
+			row.OptSettleCcy = best.SettleCcy
+			row.StrikeErrPct = strikeGapPct(best.Strike, float64(d.Strike), spotPrice)
+			rows = append(rows, row)
 			continue
 		}
 		row.OptMatched = true
@@ -154,17 +185,33 @@ func Match(dcds []okx.DCDProduct, instruments []okx.Instrument, tickers []okx.Op
 		row.Diff = aprOpt - row.DcyAPR
 		rows = append(rows, row)
 	}
+	// 决策行同样按「到期日 → 行权价 → 方向」稳定排序，避免 DCY 接口返回
+	// 顺序（C 组在前、P 组在后）导致价格忽高忽低看起来乱序。
+	sort.SliceStable(rows, func(i, j int) bool {
+		a, b := rows[i], rows[j]
+		if !a.ExpTime.Equal(b.ExpTime) {
+			return a.ExpTime.Before(b.ExpTime)
+		}
+		if a.Strike != b.Strike {
+			return a.Strike < b.Strike
+		}
+		if a.OptType != b.OptType {
+			return a.OptType < b.OptType
+		}
+		return a.ProductID < b.ProductID
+	})
 	return rows
 }
 
-// namingDiff 判断期权 uly 与 DCY 底层是否指向同一标的指数。
-// 恒等（BTC-USD）或 USDT 本位变体（BTC-USD_UM）都认同一标的。
+// namingDiff 判断期权 uly 与 DCY 底层是否指向同一标的。
+// 按标的币（BTC/ETH/SOL…）比较：BTC-USDT ↔ BTC-USD ↔ BTC-USD_UM 均视为
+// 同一标的。此前按字符串前缀比较，真实 DCY 产品 uly 为 BTC-USDT 时与期权
+// BTC-USD 前缀不匹配，导致明知同价同到期的双币赢/期权被判为未对齐。
 func namingDiff(optUly, dcyUly string) bool {
-	if optUly == dcyUly {
-		return false
+	if optUly == "" || dcyUly == "" {
+		return true
 	}
-	base := strings.TrimSuffix(dcyUly, "_UM")
-	return !strings.HasPrefix(optUly, base)
+	return currencyOf(optUly) != currencyOf(dcyUly)
 }
 
 // strikeGapPct 两个行权价的偏差，以现价为基数的百分比。

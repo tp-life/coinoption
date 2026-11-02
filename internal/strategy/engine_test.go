@@ -196,23 +196,36 @@ func TestUSDTMarginedVariantMatches(t *testing.T) {
 	assertNear(t, "optAPR(USDT)", rows[0].OptAPR, target, 1e-9)
 }
 
-// 排序：可执行动作优先、diff 大者靠前。
+// 排序：动作优先；同动作内按到期日 → 行权价 → 本位 → 方向，不再按 Diff。
 func TestSortOrder(t *testing.T) {
+	day := func(d int) time.Time { return time.Date(2026, 3, d, 8, 0, 0, 0, time.UTC) }
 	ds := []Decision{
-		{Action: ActionSubscribeDual, Row: MatchRow{Diff: 0.05}},
-		{Action: ActionBuyOption, Row: MatchRow{Diff: 0.30}},
-		{Action: ActionUnaligned},
-		{Action: ActionSubscribeDual, Row: MatchRow{Diff: 0.10}},
+		{Action: ActionSubscribeDual, Row: MatchRow{ExpTime: day(20), Strike: 70000, Diff: 0.50}},
+		{Action: ActionBuyOption, Row: MatchRow{ExpTime: day(20), Strike: 90000, Diff: 0.05}},
+		{Action: ActionUnaligned, Row: MatchRow{ExpTime: day(10), Strike: 50000}},
+		{Action: ActionBuyOption, Row: MatchRow{ExpTime: day(10), Strike: 80000, Diff: 0.30}},
+		{Action: ActionBuyOption, Row: MatchRow{ExpTime: day(20), Strike: 85000, Diff: 0.20}},
+		{Action: ActionNone, Row: MatchRow{ExpTime: day(1), Strike: 1}},
 	}
 	Sort(ds)
-	if ds[0].Action != ActionBuyOption {
-		t.Fatalf("first should be buy_option, got %s", ds[0].Action)
+	want := []struct {
+		action Action
+		day    int
+		strike float64
+	}{
+		{ActionBuyOption, 10, 80000},
+		{ActionBuyOption, 20, 85000},
+		{ActionBuyOption, 20, 90000},
+		{ActionSubscribeDual, 20, 70000},
+		{ActionUnaligned, 10, 50000},
+		{ActionNone, 1, 1},
 	}
-	if ds[1].Row.Diff < ds[2].Row.Diff {
-		t.Fatalf("diff must be sorted desc within same action")
-	}
-	if ds[3].Action != ActionUnaligned {
-		t.Fatalf("unaligned should be last executable, got %s", ds[3].Action)
+	for i, w := range want {
+		got := ds[i]
+		if got.Action != w.action || got.Row.ExpTime.Day() != w.day || got.Row.Strike != w.strike {
+			t.Fatalf("第 %d 行 = %s/%s/%.0f, want %s/03-%02d/%.0f",
+				i, got.Action, got.Row.ExpTime.Format("01-02"), got.Row.Strike, w.action, w.day, w.strike)
+		}
 	}
 }
 

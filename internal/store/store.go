@@ -240,6 +240,11 @@ type Settings struct {
 	MinOptionEdgePP float64 `json:"minOptionEdgePp"` // 期权须高出 DCY 的百分点（20 = 20pp）
 	MaxStrikeGapPct float64 `json:"maxStrikeGapPct"` // 行权价相对现价最大偏差（%）
 	AutoTrade       bool    `json:"autoTrade"`
+	// 界面筛选记忆（TUI 退出后重启恢复）：方向 "" | "C" | "P"；
+	// 结算本位 "" | "B"（币本位）| "U"（U本位）。
+	// 只影响展示筛选，不影响策略/下单。
+	SideFilter   string `json:"sideFilter,omitempty"`
+	SettleFilter string `json:"settleFilter,omitempty"`
 }
 
 // DefaultSettings 生产默认值（与 strategy.DefaultParams 对齐）。
@@ -270,6 +275,17 @@ func (s *Store) LoadSettings() (Settings, error) {
 	}
 	if out.MaxStrikeGapPct <= 0 {
 		out.MaxStrikeGapPct = 0.5
+	}
+	// 筛选记忆只认合法枚举值，手改文件写坏则回落「全部」。
+	switch out.SideFilter {
+	case "C", "P":
+	default:
+		out.SideFilter = ""
+	}
+	switch out.SettleFilter {
+	case "B", "U":
+	default:
+		out.SettleFilter = ""
 	}
 	return out, nil
 }

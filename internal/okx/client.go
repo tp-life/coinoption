@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -43,6 +44,7 @@ type Client struct {
 
 	baseURL   string
 	http      *http.Client
+	proxyErr  error // 代理配置非法（请求一律短路报错，不静默直连）
 	limiter   *rate.Limiter
 	retryBase time.Duration // 重试退避基数（测试可调小）
 }
@@ -96,15 +98,95 @@ func WithTimeout(d time.Duration) Option {
 	return func(c *Client) { c.http.Timeout = d }
 }
 
-// WithProxy 配置 HTTP/SOCKS5 代理（如 http://127.0.0.1:7890）。
+// WithProxy 配置 HTTP/SOCKS5 代理（如 http://127.0.0.1:7890 / socks5://127.0.0.1:1080）。
+// 配置非法时不静默回落直连：私有接口一旦直连，OKX 会看到本机真实出口
+// （NAT/公网下常是 IPv6），50110 白名单报文极具迷惑性。代理配置错误一律
+// 短路报错（见 ParseProxy）。
 func WithProxy(proxyURL string) Option {
 	return func(c *Client) {
-		u, err := url.Parse(proxyURL)
+		u, err := ParseProxy(proxyURL)
 		if err != nil {
-			return // 无效代理则忽略，回落直连
+			c.proxyErr = err
+			return
 		}
 		c.http.Transport = &http.Transport{Proxy: http.ProxyURL(u)}
 	}
+}
+
+// ParseProxy 校验 HTTP/SOCKS5 代理配置并转为 *url.URL。
+// 要求显式 scheme（http/https/socks5/socks5h）+ host:port；`host:port` 这类
+// 裸地址一律报错——历史上静默回落直连曾让 DCY 白名单报文打出本机 IPv6 出口。
+// socks5h 会归一为 Go 支持的 socks5（远端 DNS 语义）。
+func ParseProxy(raw string) (*url.URL, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return nil, fmt.Errorf("代理地址为空")
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return nil, fmt.Errorf("无法解析 %q: %w", s, err)
+	}
+	switch u.Scheme {
+	case "http", "https", "socks5":
+		if u.Host == "" {
+			return nil, fmt.Errorf("%q 缺少主机:端口（示例 http://127.0.0.1:7890）", s)
+		}
+		return u, nil
+	case "socks5h":
+		if u.Host == "" {
+			return nil, fmt.Errorf("%q 缺少主机:端口（示例 socks5h://127.0.0.1:1080）", s)
+		}
+		u.Scheme = "socks5"
+		return u, nil
+	case "":
+		return nil, fmt.Errorf("%q 缺少 scheme 前缀（应为 http:// 或 socks5://）", s)
+	default:
+		return nil, fmt.Errorf("%q 的 scheme %q 不支持（支持 http/https/socks5/socks5h）", s, u.Scheme)
+	}
+}
+
+// egressTraceURL 出口 IP 探测端点（返回 ip=... 文本行；测试可覆盖）。
+var egressTraceURL = "https://www.cloudflare.com/cdn-cgi/trace"
+
+// EgressIP 通过当前 Transport（含代理）查询外部服务看到的出口 IP 与 IP 家族。
+// 用途：核对代理是否生效、出口是 IPv4 还是 IPv6——OKX 的 API Key 白名单
+// 校验的就是这个 IP（代理出口是 IPv6 时，白名单填 IPv4 必然 50110）。
+func (c *Client) EgressIP(ctx context.Context) (ip, family string, err error) {
+	if c.proxyErr != nil {
+		return "", "", fmt.Errorf("代理配置错误: %w", c.proxyErr)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, egressTraceURL, nil)
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Accept", "text/plain")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("查询出口 IP 失败（代理链路不通？）: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		return "", "", err
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "ip=") {
+			continue
+		}
+		ip = strings.TrimPrefix(line, "ip=")
+		parsed := net.ParseIP(ip)
+		switch {
+		case parsed == nil:
+			family = "未知"
+		case parsed.To4() != nil:
+			family = "IPv4"
+		default:
+			family = "IPv6"
+		}
+		return ip, family, nil
+	}
+	return "", "", fmt.Errorf("出口 IP 探测响应缺少 ip= 字段（head=%.120s）", body)
 }
 
 // APIError OKX 返回的业务错误（code != "0"）。
@@ -116,8 +198,8 @@ type APIError struct {
 // hint 为常见业务错误码补充人类指引。
 var hint = map[string]string{
 	"50105": "Passphrase 不正确：passphrase 是创建 API Key 时 YOU 自己设置的那串口令（不是 OKX 发的），检查是否漏拷/多空格/引号",
-	"50106": "IP 白名单未配置或不匹配：OKX 看到的出口 IP 需加入 API Key 白名单（走代理时应填代理出口 IP），或改为不绑定 IP 的 Key",
-	"50110": "IP 不在 API Key 白名单：(上方报文的出口 IP) 加入白名单或换不绑 IP 的 Key",
+	"50106": "IP 白名单未配置或不匹配：OKX 校验的是「出口 IP」（代理生效时=代理出口）。若报文里的 IP 是 IPv6，而白名单只填了 IPv4：说明代理链路走了 IPv6 出口（或代理未生效）——在代理侧强制 IPv4 出口（如 Clash ipv6: false），或把该 IPv6 加进白名单",
+	"50110": "IP 不在 API Key 白名单：(上方报文的出口 IP) 加入白名单或换不绑 IP 的 Key；用 --egress 核对代理出口 IP，报文为 IPv6 时按 50106 处理",
 	"50102": "签名时间戳偏差超过 30s：请校对本机时间/时区",
 	"50111": "API Key 为空或未传入",
 	"50103": "API Key 不存在或已失效（Header 不匹配）",
@@ -354,6 +436,10 @@ func asAPIError(err error, target **APIError) bool {
 
 // doOnce 不含重试的单次执行。
 func (c *Client) doOnce(ctx context.Context, method, path string, body []byte) (json.RawMessage, error) {
+	// 代理配置非法 → 请求短路报错（绝不静默直连打私有接口）
+	if c.proxyErr != nil {
+		return nil, fmt.Errorf("代理配置错误: %w", c.proxyErr)
+	}
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, err

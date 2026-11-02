@@ -10,12 +10,14 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 - **M3 v1 完成**：executor 执行层 ✅ —— 风控守卫（总敞口 5000 / 单笔 2000 / 并行 5 / 日 10 强校验 + 重启恢复）、DCY 申购两步流（quote→trade）、期权卖单、三种模式路由（live / sim-okx / sim-local）、本地 DCY 纸面模拟结算（[SIM] 单落盘、到期按现价结算）、统一持仓视图、JSONL 审计留痕（`~/.coinoption/`）
 - **M3.2 完成**：TUI 下单与持仓 ✅ —— 决策行上 `o` 卖期权 / `d` 申购双币赢，数量输入 → 二次确认 → 提交（`y`/`n`），`p` 持仓页（异步刷新缓存 + `j/k` 滚动），头部常驻模式徽标与敞口/在持进度；live 模式启动时从平台 DCY 在持单 + 期权空头恢复风控敞口
 - **M3.3 完成**：Settings 页 + 自动执行（默认关闭）✅ —— 阈值/开关落盘 `settings.json`，自动执行每次刷新最多 1 单、同产品跨重启只做一次、间隔 ≥60s，仍受 executor 风控硬上限约束；live 模式开启需当次 `y` 二次确认，进程重启强制回到关闭
+- **M4 扩展**：Web 看板双标签（对比决策 / 完整期权链）✅；Web 手动下单（`--web-trade`，默认只读）✅ —— 决策行内「卖出期权 / 申购 DCY」弹窗二次确认，复用 executor 风控/审计/模式路由，live 模式启动打印实盘警告
 
 ### TUI 快捷键
 
 | 键 | 作用 |
 | --- | --- |
 | `1` / `3` / `p` | 决策表 / 持仓页切换 |
+| `2` | 完整期权链（参考视图，不直接下单；`1` 返回决策页） |
 | `4` / `l` | 审计日志页（submit/reject/settle/restore，最新 200 条） |
 | `5` / `s` | Settings 页（自动执行开关、阈值调整、风控只读展示） |
 | `a` | Settings 页内切换自动执行（live 需 `y` 二次确认） |
@@ -28,13 +30,16 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 | `u` | 弹窗选择标的（BTC / ETH / SOL）：`↑/↓` 或 `j/k` 移动，`Enter` 确认，`Esc` 取消 |
 | `e` | 弹窗选择到期日：`全部（不过滤）` / 快照中每个可用到期日（含行数） / `手动输入日期…` |
 | `t` | 弹窗选择方向：`全部方向` / `CALL 看涨（高卖）` / `PUT 看跌（低买）`，含当前组合行数 |
-| `Esc` | 关闭弹窗；无弹窗时清除全部筛选（方向 + 到期），恢复全量 |
+| `b` | 弹窗选择结算本位：`全部本位` / `币本位（BTC-USD 链）` / `U本位（BTC-USD_UM 链）`，含当前组合行数 |
+| `Esc` | 关闭弹窗；无弹窗时清除全部筛选（方向 + 本位 + 到期），恢复全量 |
 
-> 当前组合：`标的 + 方向 + 到期` 三个维度可自由组合，表头上方的「组合」条实时显示（如 `BTC-USDT · CALL · 2026-11-06`），并给出方向/到期快捷项与行数；`t` 选方向、`e` 选到期、`u` 切标的，`Esc` 一键清空。方向与到期筛选同时作用于决策行和期权榜。
+> 当前组合：`标的 + 方向 + 本位 + 到期` 四个维度可自由组合，表头上方的「组合」条实时显示（如 `BTC-USDT · PUT · 币本位 · 2026-11-06`），并给出各维度快捷项与行数；`t` 选方向、`b` 选本位、`e` 选到期、`u` 切标的，`Esc` 一键清空。四个筛选同时作用于决策行和期权榜。
+>
+> **方向与本位选择会记忆**：`t` / `b` 的选择即时写入 `settings.json`（`sideFilter` / `settleFilter`），退出后下次启动自动恢复（`Esc` 清除也会同步落盘）。到期筛选不记忆。
 
-> 到期时间筛选：按 `e` 弹出到期日选择框（`全部` / 各可用到期日 + 行数 / `手动输入日期…`，手动模式支持 RFC3339 或 `2026-11-06`）。选定后按「到期日（UTC）」过滤决策/期权榜，展示统一为 `YYYY-MM-DD HH:mm`（UTC）。
+> 到期时间筛选：按 `e` 弹出到期日选择框（`全部` / 各可用到期日 + 行数 / `手动输入日期…`，手动模式支持 RFC3339 或 `2026-11-06`）。选定后按「到期日（UTC）」过滤决策/期权榜；表格内展示日期，详情行展示完整 `YYYY-MM-DD HH:mm`（UTC）。
 
-> 主表列宽随终端宽度自适应（120 列下不裁切）：操作 / 产品·合约 / 到期(UTC) / 方向 / 行权价 / DCY APR / 期权 APR / 差 / 天 / 建议金额。选中行下方详情行展示完整产品与期权合约、交易方向、到期、行权价、偏差、原因与建议金额。
+> 主表列宽随终端宽度自适应（120 列下不裁切）：操作 / 产品·合约 / 到期(UTC) / 方向 / 本位 / 行权价 / **距现价%** / **买价** / DCY APR / 期权APR / 差% / 天 / 建议。**决策页（`1`）每条 DCY 产品一行**，期权 APR / 差 来自对齐到的同档合约；**期权链页（`2`）单独展示完整期权链**（操作 / 期权合约 / 到期 / 方向 / 本位 / 行权价 / 距现价% / 买价 / 期权APR / DCY APR / 差% / 天），有对应 DCY 的合约在合约名后标 `←DCY`，详情行给出对应产品与差值。`本位` 列区分期权腿结算：**币本位**（`BTC-USD`/`ETH-USD` 链，结算币为标的币）与 **U本位**（`BTC-USD_UM` 链，USDT 结算）。`距现价%` =（行权价 − 现价）/ 现价，正=高于现价、负=低于现价；`买价` 是该档权利金买一价（币本位计 BTC、U本位计 USDT）。到期列只显示 UTC 日期（OKX 期权统一 08:00 结算）；选中行下方详情行展示完整产品与期权合约、交易方向、本位、到期时间、行权价、现价与距现价绝对值/百分比、买价/卖价、偏差、原因与建议金额。
 
 ### 方向与买卖语义（CALL / PUT）
 
@@ -44,7 +49,7 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 | 方向 | `PUT` | 看跌（原 `P`）；期权侧为卖 Put，DCY 侧为「低买」 |
 | 操作 | `卖CALL` / `卖PUT` | **SELL**：卖出该期权（开空、收权利金），按 `o` 下单 |
 | 操作 | `申购高卖` / `申购低买` | **申购**双币赢，按 `d` 下单；高卖＝到期按行权价**卖币**（投入 BTC/ETH），低买＝到期按行权价**买币**（投入 USDT） |
-| 操作 | `卖出期权` | 期权榜行：只有卖方 APR（SELL），用于观察，不可直接下单 |
+| 操作 | `卖出期权` / `仅报价` | 期权榜行：`卖出期权`=有买盘且卖方方向有效；`仅报价`=方向有效但暂无买盘（算不出卖方 APR）。实值档已从期权榜过滤 |
 
 > 本工具没有「买入期权」（BUY option）路径：`buy_option` 是策略名，实际执行的是卖出期权；表中统一显示为「卖…」/`卖出期权` 避免误解。选定行的详情行会用一句话写明，例如 `卖出CALL（开空收权利金）` 或 `申购双币赢·低买`。
 >
@@ -95,7 +100,7 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 ### 实测结论（M0–M2 保留）
 - **模拟盘（Demo）**：现货/期权数据可用（期权 1026 合约），但**双币赢接口在 Demo 环境返回 500**——金融产品不在模拟盘范围，与文档预期一致
 - **双币赢 API（实盘）需要 API Key（只需读取权限）**；期权/现货公开数据无需 Key
-- 无 Key 时 TUI 显示「期权机会榜」（纯期权卖方 APR 降序），接入 Key 后呈现完整 DCY↔期权 对照决策
+- 无 Key 时 TUI 显示「期权机会榜」（按到期日 + 行权价升序，整条链完整展示），接入 Key 后呈现完整 DCY↔期权 对照决策
 
 ### 网络重试与限速（M4）
 
@@ -108,29 +113,63 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 
 ```bash
 ./bin/coinoption --web --addr 0.0.0.0:8080
+# 启用手动下单（默认只读）：sim-local 下期权为纸面单
+./bin/coinoption --web --web-trade --mode sim-local --addr 127.0.0.1:8080
 ```
 
 - `GET /` — 决策看板页（内嵌 HTML，自动 20s 轮询 `/api/decisions`）
-- `GET /api/decisions` — 当前决策 JSON（camelCase：`at / uly / optionUly / spotPrice / optionCount / dcdCount / decisions / optionRows / products / dcyAvailable / warn`）；`decisions[].row` 含 `productId / expTime / dcyApr / optApr / diff / strike / days / strikeErrPct / investCcy / optInstId`，`decisions[]` 含 `action / reasonCode / suggestedAmt`
+- `GET /api/decisions` — 当前决策 JSON（camelCase：`at / uly / optionUly / spotPrice / optionCount / dcdCount / decisions / optionRows / products / dcyAvailable / warn / mode / tradeEnabled / guard`）；`decisions[].row` 含 `productId / expTime / dcyApr / optApr / diff / strike / days / strikeErrPct / investCcy / optInstId`，`decisions[]` 含 `action / reasonCode / suggestedAmt`（reasonCode 增含 `strike_wrong_side`：卖 PUT 行权价高于现价 / 卖 CALL 低于现价，摆放方向异常不推荐）。`mode` 为 `read-only`（未开 `--web-trade`）或 `live/sim-okx/sim-local`；`guard` 给出敞口/单笔/并行/日限状态。
 
 **Web 看板交互**：
 
 - 币种切换：页内「标的」按钮（BTC / ETH / SOL）→ 带 `uly` 重新拉取决策（当前选中高亮）
 - 方向筛选：`全部 / CALL / PUT` 按钮 → 带 `side=C|P` 过滤决策与期权榜
+- 本位筛选：`全部 / 币本位 / U本位` 按钮 → 带 `settle=B|U` 过滤决策与期权榜（表头同步显示「本位」列）
 - 到期筛选：快捷到期按钮（如 `11-06(12)`，按快照自动生成）+ 日期选择器 + 「筛选」/「全部」按钮
 - 当前组合：`标的 + 方向 + 到期` 自由组合，页头与空状态都会显示当前组合
-- 表格列与 TUI 对齐：操作 / 产品·合约 / 到期(UTC) / 方向 / 行权价 / DCY APR / 期权 APR / 差 / 天 / 偏差 / 原因 / 建议金额
+- 页面分为两个标签页（与 TUI `1` / `2` 对应）：**对比决策**（默认，每条 DCY 产品一行，直接对照 DCY APR ↔ 同档期权 APR）与**完整期权链**（参考视图，覆盖全部卖方有效档位，并在「对应 DCY」列标出可对照产品）。两个标签页共用标的 / 方向 / 本位 / 到期筛选，避免 DCY 行与期权行在同一张表里混排。
+- 对比决策表列：操作 / DCY 产品 / 对应期权 / 到期(UTC) / 方向 / 本位 / 行权价 / 距现价% / 买价 / DCY APR / 期权 APR / 差 / 偏差% / 天 / 原因 / 建议金额 / 下单；「对应期权」直接给出对齐到的合约（如 `BTC-USDT-261113-66000-P` ↔ `BTC-USD-261113-66000-P`）
+- 对比决策排序：先按动作分组（卖期权 → 申购 DCY → 不可对齐 → 无动作），组内按「到期日 → 行权价 → 本位 → 方向」升序；不再按差%排序，避免行权价在列表中来回跳
+- 完整期权链排序：到期日 → 行权价 → 本位（币本位先）→ 方向（CALL 先）；APR / 买价不参与排序
+- 下单按钮（需 `--web-trade`）：决策行动作为 `卖期权` 时给出「卖出期权」，为 `申购双币赢` 时给出「申购 DCY」；点击后弹窗填写张数 / 投入量并二次确认。未启用时该列显示 `—`，页头提示 Web 只读
+- 完整期权链表列：操作 / 期权合约 / 到期(UTC) / 方向 / 本位 / 行权价 / 距现价% / 买价 / 卖价 / 期权 APR / 天 / 对应 DCY / DCY APR / 差
 - 顶部图例说明方向和买卖语义：`CALL 看涨 / PUT 看跌`，`卖CALL / 卖PUT = SELL（卖出期权，收权利金）`，`申购DCY（高卖→到期卖币 / 低买→到期买币）`，并标注 `本工具仅卖期权，不买入期权`
 - 快照服务端缓存 15s，避免每个页面轮询都打 OKX（DCD 限速 1 req/s）
+
+> 机会榜展示**卖方有效链**：全部到期日、全部有效行权价、不按 DCY 对齐 / 7–30 天窗口 / TopN / `bid` 有无裁剪条数；**实值档直接过滤**（卖 PUT 行权价 > 现价、卖 CALL 行权价 < 现价，超 ±0.5% 容差）。无买盘档位仍保留展示价格（操作列标 `仅报价`）。排序与 OKX 期权链一致：**到期日升序 → 行权价升序 → 本位 → 方向**，方便按价格从低到高顺序对照。**决策页只列 DCY 产品**（每条一行，含对齐结果与建议），**期权链页单独列完整链**，两类数据不再混排。决策侧同类摆放异常给 `unaligned / strike_wrong_side`；7–30 天期限窗口只过滤决策行，不影响期权榜。决策行先按动作分组（卖期权 → 申购 DCY → 不可对齐），组内按「到期日 → 行权价 → 本位 → 方向」升序；期权链按「到期日 → 行权价 → 本位 → 方向」升序。期权链同时覆盖币本位（`BTC-USD`）与 U 本位（`BTC-USD_UM`）：优先取父链响应（实测已含 `_UM`），缺失时自动补拉并按 `instId` 去重。DCY 与期权的底层按**标的币**对齐（`BTC-USDT` ↔ `BTC-USD` ↔ `BTC-USD_UM` 视为同一标的），不会因 quote 币写法不同而误判未对齐；到期匹配用 ±1 天绝对值（兼容 DCY 16:00 与币本位期权 08:00 的结算时刻差）；某档合约存在但没有买盘时，仍建立**展示对齐**（决策行显示对应期权），只是原因给 `no_option_quote`、不产生可执行动作。匹配优先选「有买盘且最近」的档位，避免被更近的空盘档抢走。
 
 **Web API 参数**：
 
 - `GET /api/decisions?uly=BTC-USDT` — 指定标的（默认启动参数）
 - `GET /api/decisions?uly=BTC-USDT&exp=2026-11-06` — 按到期日（UTC）过滤决策/期权榜；非法日期返回 400
 - `GET /api/decisions?uly=BTC-USDT&side=C` — 按方向过滤（`C`=CALL/高卖，`P`=PUT/低买，大小写不敏感）；非法值返回 400
-- `GET /api/decisions?uly=BTC-USDT&exp=2026-11-06&side=P` — 组合筛选（标的 + 方向 + 到期）
+- `GET /api/decisions?uly=BTC-USDT&settle=B` — 按结算本位过滤（`B`=币本位 BTC-USD，`U`=U本位 BTC-USD_UM，大小写不敏感，也接受 `coin`/`usdt`）；非法值返回 400
+- `GET /api/decisions?uly=BTC-USDT&exp=2026-11-06&side=P&settle=B` — 组合筛选（标的 + 方向 + 本位 + 到期）
 
-> Web 页与 TUI 共用同一决策数据链路（okx client → market.Fetcher → strategy.Build）；期权榜在拉取后已过滤为「DCY 已支持对齐的合约」。
+**Web 手动下单（需 `--web-trade`）**：
+
+```bash
+# 卖出期权（省略 px 或 px=0 时按当前买一价挂单）
+curl -s -X POST http://127.0.0.1:8080/api/order/option \
+  -H 'Content-Type: application/json' \
+  -d '{"uly":"BTC-USDT","instId":"BTC-USD-261113-66000-P","sz":1}'
+
+# 申购双币赢（amt 为投资币种数量；超 maxSize 由 executor 截到上限）
+curl -s -X POST http://127.0.0.1:8080/api/order/dcd \
+  -H 'Content-Type: application/json' \
+  -d '{"uly":"BTC-USDT","productId":"BTC-USDT-261113-66000-P","amt":100}'
+```
+
+- 默认只读；只有启动时加 `--web-trade` 才装配 executor 并开放上述端点（否则 403）。
+- 复用 TUI 同一条执行链路：`live` 真实下单 / `sim-okx` 期权走 OKX Demo、DCY 纸面 / `sim-local` 全纸面；风控（总敞口、单笔、并行、日限）与审计仍由 `internal/executor` 强制校验，拒单原因原样回显。
+- 只允许对**当前快照里已明确给出建议**的决策行下单：期权必须命中 `action=buy_option` 且 `instId` 一致，DCY 必须命中 `action=subscribe_dual` 且 `productId` 一致。这样不会绕过实值档过滤、期限窗口或对齐逻辑直接 POST 任意合约。
+- 端点只接受 `POST` + `application/json`（`text/plain` 返回 415），且本服务不返回 CORS 头，降低跨站表单直接下单的风险；但这不等于身份认证——**任何能访问该端口的人都能下单**。
+- 默认 `--addr :8080` 监听所有网卡；实盘启用 `--web-trade` 时会打印醒目警告。建议改为 `--addr 127.0.0.1:8080`，仅在需要手机/局域网访问时再放开，并自行加防火墙 / 反向代理认证。
+- 回执：`{ok, mode, kind, ref, ordId, quoteId, amt, investCcy, amtUsdt, premium, sim, detail}`；参数/风控错误返回 400 + `{error}`。
+- 期权卖方的风控敞口按合约名义折算（BTC 单张名义约 1 BTC）；默认单笔上限 2000 USDT 会直接拒掉 1 张 BTC 期权。要实际下单需按自身风险承受能力放宽 `--limits`，例如 `--limits 5000,100000,5,10`（总敞口/单笔/并行/日限，单位 USDT/笔）。页面弹窗会显示当前单笔上限与剩余敞口。
+- 无 API Key 时 DCY 产品快照为空、决策行也为空，因此 Web 没有可下单行（完整期权链仍可查看）；要下单需接好 Key 让 DCY 产品与决策生成（`sim-local` 下仍为纸面单）。
+
+> Web 页与 TUI 共用同一决策数据链路（okx client → market.Fetcher → strategy.Build）；期权榜**不**再按「DCY 已支持对齐的合约」裁剪，而是展示卖方有效链（覆盖全部到期日、全部有效行权价、不截断条数、不再套 7–30 天期限窗口——期限窗口只作用于决策行；实值档已过滤），并按到期日 + 行权价升序排列。Web 页用「对比决策 / 完整期权链」两个标签页分离主视图与参考数据：**对比决策页只列 DCY 产品**，每行给出对齐到的期权与 APR 差；**完整期权链页**保留全部卖方有效档位，并通过「对应 DCY」列回链到双币赢产品。页面新增「距现价% / 买价」列；到期快捷按钮不再限制前 12 个，与 OKX 实际列表对照时用「到期 + 方向 + 本位」筛选收敛。
 
 ## 构建
 
@@ -146,7 +185,8 @@ go test ./internal/strategy/        # 黄金回归
 
 | 参数 | 环境变量 | 说明 |
 | --- | --- | --- |
-| `--proxy` | `COINOPTION_PROXY` | HTTP/SOCKS5 代理（如 `http://127.0.0.1:7890`），不填直连 |
+| `--proxy` | `COINOPTION_PROXY` | HTTP/SOCKS5 代理（如 `http://127.0.0.1:7890` / `socks5h://127.0.0.1:1080`），不填直连；必须带 scheme，非法配置启动即报错（不再静默直连） |
+| `--egress` | — | 出口自检：经同一代理链路查询外部服务看到的真实出口 IP（IPv4/IPv6），用于核对 OKX API Key 白名单 |
 | `--key` | `COINOPTION_API_KEY` | API Key（仅私有接口，双币赢接口实测需要） |
 | `--secret` | `COINOPTION_SECRET` | API Secret |
 | `--passphrase` | `COINOPTION_PASSPHRASE` | API Passphrase |
@@ -157,6 +197,7 @@ go test ./internal/strategy/        # 黄金回归
 | `--limits` | — | 风控覆盖 `"total,perOrder,concurrent,perDay"`（段序：总敞口 / 单笔 / 并行 / 日限；期权大名义验证需放宽），默认 `5000,2000,5,10` |
 | `--uly` | — | 标的，默认 `BTC-USDT`（支持 ETH-USDT/SOL-USDT；TUI 可用 `u` 快速切换） |
 | `--web` | — | 启动 Web 展示服务（决策看板） |
+| `--web-trade` | — | Web 看板启用手动下单（默认只读；`live` 会提交真实订单，建议配合 `--addr 127.0.0.1:8080`） |
 | `--addr` | — | Web 服务监听地址（`--web` 开启时生效，默认 `:8080`） |
 
 > 运行模式在启动时固定（executor 装配后不可热切换）；Settings 页显示当前模式，切换需重启并指定 `--mode`。
@@ -166,6 +207,7 @@ go test ./internal/strategy/        # 黄金回归
 - 双币赢（sfp/dcd）接口：需要「读取」权限（产品/订单查询）；实盘申购需要「交易」权限
 - 期权卖单：需要「交易」权限（`tdMode=cross`）
 - **IP 白名单**：私有接口会校验来源 IP（实测出口 `198.176.52.187` 未在 Key 白名单 → `50110`）；需在 OKX 后台加入当前出口 IP，或改用不绑定 IP 的 Key
+- **代理出口是 IPv6 时**：OKX 报文里的 IP 是「它看到的出口」，不是代理配置本身。若白名单只填了 IPv4，而出口为 IPv6（`2408:...`），必然 50106/50110。先跑 `./bin/coinoption --proxy <...> --egress` 看真实出口，再二选一：把该 IPv6 加入白名单，或在代理侧强制 IPv4 出口（Clash `ipv6: false` / 换 IPv4-only 节点）。配置非法的代理（如漏写 `http://`）现在会启动即报错，不会静默直连
 
 ## 下一步验证清单（需要人工配合）
 

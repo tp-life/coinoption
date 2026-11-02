@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -194,5 +195,84 @@ func TestBackoffJitterAndCap(t *testing.T) {
 	}
 	if d := c.backoff(1, 10*time.Second); d != 5*time.Second {
 		t.Fatalf("Retry-After 应被截到 5s，实际 %v", d)
+	}
+}
+
+// ─── 代理配置 ─── 回归（2026-11 用户反馈）：--proxy 1.2.3.4:7890（无 scheme）
+// 曾被静默忽略 → 直连 → DCY 白名单报文打出本机 IPv6 出口（50110 误导排查）。
+
+func TestParseProxy(t *testing.T) {
+	// 合法 scheme（socks5h 归一为 socks5）
+	for _, raw := range []string{
+		"http://127.0.0.1:7890",
+		"https://proxy.example.com:8443",
+		"socks5://127.0.0.1:1080",
+		"socks5h://127.0.0.1:1080",
+		"  socks5://user:pass@10.0.0.1:1080/?x=1  ", // 前后空白容忍
+	} {
+		u, err := ParseProxy(raw)
+		if err != nil || u == nil || u.Host == "" {
+			t.Fatalf("合法代理 %q 不应报错: %v", raw, err)
+		}
+		if strings.HasPrefix(strings.TrimSpace(raw), "socks5h://") && u.Scheme != "socks5" {
+			t.Fatalf("socks5h 应归一为 socks5，实际 %q", u.Scheme)
+		}
+	}
+	// 非法：裸 host:port / 缺 scheme / 不支持 scheme / 空
+	for _, raw := range []string{
+		"127.0.0.1:7890",
+		"1.2.3.4:7890",
+		"http://",
+		"ftp://127.0.0.1:21",
+		"   ",
+		"::bad url::",
+	} {
+		if _, err := ParseProxy(raw); err == nil {
+			t.Fatalf("非法代理 %q 应报错", raw)
+		}
+	}
+}
+
+// EgressIP 通过同一 Transport 探测出口 IP，并识别 IPv4/IPv6。
+func TestEgressIP(t *testing.T) {
+	old := egressTraceURL
+	defer func() { egressTraceURL = old }()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "fl=abc\nip=2408:8207:1234:5678::1\nts=1\n")
+	}))
+	defer srv.Close()
+	egressTraceURL = srv.URL
+
+	c := NewClient(WithBaseURL(srv.URL))
+	ip, family, err := c.EgressIP(context.Background())
+	if err != nil {
+		t.Fatalf("EgressIP: %v", err)
+	}
+	if ip != "2408:8207:1234:5678::1" || family != "IPv6" {
+		t.Fatalf("出口解析错误: %q %q", ip, family)
+	}
+}
+
+// 代理配置非法时 EgressIP 也必须短路报错（不静默直连）。
+func TestEgressIPInvalidProxy(t *testing.T) {
+	c := NewClient(WithProxy("1.2.3.4:7890"))
+	if _, _, err := c.EgressIP(context.Background()); err == nil || !contains(err.Error(), "代理配置错误") {
+		t.Fatalf("无效代理应短路报错: %v", err)
+	}
+}
+
+// 配置非法的代理必须让所有请求短路报错，绝不静默回落直连。
+func TestInvalidProxyShortCircuits(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("请求不应发出（无效代理应短路）: %s", r.URL.Path)
+	}))
+	defer srv.Close()
+
+	c := NewClient(WithBaseURL(srv.URL), WithProxy("1.2.3.4:7890"))
+	c.retryBase = time.Millisecond
+	_, err := c.request(context.Background(), http.MethodGet, "/x", nil)
+	if err == nil || !contains(err.Error(), "代理配置错误") {
+		t.Fatalf("无效代理应短路报错，得到: %v", err)
 	}
 }

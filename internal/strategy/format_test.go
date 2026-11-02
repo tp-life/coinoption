@@ -91,3 +91,28 @@ func TestSupportedOptionInsts(t *testing.T) {
 		t.Fatalf("OptMatched=false 的行不应计入 supported: %v", insts)
 	}
 }
+
+func TestSettleKind(t *testing.T) {
+	cases := []struct {
+		settleCcy, instID string
+		want              rune
+	}{
+		{"BTC", "BTC-USD-261106-80000-P", 'B'},
+		{"USDT", "BTC-USD_UM-261106-80000-P", 'U'},
+		{"USD", "BTC-USD_UM-261106-80000-P", 'U'},
+		{"", "BTC-USD_UM-261106-80000-P", 'U'}, // settleCcy 缺失 → 按 _UM 推断
+		{"", "BTC-USD-261106-80000-P", 'B'},
+		{"", "", 0},
+	}
+	for _, c := range cases {
+		if got := SettleKind(c.settleCcy, c.instID); got != c.want {
+			t.Fatalf("SettleKind(%q,%q) = %q, want %q", c.settleCcy, c.instID, got, c.want)
+		}
+	}
+	names := map[rune]string{'B': "币本位", 'U': "U本位", 0: "—"}
+	for k, want := range names {
+		if got := SettleKindName(k); got != want {
+			t.Fatalf("SettleKindName(%q) = %q, want %q", k, got, want)
+		}
+	}
+}

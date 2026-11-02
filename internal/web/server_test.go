@@ -10,7 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tp/coinoption/internal/executor"
 	"github.com/tp/coinoption/internal/market"
+	"github.com/tp/coinoption/internal/okx"
 	"github.com/tp/coinoption/internal/strategy"
 )
 
@@ -57,6 +59,13 @@ func testSnap() *market.Snapshot {
 			{InstID: "BTC-USD-261106-79000-C", OptType: 'C', OptAPR: 0.4, Strike: 79000, Days: 8},
 			{InstID: "BTC-USD-261113-77000-P", OptType: 'P', OptAPR: 0.3, Strike: 77000, Days: 15},
 		},
+		Products: map[string]okx.DCDProduct{
+			"BTC-USDT-261113-78000-P": {
+				ProductID: "BTC-USDT-261113-78000-P", BaseCcy: "BTC", QuoteCcy: "USDT",
+				NotionalCcy: "USDT", OptType: "P", Strike: 78000,
+				AbsYield: 0.02, AnnualizedYield: 0.2, MinSize: 10, MaxSize: 100000,
+			},
+		},
 	}
 }
 
@@ -102,6 +111,16 @@ func TestIndexPageContainsControls(t *testing.T) {
 		"卖出期权",
 		"<th>方向</th>",
 		"<th>操作</th>",
+		// 主视图与参考视图分开：对比决策页只放 DCY 产品行，完整期权链
+		// 放第二个标签页，避免两类行在同一张表里混排。
+		`data-tab="decisions"`,
+		`data-tab="chain"`,
+		`id="decRows"`,
+		`id="optRows"`,
+		`id="decWrap"`,
+		`id="chainWrap"`,
+		"对应期权",
+		"对应 DCY",
 		`data-side=""`,
 		`data-side="C"`,
 		`data-side="P"`,
@@ -214,6 +233,45 @@ func TestAPISideFilter(t *testing.T) {
 	}
 }
 
+func TestAPISettleFilter(t *testing.T) {
+	ts := newTestServer(t, &fakeFetcher{snap: testSnap()})
+	// 测试快照里所有合约都是 BTC-USD（币本位）；无合约的决策无法判定本位。
+	cases := []struct {
+		settle     string
+		decisions  int
+		optionRows int
+	}{
+		{settle: "B", decisions: 1, optionRows: 2},
+		{settle: "b", decisions: 1, optionRows: 2}, // 大小写不敏感
+		{settle: "U", decisions: 0, optionRows: 0},
+	}
+	for _, c := range cases {
+		code, body := get(t, ts.URL+"/api/decisions?settle="+c.settle)
+		if code != http.StatusOK {
+			t.Fatalf("settle=%s API = %d: %s", c.settle, code, body)
+		}
+		var j struct {
+			Decisions  []json.RawMessage `json:"decisions"`
+			OptionRows []json.RawMessage `json:"optionRows"`
+		}
+		if err := json.Unmarshal(body, &j); err != nil {
+			t.Fatalf("settle=%s decode: %v", c.settle, err)
+		}
+		if len(j.Decisions) != c.decisions || len(j.OptionRows) != c.optionRows {
+			t.Fatalf("settle=%s decisions=%d optionRows=%d，期望 %d/%d",
+				c.settle, len(j.Decisions), len(j.OptionRows), c.decisions, c.optionRows)
+		}
+	}
+}
+
+func TestAPIInvalidSettle(t *testing.T) {
+	ts := newTestServer(t, &fakeFetcher{snap: testSnap()})
+	code, body := get(t, ts.URL+"/api/decisions?settle=X")
+	if code != http.StatusBadRequest {
+		t.Fatalf("非法 settle 应返回 400，实际 %d: %s", code, body)
+	}
+}
+
 func TestAPICombinedSideAndExpiry(t *testing.T) {
 	ts := newTestServer(t, &fakeFetcher{snap: testSnap()})
 	var j struct {
@@ -282,3 +340,196 @@ func TestAPIUlyOverride(t *testing.T) {
 type fetcherFunc func(string) (*market.Snapshot, error)
 
 func (f fetcherFunc) FetchSnapshot(uly string) (*market.Snapshot, error) { return f(uly) }
+
+// ─── Web 手动下单 ───────────────────────────────────────────────
+
+type fakeTrader struct {
+	mode     executor.Mode
+	optCalls int
+	dcdCalls int
+	lastInst string
+	lastSz   float64
+	lastProd string
+	lastAmt  float64
+	fail     error
+}
+
+func (f *fakeTrader) Mode() executor.Mode { return f.mode }
+func (f *fakeTrader) State() executor.GuardState {
+	return executor.GuardState{OpenCount: 1, Limits: executor.DefaultLimits()}
+}
+func (f *fakeTrader) SubmitOption(instID string, sz, limPx float64) (executor.Outcome, error) {
+	f.optCalls++
+	f.lastInst = instID
+	f.lastSz = sz
+	if f.fail != nil {
+		return executor.Outcome{}, f.fail
+	}
+	return executor.Outcome{
+		Mode: f.mode, Kind: "option", Ref: instID, OrdID: "ord-1",
+		Amt: sz, AmtUSDT: 1000, Sim: f.mode != executor.ModeLive,
+		Detail: "卖出 " + instID,
+	}, nil
+}
+func (f *fakeTrader) SubmitDCD(p okx.DCDProduct, amt float64) (executor.Outcome, error) {
+	f.dcdCalls++
+	f.lastProd = p.ProductID
+	f.lastAmt = amt
+	if f.fail != nil {
+		return executor.Outcome{}, f.fail
+	}
+	return executor.Outcome{
+		Mode: f.mode, Kind: "dcd", Ref: p.ProductID, OrdID: "ord-2",
+		Amt: amt, InvestCcy: p.NotionalCcy, AmtUSDT: amt,
+		Sim: f.mode != executor.ModeLive, Detail: "申购 " + p.ProductID,
+	}, nil
+}
+
+func newTradeServer(t *testing.T, f SnapshotFetcher, tr Trader) *httptest.Server {
+	t.Helper()
+	ts := httptest.NewServer(New(f, "BTC-USDT", "", WithTrader(tr)).Handler)
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func postJSON(t *testing.T, url, body string) (int, []byte) {
+	t.Helper()
+	resp, err := http.Post(url, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return resp.StatusCode, b
+}
+
+func TestIndexPageHasOrderUI(t *testing.T) {
+	ts := newTestServer(t, &fakeFetcher{snap: testSnap()})
+	_, body := get(t, ts.URL+"/")
+	for _, want := range []string{`id="orderModal"`, `id="tradeBar"`, "<th>下单</th>", "确认下单"} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("首页缺少下单 UI %q", want)
+		}
+	}
+}
+
+func TestAPIOrderDisabledByDefault(t *testing.T) {
+	ts := newTestServer(t, &fakeFetcher{snap: testSnap()})
+	code, body := postJSON(t, ts.URL+"/api/order/option", `{"instId":"BTC-USD-261106-80000-C","sz":1}`)
+	if code != http.StatusForbidden {
+		t.Fatalf("未启用下单应 403，实际 %d: %s", code, body)
+	}
+}
+
+func TestAPIOrderOption(t *testing.T) {
+	tr := &fakeTrader{mode: executor.ModeSimLocal}
+	ts := newTradeServer(t, &fakeFetcher{snap: testSnap()}, tr)
+	code, body := postJSON(t, ts.URL+"/api/order/option",
+		`{"uly":"BTC-USDT","instId":"BTC-USD-261106-80000-C","sz":2}`)
+	if code != http.StatusOK {
+		t.Fatalf("下单失败 %d: %s", code, body)
+	}
+	if tr.optCalls != 1 || tr.lastInst != "BTC-USD-261106-80000-C" || tr.lastSz != 2 {
+		t.Fatalf("executor 调用不符: calls=%d inst=%q sz=%v", tr.optCalls, tr.lastInst, tr.lastSz)
+	}
+	var j struct {
+		OK    bool   `json:"ok"`
+		Mode  string `json:"mode"`
+		OrdID string `json:"ordId"`
+		Sim   bool   `json:"sim"`
+	}
+	if err := json.Unmarshal(body, &j); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !j.OK || j.Mode != "sim-local" || j.OrdID != "ord-1" || !j.Sim {
+		t.Fatalf("回执不符: %+v", j)
+	}
+}
+
+func TestAPIOrderOptionRejectsNonDecision(t *testing.T) {
+	tr := &fakeTrader{mode: executor.ModeSimLocal}
+	ts := newTradeServer(t, &fakeFetcher{snap: testSnap()}, tr)
+	code, body := postJSON(t, ts.URL+"/api/order/option",
+		`{"uly":"BTC-USDT","instId":"BTC-USD-261106-99999-C","sz":1}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("无决策的合约应 400，实际 %d: %s", code, body)
+	}
+	if tr.optCalls != 0 {
+		t.Fatalf("不应调用 executor，实际 %d 次", tr.optCalls)
+	}
+}
+
+func TestAPIOrderDCD(t *testing.T) {
+	tr := &fakeTrader{mode: executor.ModeSimLocal}
+	ts := newTradeServer(t, &fakeFetcher{snap: testSnap()}, tr)
+	code, body := postJSON(t, ts.URL+"/api/order/dcd",
+		`{"uly":"BTC-USDT","productId":"BTC-USDT-261113-78000-P","amt":500}`)
+	if code != http.StatusOK {
+		t.Fatalf("DCY 下单失败 %d: %s", code, body)
+	}
+	if tr.dcdCalls != 1 || tr.lastProd != "BTC-USDT-261113-78000-P" || tr.lastAmt != 500 {
+		t.Fatalf("executor 调用不符: calls=%d prod=%q amt=%v", tr.dcdCalls, tr.lastProd, tr.lastAmt)
+	}
+}
+
+func TestAPIOrderDCDRejectsUnknownProduct(t *testing.T) {
+	tr := &fakeTrader{mode: executor.ModeSimLocal}
+	ts := newTradeServer(t, &fakeFetcher{snap: testSnap()}, tr)
+	code, body := postJSON(t, ts.URL+"/api/order/dcd",
+		`{"uly":"BTC-USDT","productId":"BTC-USDT-261113-99999-P","amt":100}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("未知产品应 400，实际 %d: %s", code, body)
+	}
+	if tr.dcdCalls != 0 {
+		t.Fatalf("不应调用 executor，实际 %d 次", tr.dcdCalls)
+	}
+}
+
+func TestAPIOrderRequiresJSON(t *testing.T) {
+	tr := &fakeTrader{mode: executor.ModeSimLocal}
+	ts := newTradeServer(t, &fakeFetcher{snap: testSnap()}, tr)
+	resp, err := http.Post(ts.URL+"/api/order/option", "text/plain", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusUnsupportedMediaType {
+		t.Fatalf("text/plain 应 415，实际 %d", resp.StatusCode)
+	}
+}
+
+func TestAPIOrderOnlyPOST(t *testing.T) {
+	tr := &fakeTrader{mode: executor.ModeSimLocal}
+	ts := newTradeServer(t, &fakeFetcher{snap: testSnap()}, tr)
+	code, body := get(t, ts.URL+"/api/order/option")
+	if code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET 下单端点应 405，实际 %d: %s", code, body)
+	}
+}
+
+func TestAPIDecisionsExposesTradeState(t *testing.T) {
+	tr := &fakeTrader{mode: executor.ModeLive}
+	ts := newTradeServer(t, &fakeFetcher{snap: testSnap()}, tr)
+	code, body := get(t, ts.URL+"/api/decisions")
+	if code != http.StatusOK {
+		t.Fatalf("API = %d: %s", code, body)
+	}
+	var j struct {
+		Mode         string `json:"mode"`
+		TradeEnabled bool   `json:"tradeEnabled"`
+		Guard        *struct {
+			Limits struct {
+				PerOrderUSDT float64 `json:"perOrderUsdt"`
+			} `json:"limits"`
+		} `json:"guard"`
+	}
+	if err := json.Unmarshal(body, &j); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if j.Mode != "live" || !j.TradeEnabled || j.Guard == nil || j.Guard.Limits.PerOrderUSDT != 2000 {
+		t.Fatalf("交易状态不符: %+v", j)
+	}
+}

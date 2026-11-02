@@ -5,9 +5,11 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -48,11 +50,13 @@ func main() {
 
 	uly := flag.String("uly", "BTC-USDT", "标的（BTC-USDT | ETH-USDT | SOL-USDT）")
 	proxy := flag.String("proxy", os.Getenv("COINOPTION_PROXY"), "HTTP/SOCKS5 代理地址，空则直连；也可用环境变量 COINOPTION_PROXY")
+	egress := flag.Bool("egress", false, "查询经代理后的真实出口 IP（核对 OKX API Key IP 白名单；走同一代理链路）")
 	apiKey := flag.String("key", os.Getenv("COINOPTION_API_KEY"), "API Key（环境变量 COINOPTION_API_KEY）")
 	secret := flag.String("secret", os.Getenv("COINOPTION_SECRET"), "API Secret（环境变量 COINOPTION_SECRET）")
 	passphrase := flag.String("passphrase", os.Getenv("COINOPTION_PASSPHRASE"), "API Passphrase（环境变量 COINOPTION_PASSPHRASE）")
 	webEnabled := flag.Bool("web", false, "启动 Web 看板（GET /；API：/api/decisions?uly=BTC-USDT&exp=2026-11-06）")
 	webAddr := flag.String("addr", ":8080", "Web 服务监听地址（--web 开启时生效）")
+	webTrade := flag.Bool("web-trade", false, "Web 看板启用手动下单（默认只读；live 模式会提交真实订单）")
 	flag.Parse()
 
 	switch {
@@ -81,6 +85,11 @@ func main() {
 	}
 
 	switch {
+	case *egress:
+		if err := runEgress(*proxy); err != nil {
+			fmt.Fprintf(os.Stderr, "egress check failed: %v\n", err)
+			os.Exit(1)
+		}
 	case *smoke:
 		if err := runSmoke(*uly, *proxy, *apiKey, *secret, *passphrase, *demo); err != nil {
 			fmt.Fprintf(os.Stderr, "smoke failed: %v\n", err)
@@ -97,10 +106,56 @@ func main() {
 			os.Exit(1)
 		}
 	case *webEnabled:
-		// Web 展示服务：决策看板页 + JSON API（行情经 okx client 拉取）。
-		client := buildClient(*proxy, *apiKey, *secret, *passphrase, *demo)
-		srv := web.New(&market.Fetcher{C: client}, *uly, *webAddr)
-		fmt.Printf("web 服务已启动: http://0.0.0.0%s  (GET / 看板 / GET /api/decisions JSON)\n", *webAddr)
+		// Web 展示服务：决策看板页 + JSON API。
+		// --web-trade 时装配 executor（复用与 TUI 相同的风控/审计/模式路由），
+		// 否则保持只读，避免默认暴露下单入口。
+		var (
+			client *okx.Client
+			ex     *executor.Executor
+		)
+		if *webTrade {
+			cli := cliExec{
+				mode: *mode, proxy: *proxy,
+				apiKey: *apiKey, secret: *secret, passphrase: *passphrase,
+				storeDir: *storeDir, uly: *uly, limitsOverride: *limits,
+			}
+			var err error
+			_, ex, err = cli.boot()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "executor 装配失败: %v\n", err)
+				os.Exit(1)
+			}
+			client = ex.Client()
+			if ex.Mode() == executor.ModeLive {
+				if msg, err := ex.SyncLiveGuard(); err != nil {
+					fmt.Fprintf(os.Stderr, "[warn] 平台仓位恢复失败: %v\n", err)
+				} else {
+					fmt.Fprintln(os.Stderr, "[restore]", msg)
+				}
+				fmt.Fprintln(os.Stderr, "⚠ Web 实盘下单已启用：任何能访问该端口的人都能提交真实订单")
+			}
+			if host, _, err := net.SplitHostPort(*webAddr); err == nil &&
+				(host == "" || host == "0.0.0.0" || host == "::") {
+				fmt.Fprintln(os.Stderr, "⚠ --addr 监听所有网卡；建议改为 127.0.0.1:8080，避免局域网内被下单")
+			}
+		} else {
+			client = buildClient(*proxy, *apiKey, *secret, *passphrase, *demo)
+		}
+		fetcher := &market.Fetcher{C: client}
+		opts := make([]web.ServerOption, 0, 1)
+		if ex != nil {
+			opts = append(opts, web.WithTrader(ex))
+		}
+		srv := web.New(fetcher, *uly, *webAddr, opts...)
+		tradeTxt := "只读"
+		if ex != nil {
+			tradeTxt = "手动下单已启用（" + string(ex.Mode()) + "）"
+		}
+		display := *webAddr
+		if strings.HasPrefix(display, ":") {
+			display = "0.0.0.0" + display
+		}
+		fmt.Printf("web 服务已启动: http://%s  (GET / 看板 / GET /api/decisions / %s)\n", display, tradeTxt)
 		if err := srv.ListenAndServe(); err != nil {
 			fmt.Fprintf(os.Stderr, "web server failed: %v\n", err)
 			os.Exit(1)
@@ -138,6 +193,10 @@ func runSmoke(uly, proxy, apiKey, secret, passphrase string, demo bool) error {
 	c := buildClient(proxy, apiKey, secret, passphrase, demo)
 
 	fmt.Printf("== smoke: %s @ %s ==\n\n", uly, time.Now().Format(time.RFC3339))
+	if proxy != "" {
+		printEgress(c, proxy, 8*time.Second)
+		fmt.Println()
+	}
 
 	// 1. 现货现价
 	spots, err := c.GetSpotTicker(uly)
@@ -222,6 +281,13 @@ func runSmoke(uly, proxy, apiKey, secret, passphrase string, demo bool) error {
 func buildClient(proxy, apiKey, secret, passphrase string, demo bool) *okx.Client {
 	opts := []okx.Option{}
 	if proxy != "" {
+		if _, err := okx.ParseProxy(proxy); err != nil {
+			// 启动即报错退出，绝不带着无效代理直连跑：私有接口（DCY 等）
+			// 会以本机真实出口 IP（常为 IPv6）撞白名单 50110，误导排查。
+			fmt.Fprintf(os.Stderr, "代理配置无效: --proxy %q: %v\n", proxy, err)
+			fmt.Fprintln(os.Stderr, "示例：--proxy http://127.0.0.1:7890 或 --proxy socks5://127.0.0.1:1080")
+			os.Exit(1)
+		}
 		opts = append(opts, okx.WithProxy(proxy))
 	}
 	if demo {
@@ -231,6 +297,36 @@ func buildClient(proxy, apiKey, secret, passphrase string, demo bool) *okx.Clien
 		opts = append(opts, okx.WithAuth(apiKey, secret, passphrase))
 	}
 	return okx.NewClient(opts...)
+}
+
+// printEgress 打印经代理后的真实出口 IP；探测失败返回 error（--egress 据此非零退出）。
+func printEgress(c *okx.Client, proxy string, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 8 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	shown := proxy
+	if shown == "" {
+		shown = "（直连，未配置代理）"
+	}
+	ip, family, err := c.EgressIP(ctx)
+	if err != nil {
+		fmt.Printf("[egress] 代理 %s → 出口探测失败: %v\n", shown, err)
+		return err
+	}
+	fmt.Printf("[egress] 代理 %s → 出口 IP %s（%s）\n", shown, ip, family)
+	if family == "IPv6" {
+		fmt.Println("[egress] ⚠ 出口是 IPv6：OKX 白名单校验的是这个 IP。若白名单只填了 IPv4 → 50106/50110。")
+		fmt.Println("[egress]   处理：① 把该 IPv6 加入 API Key 白名单；或 ② 在代理侧强制 IPv4 出口（如 Clash `ipv6: false` / 换 IPv4-only 节点）。")
+	}
+	return nil
+}
+
+// runEgress --egress：核对代理后的真实出口 IP（OKX 白名单按此校验）。
+func runEgress(proxy string) error {
+	c := buildClient(proxy, "", "", "", false)
+	return printEgress(c, proxy, 10*time.Second)
 }
 
 func min(a, b int) int {

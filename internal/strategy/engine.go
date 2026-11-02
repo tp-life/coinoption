@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -16,14 +17,33 @@ import (
 // 规则（用户需求）：
 //   - 期权 APR 显著高于双币赢 → 押注期权（卖出同向期权）
 //   - 差距不大（含期权更差）→ 投注双币赢
-//   - 行权价偏差过大 / 无期权报价 → Unaligned（不推荐动作）
+//   - 行权价偏差过大 / 行权价摆放方向异常（卖 PUT 高于现价等）/ 无期权报价 → Unaligned
 func Decide(row MatchRow, p Params) Decision {
 	d := Decision{
 		Row: row,
 		Ts:  time.Now(),
 	}
 
-	if !row.OptMatched {
+	// 行权价摆放防呆：卖 PUT（低买）行权价不应高于现价、卖 CALL（高卖）不应
+	// 低于现价（允许 ±MaxStrikeGapPct 近 ATM 容差）。超出即摆放方向异常
+	// （DCY 数据异常或对齐错位），无论有无期权报价都不推荐动作。
+	if row.Spot > 0 {
+		tol := row.Spot * p.MaxStrikeGapPct / 100
+		switch {
+		case row.OptType == 'P' && row.Strike > row.Spot+tol:
+			d.Action = ActionUnaligned
+			d.ReasonCode = "strike_wrong_side"
+			return d
+		case row.OptType == 'C' && row.Strike < row.Spot-tol:
+			d.Action = ActionUnaligned
+			d.ReasonCode = "strike_wrong_side"
+			return d
+		}
+	}
+
+	if !row.OptMatched || row.OptBidPx == "" {
+		// 未找到同向同到期合约，或合约存在但无买盘（仅报价）：都算不出
+		// 可执行的卖方 APR，标注为不可对齐。
 		d.Action = ActionUnaligned
 		d.ReasonCode = "no_option_quote"
 		return d
@@ -96,8 +116,11 @@ func clampCap(row MatchRow, capUSDT float64) float64 {
 	return math.Round(amt*1e8) / 1e8
 }
 
-// Sort 决策排序：可执行动作优先，同动作内 Diff 降序。
-// 权重：BuyOption > SubscribeDual > Unaligned > None
+// Sort 决策排序：先按动作优先级分组（卖期权 > 申购双币赢 > 不可对齐 > 无动作），
+// 组内按「到期日 → 行权价 → 本位 → 方向」升序。
+//
+// 组内不再按 Diff 降序：收益差仍由「差%」列体现，但列表不会因此反复跳价，
+// 方便按到期和行权价连续对照。动作分组保留，确保可执行机会仍排在前面。
 func Sort(ds []Decision) {
 	weight := map[Action]int{
 		ActionBuyOption:     3,
@@ -105,19 +128,33 @@ func Sort(ds []Decision) {
 		ActionUnaligned:     1,
 		ActionNone:          0,
 	}
-	for i := 1; i < len(ds); i++ {
-		for j := i; j > 0; j-- {
-			a, b := ds[j-1], ds[j]
-			wa, wb := weight[a.Action], weight[b.Action]
-			if wa < wb || (wa == wb && a.Row.Diff < b.Row.Diff) {
-				ds[j-1], ds[j] = b, a
-			}
+	sort.SliceStable(ds, func(i, j int) bool {
+		a, b := ds[i], ds[j]
+		wa, wb := weight[a.Action], weight[b.Action]
+		if wa != wb {
+			return wa > wb
 		}
-	}
+		if !a.Row.ExpTime.Equal(b.Row.ExpTime) {
+			return a.Row.ExpTime.Before(b.Row.ExpTime)
+		}
+		if a.Row.Strike != b.Row.Strike {
+			return a.Row.Strike < b.Row.Strike
+		}
+		ka, kb := settleSortKey(a.Row.OptSettleCcy, a.Row.OptInstID),
+			settleSortKey(b.Row.OptSettleCcy, b.Row.OptInstID)
+		if ka != kb {
+			return ka < kb
+		}
+		if a.Row.OptType != b.Row.OptType {
+			return a.Row.OptType < b.Row.OptType
+		}
+		return a.Row.ProductID < b.Row.ProductID
+	})
 }
 
 // SupportedOptionInsts 由决策中「已成功对齐」的期权 instId 派生：命中即视为
-// 该期权被双币赢链路支持。供 Web/TUI 在展示期权榜时丢弃未被支持的合约。
+// 该期权被双币赢链路支持。供下游标注/筛选 DCY 可承接合约（期权榜本身
+// 已改为全链路完整展示，不再据此裁剪）。
 func SupportedOptionInsts(ds []Decision) map[string]bool {
 	insts := make(map[string]bool, len(ds))
 	for _, d := range ds {

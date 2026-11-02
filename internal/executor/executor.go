@@ -59,6 +59,9 @@ func (e *Executor) Mode() Mode { return e.mode }
 // Store 数据仓。
 func (e *Executor) Store() *store.Store { return e.st }
 
+// Client 底层 OKX 客户端（Web 行情与下单复用同一限速器）。
+func (e *Executor) Client() *okx.Client { return e.client }
+
 // State 风控状态快照。
 func (e *Executor) State() GuardState { return e.guard.Snapshot() }
 

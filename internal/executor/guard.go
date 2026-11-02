@@ -10,13 +10,13 @@ import (
 // Executor 层强校验：UI/配置异常也拦得住。
 type Limits struct {
 	// TotalExposureUSDT 全部在手敞口的 USDT 估值上限（5000）。
-	TotalExposureUSDT float64
+	TotalExposureUSDT float64 `json:"totalExposureUsdt"`
 	// PerOrderUSDT 单笔上限（2000）。
-	PerOrderUSDT float64
+	PerOrderUSDT float64 `json:"perOrderUsdt"`
 	// MaxConcurrent 最大同时在持订单笔数（5）。
-	MaxConcurrent int
+	MaxConcurrent int `json:"maxConcurrent"`
 	// MaxSessionsPerDay 单日（UTC 自然日）提交成功次数上限（10）。
-	MaxSessionsPerDay int
+	MaxSessionsPerDay int `json:"maxSessionsPerDay"`
 }
 
 // DefaultLimits plan §2.4 定稿。

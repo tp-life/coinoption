@@ -1,6 +1,9 @@
 package strategy
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Action 决策动作。
 type Action string
@@ -40,7 +43,7 @@ func DefaultParams() Params {
 type Decision struct {
 	Row          MatchRow  `json:"row"`
 	Action       Action    `json:"action"`
-	ReasonCode   string    `json:"reasonCode"` // "option_apr_higher" | "diff_small" | "option_apr_worse" | "strike_gap_too_big" | "no_option_quote"
+	ReasonCode   string    `json:"reasonCode"` // "option_apr_higher" | "diff_small" | "option_apr_worse" | "strike_gap_too_big" | "strike_wrong_side" | "no_option_quote"
 	SuggestedAmt float64   `json:"suggestedAmt"`
 	Ts           time.Time `json:"ts"`
 }
@@ -63,10 +66,12 @@ type MatchRow struct {
 	DcyAPR float64 `json:"dcyApr"` // 年化（统一小数口径）
 
 	// 期权侧（OptAPR 小数口径；未匹配时 OptMatched=false）
+	// OptMatched=true 表示「找到了同向、同到期（±1 天）的合约」，不代表
+	// 一定有可成交买盘：OptBidPx 为空时只做展示对齐，不可给出卖出建议。
 	OptMatched   bool    `json:"optMatched"`
 	OptInstID    string  `json:"optInstId"`
 	OptAPR       float64 `json:"optApr"`
-	OptBidPx     string  `json:"optBidPx"` // 原始串串并保留
+	OptBidPx     string  `json:"optBidPx"` // 原始串并保留；空 = 无买盘
 	OptSettleCcy string  `json:"optSettleCcy"`
 	StrikeErrPct float64 `json:"strikeErrPct"` // 相对现价的行权价偏差
 
@@ -80,6 +85,37 @@ func OptTypeName(t rune) string {
 		return "CALL"
 	case 'P', 'p':
 		return "PUT"
+	}
+	return "—"
+}
+
+// SettleKind 判断期权结算本位：'U' = U 本位（USDT/USD 结算，如 BTC-USD_UM 链），
+// 'B' = 币本位（结算币为标的币，如 BTC-USD 链）。
+// settleCcy 为空（instruments 缺失）时按 instId 中的 _UM 推断；都无法判断返回 0。
+func SettleKind(settleCcy, instID string) rune {
+	switch strings.ToUpper(strings.TrimSpace(settleCcy)) {
+	case "USDT", "USDC", "USD":
+		return 'U'
+	case "":
+	default:
+		return 'B' // BTC/ETH/SOL 等标的币结算
+	}
+	if strings.Contains(instID, "_UM") {
+		return 'U'
+	}
+	if instID != "" {
+		return 'B'
+	}
+	return 0
+}
+
+// SettleKindName 本位展示名：'U' → U本位，'B' → 币本位，其它 → —。
+func SettleKindName(k rune) string {
+	switch k {
+	case 'U', 'u':
+		return "U本位"
+	case 'B', 'b':
+		return "币本位"
 	}
 	return "—"
 }

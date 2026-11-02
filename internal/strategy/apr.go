@@ -27,6 +27,7 @@ type OptQuote struct {
 	Expiry    time.Time
 	BidPx     string
 	AskPx     string
+	MarkPx    string
 	CtVal     float64 // 1 张合约对应的标的名义数量
 	CtValCcy  string  // BTC
 	SettleCcy string  // BTC | USDT

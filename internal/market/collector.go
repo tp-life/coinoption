@@ -36,16 +36,45 @@ func FetchWith(c *okx.Client, dcyUly string, p strategy.Params) (*Snapshot, erro
 	parts := strings.Split(dcyUly, "-")
 	base := parts[0]
 
-	// 1. 期权底层：USDT 变体 → USD 兜底
-	optionUly := dcyUly
-	instruments, err := c.GetOptionInstruments(optionUly)
-	if (err != nil || len(instruments) == 0) && strings.HasSuffix(dcyUly, "-USDT") {
-		optionUly = base + "-USD"
-		if ins2, err2 := c.GetOptionInstruments(optionUly); err2 == nil && len(ins2) > 0 {
-			instruments = ins2
+	// 1. 期权链：优先拉父链 BTC-USD（OKX 的 instruments 响应实测已包含
+	// _UM 合约）。若父链行情里没有 U 本位合约，再单独补拉 BTC-USD_UM，
+	// 保证用户对照 OKX 列表时不缺档位；按 instId 去重避免重复行。
+	snapshot := &Snapshot{At: time.Now(), Uly: dcyUly}
+	parentChain := base + "-USD"
+	var chainWarns []string
+	instruments, err := c.GetOptionInstruments(parentChain)
+	if err != nil {
+		chainWarns = append(chainWarns, parentChain+" 产品信息: "+shortErr(err))
+	}
+	tickers, err := c.GetOptionTickers(parentChain)
+	if err != nil {
+		chainWarns = append(chainWarns, parentChain+" 行情: "+shortErr(err))
+	}
+	umChain := base + "-USD_UM"
+	if !hasUMInstrument(instruments) {
+		if um, err := c.GetOptionInstruments(umChain); err == nil {
+			instruments = append(instruments, um...)
 		}
 	}
-	snapshot := &Snapshot{At: time.Now(), Uly: dcyUly, OptionUly: optionUly}
+	fetchedUM := false
+	if !hasUMTicker(tickers) {
+		if um, err := c.GetOptionTickers(umChain); err == nil && len(um) > 0 {
+			tickers = append(tickers, um...)
+			fetchedUM = true
+		}
+	}
+	instruments = dedupeInstruments(instruments)
+	tickers = dedupeTickers(tickers)
+	if len(tickers) == 0 {
+		return nil, fmt.Errorf("期权行情拉取失败: %s", strings.Join(chainWarns, "; "))
+	}
+	snapshot.OptionUly = parentChain
+	if fetchedUM {
+		snapshot.OptionUly += " + " + umChain
+	}
+	if len(chainWarns) > 0 {
+		snapshot.Warn = strings.Join(chainWarns, "; ")
+	}
 
 	// 2. 现价
 	spots, err := c.GetSpotTicker(dcyUly)
@@ -57,14 +86,10 @@ func FetchWith(c *okx.Client, dcyUly string, p strategy.Params) (*Snapshot, erro
 	}
 	spotMap := map[string]float64{base: snapshot.SpotPrice}
 
-	// 3. 期权行情
-	tickers, err := c.GetOptionTickers(optionUly)
-	if err != nil {
-		return nil, err
-	}
+	// 3. 期权行情（合并链）
 	snapshot.OptionCount = len(tickers)
 
-	snapshot.OptionRows = strategy.RankOptions(instruments, tickers, spotMap, time.Now(), p)
+	snapshot.OptionRows = strategy.RankOptions(instruments, tickers, spotMap, time.Now())
 
 	// 4. DCY 产品（尽力而为；无 Key/模拟盘下 401/500 → 降级为纯期权观察）
 	var dcds []okx.DCDProduct
@@ -89,51 +114,59 @@ func FetchWith(c *okx.Client, dcyUly string, p strategy.Params) (*Snapshot, erro
 		}
 		snapshot.Decisions = strategy.Build(dcds, instruments, tickers, spotMap, time.Now(), p)
 	} else {
-		snapshot.Warn = "双币赢不可用（需实盘 API Key；模拟盘无金融产品）→ [" + strings.Join(warns, "; ") + "]"
-	}
-
-	// 丢弃未被双币赢链路支持的期权榜行：决策中 OptMatched 成功的合约即为
-	// DCY 可承接的选项；DCY 不可用（纯期权观察）时保留全量供看板。
-	if len(snapshot.Decisions) > 0 {
-		supported := strategy.SupportedOptionInsts(snapshot.Decisions)
-		if len(supported) > 0 {
-			kept := snapshot.OptionRows[:0]
-			for _, or := range snapshot.OptionRows {
-				if supported[or.InstID] {
-					kept = append(kept, or)
-				}
-			}
-			snapshot.OptionRows = kept
+		dcyWarn := "双币赢不可用（需实盘 API Key；模拟盘无金融产品）→ [" + strings.Join(warns, "; ") + "]"
+		if snapshot.Warn != "" {
+			snapshot.Warn += "; " + dcyWarn
+		} else {
+			snapshot.Warn = dcyWarn
 		}
 	}
+
+	// 期权榜保持全链路完整展示（卖方有效方向 + 有买盘），不再按「DCY 已对齐
+	// 合约」裁剪——那样整条链只剩 DCY 产品匹配的最近几个档位，用户对照
+	// OKX 实际列表时看不到 70000/74000 等档位。需要收敛视图用「到期 + 方向」筛选。
 	return snapshot, nil
+}
+
+// Filter 组合筛选条件（零值 = 全量）。
+type Filter struct {
+	Day    time.Time // 到期日（UTC，零值不限）
+	Side   rune      // 0 全部 / 'C' CALL / 'P' PUT
+	Settle rune      // 0 全部 / 'B' 币本位 / 'U' U本位
 }
 
 // FilterByExpiryDay 按到期日（UTC）过滤快照：只保留到期日匹配的决策与期权榜行。
 // day 为零值表示不过滤（全量）。返回浅拷贝，不修改入参（快照可被缓存复用）。
 func FilterByExpiryDay(snap *Snapshot, day time.Time) *Snapshot {
-	return FilterSnapshot(snap, day, 0)
+	return FilterSnapshot(snap, Filter{Day: day})
 }
 
-// FilterSnapshot 组合筛选：到期日（UTC，day 零值为全部）+ 方向（0 全部 / 'C' CALL / 'P' PUT）。
+// FilterSnapshot 组合筛选：到期日（UTC）+ 方向 + 结算本位。
 // 同时作用于决策行与期权榜。返回浅拷贝，不修改入参（快照可被缓存复用）。
-func FilterSnapshot(snap *Snapshot, day time.Time, side rune) *Snapshot {
+func FilterSnapshot(snap *Snapshot, f Filter) *Snapshot {
 	if snap == nil {
 		return nil
 	}
-	side = normalizeSide(side)
-	if day.IsZero() && side == 0 {
+	f.Side = normalizeSide(f.Side)
+	f.Settle = normalizeSettle(f.Settle)
+	if f.Day.IsZero() && f.Side == 0 && f.Settle == 0 {
 		return snap
 	}
 	dayStr := ""
-	if !day.IsZero() {
-		dayStr = day.UTC().Format("2006-01-02")
+	if !f.Day.IsZero() {
+		dayStr = f.Day.UTC().Format("2006-01-02")
 	}
 	sideOK := func(t rune) bool {
-		if side == 0 {
+		if f.Side == 0 {
 			return true
 		}
-		return normalizeSide(t) == side
+		return normalizeSide(t) == f.Side
+	}
+	settleOK := func(t rune) bool {
+		if f.Settle == 0 {
+			return true
+		}
+		return normalizeSettle(t) == f.Settle
 	}
 	out := *snap
 	out.Decisions = make([]strategy.Decision, 0, len(snap.Decisions))
@@ -144,6 +177,9 @@ func FilterSnapshot(snap *Snapshot, day time.Time, side rune) *Snapshot {
 		if !sideOK(d.Row.OptType) {
 			continue
 		}
+		if !settleOK(strategy.SettleKind(d.Row.OptSettleCcy, d.Row.OptInstID)) {
+			continue
+		}
 		out.Decisions = append(out.Decisions, d)
 	}
 	out.OptionRows = make([]strategy.OptionRow, 0, len(snap.OptionRows))
@@ -152,6 +188,9 @@ func FilterSnapshot(snap *Snapshot, day time.Time, side rune) *Snapshot {
 			continue
 		}
 		if !sideOK(or.OptType) {
+			continue
+		}
+		if !settleOK(strategy.SettleKind(or.SettleCcy, or.InstID)) {
 			continue
 		}
 		out.OptionRows = append(out.OptionRows, or)
@@ -168,6 +207,65 @@ func normalizeSide(t rune) rune {
 		return 'P'
 	}
 	return 0
+}
+
+// normalizeSettle 把结算本位统一为 'B'（币本位）/ 'U'（U本位）；其它值视为「全部」（0）。
+func normalizeSettle(t rune) rune {
+	switch t {
+	case 'B', 'b':
+		return 'B'
+	case 'U', 'u':
+		return 'U'
+	}
+	return 0
+}
+
+// hasUMInstrument 判断 instruments 中是否已含 U 本位（_UM）合约。
+func hasUMInstrument(ins []okx.Instrument) bool {
+	for _, i := range ins {
+		if strings.Contains(i.InstID, "_UM") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasUMTicker 判断 tickers 中是否已含 U 本位（_UM）合约。
+func hasUMTicker(tks []okx.OptionTicker) bool {
+	for _, t := range tks {
+		if strings.Contains(t.InstID, "_UM") {
+			return true
+		}
+	}
+	return false
+}
+
+// dedupeInstruments 按 instId 去重（父链与 _UM 链可能返回重叠合约）。
+func dedupeInstruments(in []okx.Instrument) []okx.Instrument {
+	seen := make(map[string]bool, len(in))
+	out := in[:0]
+	for _, i := range in {
+		if seen[i.InstID] {
+			continue
+		}
+		seen[i.InstID] = true
+		out = append(out, i)
+	}
+	return out
+}
+
+// dedupeTickers 按 instId 去重（父链与 _UM 链可能返回重叠行情）。
+func dedupeTickers(in []okx.OptionTicker) []okx.OptionTicker {
+	seen := make(map[string]bool, len(in))
+	out := in[:0]
+	for _, t := range in {
+		if seen[t.InstID] {
+			continue
+		}
+		seen[t.InstID] = true
+		out = append(out, t)
+	}
+	return out
 }
 
 func parseFloat(s string) float64 {
