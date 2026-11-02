@@ -57,6 +57,7 @@ func main() {
 	webEnabled := flag.Bool("web", false, "启动 Web 看板（GET /；API：/api/decisions?uly=BTC-USDT&exp=2026-11-06）")
 	webAddr := flag.String("addr", ":8080", "Web 服务监听地址（--web 开启时生效）")
 	webTrade := flag.Bool("web-trade", false, "Web 看板启用手动下单（默认只读；live 模式会提交真实订单）")
+	wsEnabled := flag.Bool("ws", true, "启用 OKX WebSocket 实时行情（断线自动重连；--ws=false 回退 REST 轮询）")
 	flag.Parse()
 
 	switch {
@@ -141,7 +142,8 @@ func main() {
 		} else {
 			client = buildClient(*proxy, *apiKey, *secret, *passphrase, *demo)
 		}
-		fetcher := &market.Fetcher{C: client}
+		fetcher := &market.Fetcher{C: client, UseWS: *wsEnabled}
+		defer fetcher.Close()
 		opts := make([]web.ServerOption, 0, 1)
 		if ex != nil {
 			opts = append(opts, web.WithTrader(ex))
@@ -180,7 +182,9 @@ func main() {
 			}
 		}
 		client := buildClient(*proxy, *apiKey, *secret, *passphrase, *demo)
-		run := ui.New(&market.Fetcher{C: client}, ex, *uly)
+		fetcher := &market.Fetcher{C: client, UseWS: *wsEnabled}
+		defer fetcher.Close()
+		run := ui.New(fetcher, ex, *uly)
 		p := tea.NewProgram(run, tea.WithAltScreen())
 		if _, err := p.Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "tui failed: %v\n", err)

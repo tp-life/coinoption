@@ -27,8 +27,9 @@ type SpotTicker struct {
 
 // OptionTicker 期权行情节选（/market/tickers?instType=OPTION）。
 type OptionTicker struct {
-	InstID     string `json:"instId"` // BTC-USDT-260129-130000-P
-	Uly        string `json:"uly"`    // BTC-USDT
+	InstType   string `json:"instType"` // SPOT / OPTION（WS tickers 推送）
+	InstID     string `json:"instId"`   // BTC-USDT-260129-130000-P
+	Uly        string `json:"uly"`      // BTC-USDT
 	InstFamily string `json:"instFamily"`
 	Ccy        string `json:"ccy"`
 	OptType    string `json:"optType"`   // C | P

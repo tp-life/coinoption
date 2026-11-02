@@ -44,7 +44,9 @@ type Client struct {
 
 	baseURL   string
 	http      *http.Client
-	proxyErr  error // 代理配置非法（请求一律短路报错，不静默直连）
+	proxyErr  error    // 代理配置非法（请求一律短路报错，不静默直连）
+	proxyURL  *url.URL // WS Dialer 复用同一代理链路
+	wsURL     string   // 覆盖 WebSocket 公共行情地址（测试/特殊网络）
 	limiter   *rate.Limiter
 	retryBase time.Duration // 重试退避基数（测试可调小）
 }
@@ -109,7 +111,16 @@ func WithProxy(proxyURL string) Option {
 			c.proxyErr = err
 			return
 		}
+		c.proxyURL = u
 		c.http.Transport = &http.Transport{Proxy: http.ProxyURL(u)}
+	}
+}
+
+// WithWSURL 覆盖 WebSocket 公共行情地址（测试或特殊网络环境）。
+// 生产默认：实盘 wss://ws.okx.com/ws/v5/public；模拟盘 wspap.okx.com。
+func WithWSURL(raw string) Option {
+	return func(c *Client) {
+		c.wsURL = strings.TrimSpace(raw)
 	}
 }
 

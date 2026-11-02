@@ -6,10 +6,11 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 
 - **M0 完成**：OKX REST 客户端（签名/限速/重试/代理）✅ 公开行情实测 ✅ 双币赢 `sfp/dcd` 全端点 ✅
 - **M1 完成**：strategy 对齐引擎（matcher/APR/决策）+ 黄金用例 + 实线校准（`|strike gap|` 匹配、UM=USD 计价）✅
-- **M2 v1 完成**：Bubble Tea TUI Dashboard（默认运行模式，20s 自动刷新，`r` 手动刷新，`q` 退出）✅
+- **M2 v1 完成**：Bubble Tea TUI Dashboard（WS 实时行情，1s 从本地缓存重绘；`r` 手动刷新，`q` 退出）✅
 - **M3 v1 完成**：executor 执行层 ✅ —— 风控守卫（总敞口 5000 / 单笔 2000 / 并行 5 / 日 10 强校验 + 重启恢复）、DCY 申购两步流（quote→trade）、期权卖单、三种模式路由（live / sim-okx / sim-local）、本地 DCY 纸面模拟结算（[SIM] 单落盘、到期按现价结算）、统一持仓视图、JSONL 审计留痕（`~/.coinoption/`）
 - **M3.2 完成**：TUI 下单与持仓 ✅ —— 决策行上 `o` 卖期权 / `d` 申购双币赢，数量输入 → 二次确认 → 提交（`y`/`n`），`p` 持仓页（异步刷新缓存 + `j/k` 滚动），头部常驻模式徽标与敞口/在持进度；live 模式启动时从平台 DCY 在持单 + 期权空头恢复风控敞口
 - **M3.3 完成**：Settings 页 + 自动执行（默认关闭）✅ —— 阈值/开关落盘 `settings.json`，自动执行每次刷新最多 1 单、同产品跨重启只做一次、间隔 ≥60s，仍受 executor 风控硬上限约束；live 模式开启需当次 `y` 二次确认，进程重启强制回到关闭
+- **M4 v1 完成**：OKX WebSocket 实时行情 ✅ —— 现货 + 全部期权 `tickers` 订阅（每批 300 条），心跳、指数退避重连、断线自动降级 30s REST；`market.Live` 缓存每 500ms 重组一次，TUI 1s 重绘；Web 新增 `GET /ws` 每秒推送当前筛选快照，浏览器断线自动重连并回退 REST
 - **M4 扩展**：Web 看板双标签（对比决策 / 完整期权链）✅；Web 手动下单（`--web-trade`，默认只读）✅ —— 决策行内「卖出期权 / 申购 DCY」弹窗二次确认，复用 executor 风控/审计/模式路由，live 模式启动打印实盘警告
 
 ### TUI 快捷键
@@ -55,7 +56,7 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 >
 > `高卖 / 低买` 里的「卖 / 买」指到期时**换币方向**（卖币 / 买币），不是期权买卖；期权的买卖看「操作」列：`卖CALL / 卖PUT / 卖出期权` 都是 SELL。
 
-刷新失败时保留上一次成功快照并在头部标红提示（不会清空决策表）；持仓页与日志页在可见时随 20s 心跳自动刷新。
+刷新失败时保留上一次成功快照并在头部标红提示（不会清空决策表）；持仓页与日志页在可见时随 1s 心跳自动刷新（WS 缓存；`--ws=false` 时 REST 15s 缓存）。
 
 **自动执行边界**（`settings.json` 的 `autoTrade`）：
 
@@ -109,7 +110,16 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 - 只读 GET 的瞬时故障（`50001/50026/50013/50004/50005`）可重试；**POST 一律不重试**，避免「已成交又重下一单」。
 - 签名/参数/白名单类错误（`50105/50106/50110` 等）立即失败并给出中文提示，不浪费重试。
 
-### Web 展示服务（M4 扩展）
+### WebSocket 实时行情（M4）
+
+- 公共行情走 OKX WS `wss://ws.okx.com/ws/v5/public`（Demo 为 `wss://wspap.okx.com/ws/v5/public?brokerId=9999`），默认开启；`--ws=false` 回退 REST。
+- 订阅内容：现货 `BTC-USDT` + 当前标的全部期权 `tickers`（每张合约一个 `instId`，按 300 个一批发送，避开 64KB 单帧上限）。OKX 的 `tickers` 不支持按 `instFamily` 批量订阅期权；`opt-summary` 只有 IV/Greeks 没有 `bidPx`，无法复用现有卖方 APR 公式，因此没有采用。
+- 连接每 20s 发送 `ping`，60s 无数据视为断链；断链后指数退避（1s → 2s → … → 30s）重连并自动重放全部订阅。
+- 缓存与重算：WS 只更新 `bid/ask/last` 等动态字段；`market.Live` 每 500ms 最多重组一次策略结果。DCY 产品与 `instruments` 仍走 REST（DCY 30s、产品信息 5min），不占用 WS。
+- 降级：WS 断开超过缓存周期后，后台每 30s 用 REST 拉一次现货/期权行情兜底；恢复后自动切回 WS。TUI 头部显示 `WS 实时 / WS 重连中 / WS 降级`，Web 页头额外显示 `REST`（未启用或不可恢复的 WS 配置错误）。
+- Web 端 `GET /ws` 每秒推送当前筛选下的完整快照（与 `/api/decisions` 同构）；页面优先用 WebSocket，断线自动重连，重连期间用 REST 兜底。
+
+
 
 ```bash
 ./bin/coinoption --web --addr 0.0.0.0:8080
@@ -117,8 +127,9 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 ./bin/coinoption --web --web-trade --mode sim-local --addr 127.0.0.1:8080
 ```
 
-- `GET /` — 决策看板页（内嵌 HTML，自动 20s 轮询 `/api/decisions`）
-- `GET /api/decisions` — 当前决策 JSON（camelCase：`at / uly / optionUly / spotPrice / optionCount / dcdCount / decisions / optionRows / products / dcyAvailable / warn / mode / tradeEnabled / guard`）；`decisions[].row` 含 `productId / expTime / dcyApr / optApr / diff / strike / days / strikeErrPct / investCcy / optInstId`，`decisions[]` 含 `action / reasonCode / suggestedAmt`（reasonCode 增含 `strike_wrong_side`：卖 PUT 行权价高于现价 / 卖 CALL 低于现价，摆放方向异常不推荐）。`mode` 为 `read-only`（未开 `--web-trade`）或 `live/sim-okx/sim-local`；`guard` 给出敞口/单笔/并行/日限状态。
+- `GET /` — 决策看板页（内嵌 HTML，优先通过 `/ws` 接收每秒推送；WS 不可用时自动回退 `/api/decisions`）
+- `GET /ws` — WebSocket 推送（查询参数与 `/api/decisions` 相同：`uly / exp / side / settle`），每秒一帧完整快照；断线由浏览器自动重连
+- `GET /api/decisions` — 当前决策 JSON（camelCase：`at / uly / optionUly / spotPrice / optionCount / dcdCount / decisions / optionRows / products / dcyAvailable / warn / wsConnected / wsStatus / mode / tradeEnabled / guard`）；`decisions[].row` 含 `productId / expTime / dcyApr / optApr / diff / strike / days / strikeErrPct / investCcy / optInstId`，`decisions[]` 含 `action / reasonCode / suggestedAmt`（reasonCode 增含 `strike_wrong_side`：卖 PUT 行权价高于现价 / 卖 CALL 低于现价，摆放方向异常不推荐）。`mode` 为 `read-only`（未开 `--web-trade`）或 `live/sim-okx/sim-local`；`guard` 给出敞口/单笔/并行/日限状态。
 
 **Web 看板交互**：
 
@@ -134,7 +145,7 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 - 下单按钮（需 `--web-trade`）：决策行动作为 `卖期权` 时给出「卖出期权」，为 `申购双币赢` 时给出「申购 DCY」；点击后弹窗填写张数 / 投入量并二次确认。未启用时该列显示 `—`，页头提示 Web 只读
 - 完整期权链表列：操作 / 期权合约 / 到期(UTC) / 方向 / 本位 / 行权价 / 距现价% / 买价 / 卖价 / 期权 APR / 天 / 对应 DCY / DCY APR / 差
 - 顶部图例说明方向和买卖语义：`CALL 看涨 / PUT 看跌`，`卖CALL / 卖PUT = SELL（卖出期权，收权利金）`，`申购DCY（高卖→到期卖币 / 低买→到期买币）`，并标注 `本工具仅卖期权，不买入期权`
-- 快照服务端缓存 15s，避免每个页面轮询都打 OKX（DCD 限速 1 req/s）
+- 快照服务端缓存 1s（WS 实时模式；REST 模式下 `market.Fetcher` 内部另有 15s 缓存，避免每个页面轮询都打 OKX）
 
 > 机会榜展示**卖方有效链**：全部到期日、全部有效行权价、不按 DCY 对齐 / 7–30 天窗口 / TopN / `bid` 有无裁剪条数；**实值档直接过滤**（卖 PUT 行权价 > 现价、卖 CALL 行权价 < 现价，超 ±0.5% 容差）。无买盘档位仍保留展示价格（操作列标 `仅报价`）。排序与 OKX 期权链一致：**到期日升序 → 行权价升序 → 本位 → 方向**，方便按价格从低到高顺序对照。**决策页只列 DCY 产品**（每条一行，含对齐结果与建议），**期权链页单独列完整链**，两类数据不再混排。决策侧同类摆放异常给 `unaligned / strike_wrong_side`；7–30 天期限窗口只过滤决策行，不影响期权榜。决策行先按动作分组（卖期权 → 申购 DCY → 不可对齐），组内按「到期日 → 行权价 → 本位 → 方向」升序；期权链按「到期日 → 行权价 → 本位 → 方向」升序。期权链同时覆盖币本位（`BTC-USD`）与 U 本位（`BTC-USD_UM`）：优先取父链响应（实测已含 `_UM`），缺失时自动补拉并按 `instId` 去重。DCY 与期权的底层按**标的币**对齐（`BTC-USDT` ↔ `BTC-USD` ↔ `BTC-USD_UM` 视为同一标的），不会因 quote 币写法不同而误判未对齐；到期匹配用 ±1 天绝对值（兼容 DCY 16:00 与币本位期权 08:00 的结算时刻差）；某档合约存在但没有买盘时，仍建立**展示对齐**（决策行显示对应期权），只是原因给 `no_option_quote`、不产生可执行动作。匹配优先选「有买盘且最近」的档位，避免被更近的空盘档抢走。
 
@@ -196,9 +207,10 @@ go test ./internal/strategy/        # 黄金回归
 | `--store` | — | 数据目录，默认 `~/.coinoption` |
 | `--limits` | — | 风控覆盖 `"total,perOrder,concurrent,perDay"`（段序：总敞口 / 单笔 / 并行 / 日限；期权大名义验证需放宽），默认 `5000,2000,5,10` |
 | `--uly` | — | 标的，默认 `BTC-USDT`（支持 ETH-USDT/SOL-USDT；TUI 可用 `u` 快速切换） |
-| `--web` | — | 启动 Web 展示服务（决策看板） |
+| `--web` | — | 启动 Web 展示服务（决策看板；默认经 `/ws` 实时推送） |
 | `--web-trade` | — | Web 看板启用手动下单（默认只读；`live` 会提交真实订单，建议配合 `--addr 127.0.0.1:8080`） |
 | `--addr` | — | Web 服务监听地址（`--web` 开启时生效，默认 `:8080`） |
+| `--ws` | — | 启用 OKX WebSocket 实时行情（默认 `true`；`--ws=false` 回退 REST 轮询/15s 缓存） |
 
 > 运行模式在启动时固定（executor 装配后不可热切换）；Settings 页显示当前模式，切换需重启并指定 `--mode`。
 

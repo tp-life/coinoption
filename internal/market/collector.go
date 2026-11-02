@@ -1,5 +1,6 @@
-// Package market 行情采集：把 okx 客户端 + strategy 编译成一次性快照。
-// M2 阶段为同步单次拉取（TUI 每 20s 触发一次）；WS 增量在 M4 接入。
+// Package market 行情采集：把 okx 客户端 + strategy 编译成一次快照。
+// M4 起支持两条路径：market.Live（WS 实时缓存，TUI/Web 默认）与
+// FetchWith（一次 REST 拉取，CLI --dump / 降级兜底）。
 package market
 
 import (
@@ -24,6 +25,10 @@ type Snapshot struct {
 	Products     map[string]okx.DCDProduct `json:"products"`   // productId → 产品（TUI 申购用）
 	DCYAvailable bool                      `json:"dcyAvailable"`
 	Warn         string                    `json:"warn"` // 非致命提示（如 DCY 需 Key 的 401/500）
+
+	// WebSocket 实时行情状态（REST 模式为零值/空）。
+	WSConnected bool   `json:"wsConnected"`
+	WSStatus    string `json:"wsStatus,omitempty"` // connecting/live/degraded/reconnecting
 }
 
 // Fetch 同步拉取一轮并用 strategy 引擎决策（默认参数）。

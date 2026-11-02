@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	refreshEvery = 20 * time.Second
+	refreshEvery = 1 * time.Second
 	autoCooldown = 60 * time.Second // 自动执行最小间隔（防抖/防连环下单）
 )
 
@@ -737,6 +737,14 @@ func (a App) headerLine() string {
 	}
 	if a.loading {
 		parts = append(parts, warnStyle.Render("⏳ 刷新中"))
+	}
+	switch {
+	case s.WSStatus == "degraded":
+		parts = append(parts, warnStyle.Render("WS 降级"))
+	case s.WSConnected:
+		parts = append(parts, okStyle.Render("WS 实时"))
+	case s.WSStatus == "reconnecting" || s.WSStatus == "connecting":
+		parts = append(parts, warnStyle.Render("WS 重连中"))
 	}
 	parts = append(parts, hintStyle.Render("更新 "+s.At.Local().Format("15:04:05")))
 	g := a.guard

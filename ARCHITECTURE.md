@@ -146,7 +146,7 @@ type Cache interface {
 | store SQLite + `audit.go` | `store/store.go`（JSONL） | `sim_orders` / `orders` / `audit_log` 追加写；`settings.json` 单对象覆盖写 |
 | `config/` + hot reload | 命令行参数 + `settings.json` | 阈值/自动执行开关热更新；运行模式启动时固定（executor 装配后不热切） |
 | `ui/*.go` 多文件 | `ui/app.go` + `theme.go` | 页 1/2 合并为决策表；持仓/下单/Settings/日志已具备，单文件 Model |
-| `market` WS collector | `market/collector.go`（REST 20s 轮询） | 已加重试/限速退避；WS 增量仍待接入（当前请求量在 10 rps 限制内） |
+| `market` WS collector | `market/live.go`（WS 实时缓存）+ `market/collector.go`（REST 单次/降级） | `okx/ws.go` 订阅 spot + 全期权 `tickers`；REST 慢数据（DCY/instruments）与断线兜底保留 |
 | collector/strategy bus | `tea.Cmd` 异步 + `Snapshot` | 每轮一次性计算，无独立缓存层 |
 
 `SyncLiveGuard` 在 live 启动时把平台 DCY 在持单 + 期权空头折算为敞口并入守卫；**当日笔数**仍以本地 audit 为准（平台历史成交未计入），用于避免同进程内重复提交。

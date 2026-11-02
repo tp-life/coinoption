@@ -3,11 +3,14 @@ package web
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/tp/coinoption/internal/executor"
 	"github.com/tp/coinoption/internal/market"
 	"github.com/tp/coinoption/internal/okx"
@@ -64,8 +67,9 @@ type orderResponse struct {
 	Detail    string  `json:"detail"`
 }
 
-// cacheTTL 快照缓存时长：避免每次页面轮询都打 OKX（DCD 接口限速 1 req/s）。
-const cacheTTL = 15 * time.Second
+// cacheTTL 快照缓存时长：WS 实时模式只缓存 1s，避免页面/WS 推送重复重组；
+// REST 模式下 market.Fetcher 内部另有 15s 缓存，不会放大 OKX 请求量。
+const cacheTTL = 1 * time.Second
 
 type cacheEntry struct {
 	snap *market.Snapshot
@@ -252,6 +256,10 @@ let curGuard = null;
 let pending = null;
 let submitting = false;
 let loading = false;
+let ws = null;
+let wsRetry = 0;
+let wsTimer = null;
+let wsDown = false;
 
 function $(id) { return document.getElementById(id); }
 
@@ -352,6 +360,7 @@ function renderMeta(j) {
     " · 模式 " + curMode + (tradeEnabled ? "（Web 下单）" : "（Web 只读）") +
     " · 组合 " + curUly + " · " + (curSide || "全部方向") + " · " + (curSettle ? settleName(curSettle) : "全部本位") + " · " + (curExp || "全部到期") +
     " · 更新 " + (t ? t.toLocaleTimeString("zh-CN", { hour12: false }) : "-") +
+    " · " + (j.wsStatus === "degraded" ? "WS 降级" : (j.wsConnected ? "WS 实时" : (j.wsStatus === "reconnecting" ? "WS 重连中" : (j.wsStatus === "connecting" ? "WS 连接中" : "REST")))) +
     (j.warn ? " · ⚠ " + j.warn : "");
   document.querySelectorAll(".cur").forEach(function (b) {
     b.classList.toggle("on", b.dataset.uly === curUly);
@@ -584,7 +593,7 @@ async function submitOrder() {
     pending = null;
     $("status").className = "status ok";
     $("status").textContent = "✓ " + (j.detail || "已提交");
-    setTimeout(load, 3000);
+    setTimeout(refresh, 3000);
   } catch (e) {
     $("omNote").className = "omnote err";
     $("omNote").textContent = "✗ " + e.message;
@@ -642,6 +651,13 @@ function optionAct(r) {
   return "卖出期权";
 }
 
+function applySnapshot(j) {
+  renderMeta(j);
+  renderDays(expiryDays(j.decisions || [], j.optionRows || []));
+  renderRows(j);
+  $("status").textContent = wsDown ? "WebSocket 断线，重连中…" : "";
+}
+
 async function load() {
   if (loading) return;
   loading = true;
@@ -655,10 +671,7 @@ async function load() {
     const r = await fetch("/api/decisions?" + params.toString(), { cache: "no-store" });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
-    renderMeta(j);
-    renderDays(expiryDays(j.decisions || [], j.optionRows || []));
-    renderRows(j);
-    $("status").textContent = "";
+    applySnapshot(j);
   } catch (e) {
     $("meta").textContent = "加载失败：" + e.message;
     $("status").textContent = "";
@@ -667,24 +680,72 @@ async function load() {
   }
 }
 
+// WebSocket 推送：服务端每秒推送当前筛选下的完整快照（与 /api/decisions 同构）。
+// 断线自动重连，期间用 REST 兜底；不支持 WS 的环境直接回退轮询。
+function wsEndpoint() {
+  const params = new URLSearchParams();
+  params.set("uly", curUly);
+  if (curExp) params.set("exp", curExp);
+  if (curSide) params.set("side", curSide);
+  if (curSettle) params.set("settle", curSettle);
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  return proto + "//" + location.host + "/ws?" + params.toString();
+}
+
+function connectWS() {
+  if (!window.WebSocket) { load(); return; }
+  if (wsTimer) { clearTimeout(wsTimer); wsTimer = null; }
+  if (ws) {
+    ws.onclose = null;
+    ws.onerror = null;
+    try { ws.close(); } catch (e) {}
+    ws = null;
+  }
+  let sock;
+  try { sock = new WebSocket(wsEndpoint()); } catch (e) { load(); return; }
+  ws = sock;
+  sock.onopen = function () { wsRetry = 0; wsDown = false; $("status").textContent = ""; };
+  sock.onmessage = function (ev) {
+    if (ws !== sock) return;
+    let j;
+    try { j = JSON.parse(ev.data); } catch (e) { return; }
+    if (j.error) { $("status").textContent = "WS: " + j.error; return; }
+    applySnapshot(j);
+  };
+  sock.onclose = function () {
+    if (ws === sock) ws = null;
+    wsDown = true;
+    const wait = Math.min(10000, 1000 * Math.pow(2, Math.min(wsRetry, 4)));
+    wsRetry++;
+    $("status").textContent = "WebSocket 断线，重连中…";
+    wsTimer = setTimeout(connectWS, wait);
+    load(); // 重连期间 REST 兜底
+  };
+  sock.onerror = function () { try { sock.close(); } catch (e) {} };
+}
+
+function refresh() {
+  if (window.WebSocket) connectWS(); else load();
+}
+
 function setExp(day) {
   curExp = day || "";
   $("exp").value = curExp;
-  load();
+  refresh();
 }
 
 function setSide(side) {
   curSide = side || "";
-  load();
+  refresh();
 }
 
 function setSettle(settle) {
   curSettle = settle || "";
-  load();
+  refresh();
 }
 
 document.querySelectorAll(".cur").forEach(function (b) {
-  b.addEventListener("click", function () { curUly = b.dataset.uly; load(); });
+  b.addEventListener("click", function () { curUly = b.dataset.uly; refresh(); });
 });
 document.querySelectorAll(".tab").forEach(function (b) {
   b.addEventListener("click", function () { setTab(b.dataset.tab); });
@@ -705,8 +766,10 @@ $("orderModal").addEventListener("click", function (e) { if (e.target === $("ord
 document.addEventListener("keydown", function (e) {
   if (e.key === "Escape" && !$("orderModal").classList.contains("hidden")) closeOrder();
 });
-setInterval(load, 20000);
+// 首次 REST 渲染后开启 WS；WS 不可用时每 15s 轮询兜底。
 load();
+connectWS();
+setInterval(function () { if (!ws) load(); }, 15000);
 </script>
 </body>
 </html>`
@@ -738,35 +801,9 @@ func New(fetcher SnapshotFetcher, uly string, addr string, opts ...ServerOption)
 		if snapUly == "" {
 			snapUly = uly
 		}
-		var day time.Time
-		if expStr := q.Get("exp"); expStr != "" {
-			t, err := strategy.ParseExpiry(expStr)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-				return
-			}
-			day = t
-		}
-		var side rune
-		switch s := strings.ToUpper(strings.TrimSpace(q.Get("side"))); s {
-		case "":
-		case "C":
-			side = 'C'
-		case "P":
-			side = 'P'
-		default:
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "side 只能是 C（CALL）或 P（PUT）"})
-			return
-		}
-		var settle rune
-		switch s := strings.ToUpper(strings.TrimSpace(q.Get("settle"))); s {
-		case "", "ALL":
-		case "B", "COIN":
-			settle = 'B'
-		case "U", "USDT":
-			settle = 'U'
-		default:
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "settle 只能是 B（币本位）或 U（U本位）"})
+		day, side, settle, err := parseFilters(q)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
 		snap, err := c.snapshot(snapUly)
@@ -774,17 +811,66 @@ func New(fetcher SnapshotFetcher, uly string, addr string, opts ...ServerOption)
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 			return
 		}
-		resp := decisionsResponse{
-			Snapshot:     market.FilterSnapshot(snap, market.Filter{Day: day, Side: side, Settle: settle}),
-			Mode:         "read-only",
-			TradeEnabled: cfg.trader != nil,
+		writeJSON(w, http.StatusOK, makeResponse(snap, day, side, settle, cfg))
+	})
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		snapUly := q.Get("uly")
+		if snapUly == "" {
+			snapUly = uly
 		}
-		if cfg.trader != nil {
-			resp.Mode = string(cfg.trader.Mode())
-			g := cfg.trader.State()
-			resp.Guard = &g
+		day, side, settle, err := parseFilters(q)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
-		writeJSON(w, http.StatusOK, resp)
+		up := websocket.Upgrader{
+			CheckOrigin: func(*http.Request) bool { return true }, // 本机看板，无跨站下单能力
+		}
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.SetReadLimit(1024)
+
+		// 读泵只用于感知客户端关闭 / 处理控制帧；页面不会发送业务消息。
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}()
+
+		send := func() bool {
+			snap, err := c.snapshot(snapUly)
+			if err != nil {
+				_ = conn.WriteJSON(map[string]any{"error": err.Error()})
+				return true
+			}
+			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			return conn.WriteJSON(makeResponse(snap, day, side, settle, cfg)) == nil
+		}
+		if !send() {
+			return
+		}
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-done:
+				return
+			case <-t.C:
+				if !send() {
+					return
+				}
+			}
+		}
 	})
 	mux.HandleFunc("/api/order/option", func(w http.ResponseWriter, r *http.Request) {
 		if cfg.trader == nil {
@@ -893,6 +979,54 @@ func New(fetcher SnapshotFetcher, uly string, addr string, opts ...ServerOption)
 		writeJSON(w, http.StatusOK, orderResponseFrom(out))
 	})
 	return &http.Server{Addr: addr, Handler: mux}
+}
+
+// parseFilters 解析 Web 页面/WS 共用的筛选参数。
+func parseFilters(q url.Values) (time.Time, rune, rune, error) {
+	var day time.Time
+	if expStr := q.Get("exp"); expStr != "" {
+		t, err := strategy.ParseExpiry(expStr)
+		if err != nil {
+			return day, 0, 0, err
+		}
+		day = t
+	}
+	var side rune
+	switch s := strings.ToUpper(strings.TrimSpace(q.Get("side"))); s {
+	case "":
+	case "C":
+		side = 'C'
+	case "P":
+		side = 'P'
+	default:
+		return day, 0, 0, fmt.Errorf("side 只能是 C（CALL）或 P（PUT）")
+	}
+	var settle rune
+	switch s := strings.ToUpper(strings.TrimSpace(q.Get("settle"))); s {
+	case "", "ALL":
+	case "B", "COIN":
+		settle = 'B'
+	case "U", "USDT":
+		settle = 'U'
+	default:
+		return day, 0, 0, fmt.Errorf("settle 只能是 B（币本位）或 U（U本位）")
+	}
+	return day, side, settle, nil
+}
+
+// makeResponse 在快照上应用筛选并补充执行器状态（REST / WS 共用）。
+func makeResponse(snap *market.Snapshot, day time.Time, side, settle rune, cfg serverConfig) decisionsResponse {
+	resp := decisionsResponse{
+		Snapshot:     market.FilterSnapshot(snap, market.Filter{Day: day, Side: side, Settle: settle}),
+		Mode:         "read-only",
+		TradeEnabled: cfg.trader != nil,
+	}
+	if cfg.trader != nil {
+		resp.Mode = string(cfg.trader.Mode())
+		g := cfg.trader.State()
+		resp.Guard = &g
+	}
+	return resp
 }
 
 // requireJSON 只接受 POST + application/json：既统一契约，也避免跨站简单表单

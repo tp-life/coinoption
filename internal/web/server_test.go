@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/tp/coinoption/internal/executor"
 	"github.com/tp/coinoption/internal/market"
 	"github.com/tp/coinoption/internal/okx"
@@ -531,5 +532,38 @@ func TestAPIDecisionsExposesTradeState(t *testing.T) {
 	}
 	if j.Mode != "live" || !j.TradeEnabled || j.Guard == nil || j.Guard.Limits.PerOrderUSDT != 2000 {
 		t.Fatalf("交易状态不符: %+v", j)
+	}
+}
+
+func TestWebSocketPushesFilteredSnapshot(t *testing.T) {
+	ts := newTestServer(t, &fakeFetcher{snap: testSnap()})
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ws?uly=BTC-USDT&side=C"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial %s: %v", wsURL, err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, raw, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var j struct {
+		SpotPrice float64 `json:"spotPrice"`
+		Decisions []struct {
+			Row struct {
+				OptType int `json:"optType"`
+			} `json:"row"`
+		} `json:"decisions"`
+		WSStatus string `json:"wsStatus"`
+	}
+	if err := json.Unmarshal(raw, &j); err != nil {
+		t.Fatalf("decode: %v (%s)", err, raw)
+	}
+	if j.SpotPrice != 80000 {
+		t.Fatalf("spotPrice = %v, want 80000", j.SpotPrice)
+	}
+	if len(j.Decisions) != 1 || j.Decisions[0].Row.OptType != 'C' {
+		t.Fatalf("side=C 过滤不正确: %+v", j.Decisions)
 	}
 }
