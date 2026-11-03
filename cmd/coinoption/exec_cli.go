@@ -59,6 +59,9 @@ func (c cliExec) boot() (executor.Mode, *executor.Executor, error) {
 			TotalExposureUSDT: vals[0], PerOrderUSDT: vals[1],
 			MaxConcurrent: int(vals[2]), MaxSessionsPerDay: int(vals[3]),
 		}
+	} else if stg, err := st.LoadSettings(); err == nil {
+		// 资金总额（Web 设置页维护）派生总敞口/单笔上限；--limits 显式覆盖时优先。
+		lim = lim.WithCapital(stg.CapitalUSDT)
 	}
 	g := executor.NewGuard(lim)
 	if simRows, err2 := st.LoadSim(); err2 == nil {

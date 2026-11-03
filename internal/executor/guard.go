@@ -2,9 +2,15 @@ package executor
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"time"
 )
+
+// PerOrderCapitalFraction 单笔上限占资金总额的比例。
+// 取 40%：默认资金 5000 → 单笔 2000，与旧默认值完全一致；
+// 同时给并行在持留出余量（5 笔上限下不会一笔打满全部资金）。
+const PerOrderCapitalFraction = 0.4
 
 // Limits 风控三重上限 + 总敞口（plan §2.4 定稿默认值）。
 // Executor 层强校验：UI/配置异常也拦得住。
@@ -27,6 +33,22 @@ func DefaultLimits() Limits {
 		MaxConcurrent:     5,
 		MaxSessionsPerDay: 10,
 	}
+}
+
+// WithCapital 用「资金总额」派生风控上限：总敞口 = 资金总额，
+// 单笔 = 资金总额 × PerOrderCapitalFraction（保留并发/日限）。
+// capital ≤ 0 时原样返回（调用方已按默认值兜底）。
+func (l Limits) WithCapital(capitalUSDT float64) Limits {
+	if capitalUSDT <= 0 {
+		return l
+	}
+	l.TotalExposureUSDT = capitalUSDT
+	per := math.Round(capitalUSDT*PerOrderCapitalFraction*100) / 100
+	if per <= 0 {
+		per = capitalUSDT
+	}
+	l.PerOrderUSDT = per
+	return l
 }
 
 // LimitError 风控拒绝（区别于 API 错误，TUI/CLI 侧按原因码提示）。
@@ -68,6 +90,15 @@ func NewGuard(lim Limits) *Guard {
 
 // SetNowForTest 仅测试注入时钟。
 func (g *Guard) SetNowForTest(f func() time.Time) { g.now = f }
+
+// SetLimits 运行期替换风控上限（Web 设置页调整资金总额后立即生效）。
+// 只改上限，不动已占用的敞口/笔数：若新上限低于当前敞口，后续新单会被拒绝，
+// 在持订单仍按原额度持有，避免改动设置导致风控状态与真实仓位脱节。
+func (g *Guard) SetLimits(lim Limits) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.lim = lim
+}
 
 // rollDay UTC 自然日翻转清零当日计数。
 func (g *Guard) rollDay(d string) {

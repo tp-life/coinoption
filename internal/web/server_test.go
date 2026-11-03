@@ -99,32 +99,25 @@ func TestIndexPageContainsControls(t *testing.T) {
 	}
 	html := string(body)
 	for _, want := range []string{
-		`data-uly="BTC-USDT"`,
-		`data-uly="ETH-USDT"`,
-		`data-uly="SOL-USDT"`,
-		`id="exp"`,
-		`id="expClear"`,
-		"到期(UTC)",
-		"CALL 看涨",
-		"PUT 看跌",
-		"卖出期权，收权利金",
-		"仅卖期权",
-		"卖出期权",
-		"<th>方向</th>",
-		"<th>操作</th>",
-		// 主视图与参考视图分开：对比决策页只放 DCY 产品行，完整期权链
-		// 放第二个标签页，避免两类行在同一张表里混排。
-		`data-tab="decisions"`,
-		`data-tab="chain"`,
-		`id="decRows"`,
-		`id="optRows"`,
-		`id="decWrap"`,
-		`id="chainWrap"`,
-		"对应期权",
-		"对应 DCY",
-		`data-side=""`,
-		`data-side="C"`,
-		`data-side="P"`,
+		// 三栏 brutalist 布局：侧栏 / 列表 / 详情 + 动作栏
+		`class="sidebar"`, `class="nav-item is-active"`, `class="queue"`, `class="detail"`,
+		`id="queue"`, `id="doc"`, `id="rail"`, `id="log"`, `id="chainCols"`,
+		`data-tab="decisions"`, `data-tab="chain"`, `id="navDecN"`, `id="navChainN"`,
+		// 设计 token（硬边、偏移阴影、薄荷绿画布）
+		"--mint:#CFE8D6", "--ink:#121210", "--green:#2E8C42", "--amber:#E8A030", "--red:#C03A3A",
+		"--shadow:4px 4px 0 var(--ink)", "Archivo",
+		// 控制条
+		`data-uly="BTC-USDT"`, `data-uly="ETH-USDT"`, `data-uly="SOL-USDT"`,
+		`data-side=""`, `data-side="C"`, `data-side="P"`,
+		`data-settle=""`, `data-settle="B"`, `data-settle="U"`,
+		`data-sort=""`, `data-sort="price"`, `data-sort="apr"`, `data-sort="diff"`, `id="sortDir"`,
+		`id="exp"`, `id="expClear"`, `id="days"`, `id="search"`, `id="refreshBtn"`,
+		// 语义图例（安全提示不能丢）
+		"仅卖期权", "CALL 看涨", "PUT 看跌",
+		// 标的 / 方向 / 排序的本地记忆
+		"coinoption.prefs.v1", "window.localStorage",
+		// 详情区指标
+		"DECIDE", "POLICY CHECK", "对照链", "期权合约",
 	} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("首页缺少 %q", want)
@@ -352,12 +345,27 @@ type fakeTrader struct {
 	lastSz   float64
 	lastProd string
 	lastAmt  float64
+	minAPR   float64
 	fail     error
+	limits   executor.Limits
 }
 
 func (f *fakeTrader) Mode() executor.Mode { return f.mode }
+func (f *fakeTrader) Positions() (executor.PositionsView, error) {
+	return executor.PositionsView{Mode: f.mode}, nil
+}
+func (f *fakeTrader) currentLimits() executor.Limits {
+	if f.limits.TotalExposureUSDT > 0 {
+		return f.limits
+	}
+	return executor.DefaultLimits()
+}
 func (f *fakeTrader) State() executor.GuardState {
-	return executor.GuardState{OpenCount: 1, Limits: executor.DefaultLimits()}
+	l := f.currentLimits()
+	return executor.GuardState{OpenCount: 1, Limits: l, RemainingUSDT: l.TotalExposureUSDT, DayRemaining: l.MaxSessionsPerDay}
+}
+func (f *fakeTrader) SetCapital(capitalUSDT float64) {
+	f.limits = f.currentLimits().WithCapital(capitalUSDT)
 }
 func (f *fakeTrader) SubmitOption(instID string, sz, limPx float64) (executor.Outcome, error) {
 	f.optCalls++
@@ -372,6 +380,11 @@ func (f *fakeTrader) SubmitOption(instID string, sz, limPx float64) (executor.Ou
 		Detail: "卖出 " + instID,
 	}, nil
 }
+func (f *fakeTrader) SubmitOptionChecked(instID string, sz, limPx, minAPR float64) (executor.Outcome, error) {
+	f.minAPR = minAPR
+	return f.SubmitOption(instID, sz, limPx)
+}
+
 func (f *fakeTrader) SubmitDCD(p okx.DCDProduct, amt float64) (executor.Outcome, error) {
 	f.dcdCalls++
 	f.lastProd = p.ProductID
@@ -388,7 +401,12 @@ func (f *fakeTrader) SubmitDCD(p okx.DCDProduct, amt float64) (executor.Outcome,
 
 func newTradeServer(t *testing.T, f SnapshotFetcher, tr Trader) *httptest.Server {
 	t.Helper()
-	ts := httptest.NewServer(New(f, "BTC-USDT", "", WithTrader(tr)).Handler)
+	return newTradeServerOpts(t, f, WithTrader(tr))
+}
+
+func newTradeServerOpts(t *testing.T, f SnapshotFetcher, opts ...ServerOption) *httptest.Server {
+	t.Helper()
+	ts := httptest.NewServer(New(f, "BTC-USDT", "", opts...).Handler)
 	t.Cleanup(ts.Close)
 	return ts
 }
@@ -410,7 +428,7 @@ func postJSON(t *testing.T, url, body string) (int, []byte) {
 func TestIndexPageHasOrderUI(t *testing.T) {
 	ts := newTestServer(t, &fakeFetcher{snap: testSnap()})
 	_, body := get(t, ts.URL+"/")
-	for _, want := range []string{`id="orderModal"`, `id="tradeBar"`, "<th>下单</th>", "确认下单"} {
+	for _, want := range []string{`id="orderModal"`, `id="tradeBar"`, `id="rail"`, `id="doc"`, "确认下单", "openOrder"} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("首页缺少下单 UI %q", want)
 		}
@@ -521,6 +539,7 @@ func TestAPIDecisionsExposesTradeState(t *testing.T) {
 	var j struct {
 		Mode         string `json:"mode"`
 		TradeEnabled bool   `json:"tradeEnabled"`
+		ManualTrade  bool   `json:"manualTrade"`
 		Guard        *struct {
 			Limits struct {
 				PerOrderUSDT float64 `json:"perOrderUsdt"`
@@ -530,7 +549,7 @@ func TestAPIDecisionsExposesTradeState(t *testing.T) {
 	if err := json.Unmarshal(body, &j); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if j.Mode != "live" || !j.TradeEnabled || j.Guard == nil || j.Guard.Limits.PerOrderUSDT != 2000 {
+	if j.Mode != "live" || !j.TradeEnabled || !j.ManualTrade || j.Guard == nil || j.Guard.Limits.PerOrderUSDT != 2000 {
 		t.Fatalf("交易状态不符: %+v", j)
 	}
 }
@@ -565,5 +584,72 @@ func TestWebSocketPushesFilteredSnapshot(t *testing.T) {
 	}
 	if len(j.Decisions) != 1 || j.Decisions[0].Row.OptType != 'C' {
 		t.Fatalf("side=C 过滤不正确: %+v", j.Decisions)
+	}
+}
+
+// 手动卖出：交易启用后，期权链里「有买盘」的合约即使不在建议里也允许卖出，
+// 但不在链上/无买盘的合约仍然拒绝。
+func TestAPIOrderOptionManualMode(t *testing.T) {
+	snap := testSnap()
+	snap.OptionRows[0].BidPx = "0.02" // BTC-USD-261106-79000-C：链上有买盘、无 buy_option 建议
+	snap.OptionRows[0].APRValid = true
+	body := `{"uly":"BTC-USDT","instId":"BTC-USD-261106-79000-C","sz":1}`
+
+	tr := &fakeTrader{mode: executor.ModeSimLocal}
+	ts := newTradeServer(t, &fakeFetcher{snap: snap}, tr)
+	code, resp := postJSON(t, ts.URL+"/api/order/option", body)
+	if code != http.StatusOK {
+		t.Fatalf("应允许有买盘的链上合约，实际 %d: %s", code, resp)
+	}
+	if tr.optCalls != 1 {
+		t.Fatalf("应调用 executor 1 次，实际 %d", tr.optCalls)
+	}
+}
+
+func TestAPIOrderOptionManualRequiresBid(t *testing.T) {
+	tr := &fakeTrader{mode: executor.ModeSimLocal}
+	ts := newTradeServer(t, &fakeFetcher{snap: testSnap()}, tr)
+	// testSnap 的 77000-P 没有买盘，manual 也不放行。
+	code, resp := postJSON(t, ts.URL+"/api/order/option",
+		`{"uly":"BTC-USDT","instId":"BTC-USD-261113-77000-P","sz":1}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("无买盘的合约应 400，实际 %d: %s", code, resp)
+	}
+	if tr.optCalls != 0 {
+		t.Fatalf("不应调用 executor，实际 %d 次", tr.optCalls)
+	}
+}
+
+// 自动交易状态：未装配自动引擎时 AutoAvailable=false。
+func TestAPIDecisionsExposesAutoState(t *testing.T) {
+	tr := &fakeTrader{mode: executor.ModeSimLocal}
+	ts := newTradeServer(t, &fakeFetcher{snap: testSnap()}, tr)
+	_, body := get(t, ts.URL+"/api/decisions")
+	var j struct {
+		AutoAvailable bool `json:"autoAvailable"`
+		AutoTrade     bool `json:"autoTrade"`
+	}
+	if err := json.Unmarshal(body, &j); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if j.AutoAvailable || j.AutoTrade {
+		t.Fatalf("未装配自动引擎时不应声称可用: %+v", j)
+	}
+}
+
+// 不可对齐（没有精确期权）的 DCY 产品仍允许手动申购；自动执行不受影响。
+func TestAPIOrderDCDManualUnaligned(t *testing.T) {
+	snap := testSnap()
+	snap.Decisions[1].Action = strategy.ActionUnaligned
+	snap.Decisions[1].ReasonCode = "no_exact_contract"
+	tr := &fakeTrader{mode: executor.ModeSimLocal}
+	ts := newTradeServer(t, &fakeFetcher{snap: snap}, tr)
+	code, body := postJSON(t, ts.URL+"/api/order/dcd",
+		`{"uly":"BTC-USDT","productId":"BTC-USDT-261113-78000-P","amt":100}`)
+	if code != http.StatusOK {
+		t.Fatalf("不可对齐产品应允许手动申购，实际 %d: %s", code, body)
+	}
+	if tr.dcdCalls != 1 || tr.lastProd != "BTC-USDT-261113-78000-P" {
+		t.Fatalf("应调用 DCD 下单: calls=%d prod=%s", tr.dcdCalls, tr.lastProd)
 	}
 }

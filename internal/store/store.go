@@ -7,6 +7,7 @@ package store
 
 import (
 	"bufio"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -172,6 +173,92 @@ func (s *Store) LoadAudit() ([]AuditEvent, error) {
 	return readAll[AuditEvent](s.path("audit_log.jsonl"))
 }
 
+// AutoFailure 一条「自动执行失败」记录。
+//
+// 自动策略失败后没有回执可查，只能靠这组记录回答「刚才为什么没自动下单」。
+// 环形保留最近 AutoFailureLimit 条（旧 → 新），落盘 auto_failures.jsonl，
+// 重启后仍可查看；Web / TUI 共用同一份文件。
+type AutoFailure struct {
+	Ts     time.Time `json:"ts"`
+	Kind   string    `json:"kind"`             // "option" | "dcd" | "market"
+	Ref    string    `json:"ref,omitempty"`    // instId / productId / 标的 uly
+	Reason string    `json:"reason"`           // 失败原因（人读）
+	Detail string    `json:"detail,omitempty"` // 当时准备提交的候选摘要
+	Count  int       `json:"count"`            // 连续相同失败被合并的次数（≥1）
+}
+
+// AutoFailureLimit 失败记录保留条数（用户要求的「最近 10 条」）。
+const AutoFailureLimit = 10
+
+// autoFailureMergeWindow 连续相同失败在该窗口内合并为一条并累加 Count，
+// 避免同一原因反复重试把 10 条额度刷满、丢掉更早的不同失败。
+const autoFailureMergeWindow = 10 * time.Minute
+
+// PushAutoFailure 把一条失败记录并入按时间升序排列的表，返回新表：
+//   - 与最后一条 kind/ref/reason 完全相同且间隔 < 10min → 合并（更新 ts、Count++）；
+//   - 否则追加，并只保留最后 AutoFailureLimit 条（最旧的被淘汰）。
+func PushAutoFailure(rows []AutoFailure, f AutoFailure, now time.Time) []AutoFailure {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if f.Ts.IsZero() {
+		f.Ts = now
+	}
+	if f.Count <= 0 {
+		f.Count = 1
+	}
+	if n := len(rows); n > 0 {
+		last := &rows[n-1]
+		if last.Kind == f.Kind && last.Ref == f.Ref && last.Reason == f.Reason &&
+			f.Ts.Sub(last.Ts) < autoFailureMergeWindow {
+			last.Ts = f.Ts
+			if f.Detail != "" {
+				last.Detail = f.Detail
+			}
+			last.Count += f.Count
+			return rows
+		}
+	}
+	rows = append(rows, f)
+	if extra := len(rows) - AutoFailureLimit; extra > 0 {
+		rows = append([]AutoFailure(nil), rows[extra:]...)
+	}
+	return rows
+}
+
+// RecordAutoFailure 追加一条自动失败记录（合并 / 截断后整表重写）。
+func (s *Store) RecordAutoFailure(f AutoFailure) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := s.path("auto_failures.jsonl")
+	// 文件损坏时按空表重建：失败记录是诊断辅助，不能反过来拖垮自动执行。
+	rows, _ := readAll[AutoFailure](path)
+	rows = PushAutoFailure(rows, f, time.Now().UTC())
+	return rewriteAll(path, rows, AutoFailure{})
+}
+
+// SaveAutoFailures 覆盖写整张失败表（Web 端在内存里维护环形表，再整体落盘）。
+func (s *Store) SaveAutoFailures(rows []AutoFailure) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(rows) > AutoFailureLimit {
+		rows = rows[len(rows)-AutoFailureLimit:]
+	}
+	return rewriteAll(s.path("auto_failures.jsonl"), rows, AutoFailure{})
+}
+
+// LoadAutoFailures 读取失败表（旧 → 新，最多 AutoFailureLimit 条）。
+func (s *Store) LoadAutoFailures() ([]AutoFailure, error) {
+	rows, err := readAll[AutoFailure](s.path("auto_failures.jsonl"))
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) > AutoFailureLimit {
+		rows = rows[len(rows)-AutoFailureLimit:]
+	}
+	return rows, nil
+}
+
 // UpdateSim 用 ID 原地更新一笔纸面订单（读出改写全文件——记录量小足够）。
 func (s *Store) UpdateSim(id string, upd func(o *SimOrder)) error {
 	s.mu.Lock()
@@ -236,23 +323,43 @@ func normalizeState(st string) string { return st }
 //
 // AutoTrade 是「自动执行」总开关：默认关闭；live 模式启动时会被强制关闭，
 // 必须在当次会话的 Settings 页重新确认开启（防止重启后无声自动下单）。
+//
+// 资金总额（CapitalUSDT）与自动交易差%门槛（MinDiffPct）由 Web 设置页修改，
+// TUI 与 Web 共用同一份 settings.json；Web 授权码只保存哈希（WebAuthCodeHash）。
 type Settings struct {
 	MinOptionEdgePP float64 `json:"minOptionEdgePp"` // 期权须高出 DCY 的百分点（20 = 20pp）
+	MinAbsEdgePct   float64 `json:"minAbsEdgePct"`   // 单笔绝对收益差下限（%，0.5 = 0.5%）
 	MaxStrikeGapPct float64 `json:"maxStrikeGapPct"` // 行权价相对现价最大偏差（%）
 	AutoTrade       bool    `json:"autoTrade"`
+	// CapitalUSDT 资金总额（USDT）：风控总敞口上限，单笔上限按 40% 派生。
+	// ≤0 → 回落默认 5000（保持旧行为：总敞口 5000 / 单笔 2000）。
+	CapitalUSDT float64 `json:"capitalUsdt"`
+	// MinDiffPct 自动交易最低差%（年化、绝对值；0 = 不设门槛）。
+	// 期权卖出要求「期权APR − DCY APR」达标；DCY 申购要求反方向差值达标，
+	// 避免自动交易在两条腿几乎无差异时来回下单。只影响自动执行，不影响推荐动作。
+	MinDiffPct float64 `json:"minDiffPct"`
+	// WebAuthCodeHash Web 授权码的 SHA-256 十六进制摘要（不落明文）。
+	// 空 = 未启用 Web 授权；遗忘时用 --web-code 重置，或删除 settings.json 重新生成。
+	WebAuthCodeHash string `json:"webAuthCodeHash,omitempty"`
 	// 界面筛选记忆（TUI 退出后重启恢复）：方向 "" | "C" | "P"；
 	// 结算本位 "" | "B"（币本位）| "U"（U本位）。
 	// 只影响展示筛选，不影响策略/下单。
 	SideFilter   string `json:"sideFilter,omitempty"`
 	SettleFilter string `json:"settleFilter,omitempty"`
+	// 表格排序记忆："price:desc" / "apr:asc" / "diff:desc" 等；
+	// "" = 默认顺序（动作分组 → 到期 → 行权价）。只影响展示，不影响策略。
+	SortBy string `json:"sortBy,omitempty"`
 }
 
 // DefaultSettings 生产默认值（与 strategy.DefaultParams 对齐）。
 func DefaultSettings() Settings {
 	return Settings{
 		MinOptionEdgePP: 20,
+		MinAbsEdgePct:   0.5,
 		MaxStrikeGapPct: 0.5,
 		AutoTrade:       false,
+		CapitalUSDT:     5000,
+		MinDiffPct:      0,
 	}
 }
 
@@ -273,8 +380,27 @@ func (s *Store) LoadSettings() (Settings, error) {
 	if out.MinOptionEdgePP <= 0 {
 		out.MinOptionEdgePP = 20
 	}
+	if out.MinAbsEdgePct <= 0 {
+		out.MinAbsEdgePct = 0.5
+	}
 	if out.MaxStrikeGapPct <= 0 {
 		out.MaxStrikeGapPct = 0.5
+	}
+	// 资金总额决定总敞口上限；非法值回落 5000，避免手改文件把风控改成 0/负数。
+	if out.CapitalUSDT <= 0 {
+		out.CapitalUSDT = 5000
+	}
+	if out.MinDiffPct < 0 {
+		out.MinDiffPct = 0
+	}
+	if out.MinDiffPct > 1000 {
+		out.MinDiffPct = 1000 // 1000pp 已是极端值，防止手滑写出天文数字
+	}
+	// 授权码哈希必须是 64 位十六进制；写坏则视为未启用（启动时会重新生成并打印）。
+	if out.WebAuthCodeHash != "" {
+		if b, err := hex.DecodeString(out.WebAuthCodeHash); err != nil || len(b) != 32 {
+			out.WebAuthCodeHash = ""
+		}
 	}
 	// 筛选记忆只认合法枚举值，手改文件写坏则回落「全部」。
 	switch out.SideFilter {
@@ -286,6 +412,12 @@ func (s *Store) LoadSettings() (Settings, error) {
 	case "B", "U":
 	default:
 		out.SettleFilter = ""
+	}
+	// 排序记忆同理：只认「键:方向」枚举，坏值回落默认顺序。
+	switch out.SortBy {
+	case "price:asc", "price:desc", "apr:asc", "apr:desc", "diff:asc", "diff:desc":
+	default:
+		out.SortBy = ""
 	}
 	return out, nil
 }

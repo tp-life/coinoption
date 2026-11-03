@@ -20,12 +20,13 @@ type Fetcher struct {
 	C     *okx.Client
 	UseWS bool
 
-	mu         sync.Mutex
-	p          strategy.Params
-	live       *Live
-	liveCancel context.CancelFunc
-	liveRetry  time.Time
-	rest       map[string]restEntry
+	mu           sync.Mutex
+	p            strategy.Params
+	live         *Live
+	liveCancel   context.CancelFunc
+	liveRetry    time.Time
+	liveStarting chan struct{} // 非 nil = WS bootstrap 在途（避免持锁做网络 I/O）
+	rest         map[string]restEntry
 
 	restMu sync.Mutex
 }
@@ -61,37 +62,51 @@ func (f *Fetcher) liveSnapshot(uly string, p strategy.Params) (*Snapshot, error)
 		f.mu.Unlock()
 		return l.Snapshot(), nil
 	}
+	// 已有 bootstrap 在途：等它结束再重新判断，避免并发建两条 WS。
+	// 关键点是**不持锁做网络 I/O**——否则 SetParams/Close 会被 WS 握手卡住，
+	// 设置页保存、退出 TUI 都会跟着挂起。
+	if wait := f.liveStarting; wait != nil {
+		f.mu.Unlock()
+		<-wait
+		return f.liveSnapshot(uly, p)
+	}
 	if f.live != nil {
 		f.live.Close()
 		f.live = nil
 	}
 	if f.liveCancel != nil {
 		f.liveCancel()
+		f.liveCancel = nil
 	}
 	// 刚失败过就先用 REST 兜底一小段时间，避免每次刷新都卡在 WS 初始化。
 	if time.Now().Before(f.liveRetry) {
 		f.mu.Unlock()
 		return f.restSnapshot(uly, p)
 	}
+	wait := make(chan struct{})
+	f.liveStarting = wait
+	f.mu.Unlock()
+
 	l := NewLive(f.C, uly, p)
 	ctx, cancel := context.WithCancel(context.Background())
-	f.live = l
-	f.liveCancel = cancel
-
-	// 持锁启动：避免并发请求（页面 + /ws 推送）在 bootstrap 期间拿到空快照。
 	err := l.Start(ctx)
+
+	f.mu.Lock()
+	f.liveStarting = nil
+	close(wait)
 	if err != nil {
-		if f.live == l {
-			f.live = nil
-		}
 		f.liveRetry = time.Now().Add(30 * time.Second)
 		f.mu.Unlock()
 		cancel()
 		return f.restSnapshot(uly, p)
 	}
-	snap := l.Snapshot()
+	f.live = l
+	f.liveCancel = cancel
 	f.mu.Unlock()
-	return snap, nil
+
+	// bootstrap 期间设置页可能改过阈值：以最新参数为准。
+	l.SetParams(f.params())
+	return l.Snapshot(), nil
 }
 
 func (f *Fetcher) restSnapshot(uly string, p strategy.Params) (*Snapshot, error) {

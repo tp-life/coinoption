@@ -57,6 +57,11 @@ func (c *Client) wsDialer() *websocket.Dialer {
 		HandshakeTimeout: 10 * time.Second,
 		ReadBufferSize:   1 << 20,
 		WriteBufferSize:  1 << 16,
+		// 未显式配置 --proxy 时跟随 HTTPS_PROXY / HTTP_PROXY / ALL_PROXY。
+		// REST 用 http.Client 的默认 Transport，本来就吃环境变量；WS 若不同步，
+		// 就会出现「行情能拉到、WS 永远重连中」的割裂（gorilla 在拨号前把
+		// wss 归一成 https，所以 ProxyFromEnvironment 能正确命中）。
+		Proxy: http.ProxyFromEnvironment,
 	}
 	if c.proxyURL != nil {
 		d.Proxy = http.ProxyURL(c.proxyURL)

@@ -44,6 +44,7 @@ type OptionRow struct {
 	APRValid      bool      `json:"aprValid"`      // 是否有有效买盘（bid>0）
 	BidPx         string    `json:"bidPx"`         // 买一价（权利金，单位见 SettleCcy/本位）
 	AskPx         string    `json:"askPx"`         // 卖一价
+	LastPx        string    `json:"lastPx"`        // 最新成交价（无买卖盘时仍可能非空，如 _UM 冷门档）
 	Days          float64   `json:"days"`          // 剩余天数
 	SettleCcy     string    `json:"settleCcy"`     // BTC | USDT
 	SpotPx        float64   `json:"spotPx"`        // 现价（与 Strike 同计价口径）
@@ -54,8 +55,9 @@ type OptionRow struct {
 // 期权机会榜（纯卖方观察，不依赖 DCY 数据）：
 // 完整保留全部到期日的卖方有效链——不按 DCY 对齐、期限窗口、TopN 或
 // 买盘有无裁剪条数；实值档（卖方方向无效）直接过滤。排序与 OKX 期权链
-// 一致：到期日升序 → 行权价升序 → 本位 → 方向。无买盘档位仍展示报价，
-// 只是算不出卖方 APR（APRValid=false）。需要收敛视图用到期/方向/本位筛选。
+// 一致：到期日升序 → 行权价升序 → 本位 → 方向。无买盘档位仍展示报价
+// （bid/ask/last 任一非空即保留），只是算不出卖方 APR（APRValid=false）。
+// 需要收敛视图用到期/方向/本位筛选。
 func RankOptions(instruments []okx.Instrument, tickers []okx.OptionTicker,
 	spot map[string]float64, now time.Time) []OptionRow {
 	opts := buildOptQuotes(instruments, tickers, false)
@@ -65,9 +67,13 @@ func RankOptions(instruments []okx.Instrument, tickers []okx.OptionTicker,
 		if days <= 0 {
 			continue
 		}
-		// 完全没有任何报价的幽灵合约（bid/ask/mark 全空）没有展示意义。
+		// 完全没有任何报价的幽灵合约（bid/ask/mark/last 全空）没有展示意义。
+		// 注意：/market/tickers 对期权从不返回 markPx（实测 2026-11：1246 张
+		// 全为空），所以必须把 last 也算进来——否则「无买卖盘但今天成交过」
+		// 的档位（典型如 _UM 冷门行权价）会整行消失，用户在 OKX APP 里却看
+		// 得到，表现为「明明有价格却不展示」。
 		if strings.TrimSpace(q.BidPx) == "" && strings.TrimSpace(q.AskPx) == "" &&
-			strings.TrimSpace(q.MarkPx) == "" {
+			strings.TrimSpace(q.MarkPx) == "" && strings.TrimSpace(q.LastPx) == "" {
 			continue
 		}
 		spotPx := spot[currencyOf(q.Uly)]
@@ -84,6 +90,7 @@ func RankOptions(instruments []okx.Instrument, tickers []okx.OptionTicker,
 			Expiry:    q.Expiry,
 			BidPx:     q.BidPx,
 			AskPx:     q.AskPx,
+			LastPx:    q.LastPx,
 			Days:      days,
 			SettleCcy: q.SettleCcy,
 			SpotPx:    spotPx,

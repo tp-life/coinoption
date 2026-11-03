@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"math"
 	"strconv"
 	"testing"
 	"time"
@@ -270,10 +271,11 @@ func TestBuildAlignsDisplayWhenNoBid(t *testing.T) {
 	}
 }
 
-// 回归：同一到期日有「更近但无买盘」与「稍远但有买盘」两档时，匹配
-// 必须选有买盘的那档，避免挑到空盘档后误判为不可卖出。
-func TestMatchPrefersQuotedStrikeOverCloserNoBid(t *testing.T) {
-	dcd := goldenDCDProduct("BTC-USDT-260327-55000-P", "P", 55000)
+// 回归：没有「同行权价 + 同到期日」的精确档时，只做展示对齐，不产生动作，
+// 避免用相邻行权价的权利金算 APR（0.5% 行权价差 7 天年化约 13pp）。
+func TestMatchWithoutExactStrikeDoesNotAct(t *testing.T) {
+	// 54600 距现价 0.37%（在 0.5% 容差内）但期权链只有 54500 / 54900 两档。
+	dcd := goldenDCDProduct("BTC-USDT-260327-54600-P", "P", 54600)
 	ins := append(goldenInstruments(), goldenInstrument("BTC-USD-260327-54900-P", "P"))
 	ticks := []okx.OptionTicker{
 		{InstID: "BTC-USD-260327-54500-P", BidPx: "0.02", AskPx: "0.03", BidSz: "10"},
@@ -285,6 +287,139 @@ func TestMatchPrefersQuotedStrikeOverCloserNoBid(t *testing.T) {
 		t.Fatalf("want 1 decision, got %d", len(ds))
 	}
 	if got := ds[0].Row.OptInstID; got != "BTC-USD-260327-54500-P" {
-		t.Fatalf("应优先匹配有买盘档位，实际 %s", got)
+		t.Fatalf("展示层应取最近档，实际 %s", got)
+	}
+	if ds[0].Row.OptBidPx != "" || ds[0].Row.OptExact {
+		t.Fatalf("非精确档不应可执行: bid=%q exact=%v", ds[0].Row.OptBidPx, ds[0].Row.OptExact)
+	}
+	if ds[0].Action != ActionUnaligned || ds[0].ReasonCode != "no_exact_contract" {
+		t.Fatalf("want unaligned/no_exact_contract, got %s/%s", ds[0].Action, ds[0].ReasonCode)
+	}
+}
+
+// 回归（2026-11 用户反馈）：BTC-USD_UM-261113-70000-P 这类合约在 OKX APP 里
+// 可见（有最新成交价），但 /market/tickers 的 bidPx/askPx 为空、且根本不返回
+// markPx。旧判据「bid/ask/mark 全空即幽灵合约」会把它整行丢弃，表现为
+// 「明明有价格却没展示」。现在 last 也算有效报价。
+func TestRankOptionsKeepsLastOnlyRow(t *testing.T) {
+	ins := []okx.Instrument{goldenInstrument("BTC-USD_UM-260327-50000-P", "P")}
+	ins[0].SettleCcy = "USD" // _UM 链为 U 本位
+	ticks := []okx.OptionTicker{
+		{InstID: "BTC-USD_UM-260327-50000-P", BidPx: "", AskPx: "", Last: "260"},
+	}
+	rows := RankOptions(ins, ticks, map[string]float64{"BTC": goldenSpot}, goldenNow)
+	if len(rows) != 1 {
+		t.Fatalf("只有最新成交价的档位不应被丢弃，实际 %d", len(rows))
+	}
+	r := rows[0]
+	if r.LastPx != "260" {
+		t.Fatalf("lastPx 应保留，实际 %q", r.LastPx)
+	}
+	if r.APRValid || r.OptAPR != 0 {
+		t.Fatalf("无买盘仍不应算出卖方 APR: valid=%v apr=%v", r.APRValid, r.OptAPR)
+	}
+	if r.BidPx != "" || r.AskPx != "" {
+		t.Fatalf("盘口应保持为空: bid=%q ask=%q", r.BidPx, r.AskPx)
+	}
+
+	// 连 last 都没有的幽灵合约仍要丢掉，避免整条链塞满空行。
+	empty := []okx.OptionTicker{{InstID: "BTC-USD_UM-260327-50000-P"}}
+	if got := RankOptions(ins, empty, map[string]float64{"BTC": goldenSpot}, goldenNow); len(got) != 0 {
+		t.Fatalf("bid/ask/mark/last 全空应丢弃，实际 %d 行", len(got))
+	}
+}
+
+// 回归（2026-11 用户反馈）：OKX 同一行权价/到期日在 BTC-USD（币本位）与
+// BTC-USD_UM（U 本位）两条链上都有合约。旧实现按 tickers 遍历顺序取先到者，
+// 而 tickers 来自 map、每次重建顺序随机 → 同一 DCY 行的「对应期权/买价/本位」
+// 在两条链之间反复横跳（285 ↔ 0.0038），看起来就是「价格一会有一会没有」。
+func TestMatchTieBreakIsDeterministic(t *testing.T) {
+	spot := map[string]float64{"BTC": goldenSpot}
+
+	// 低买（投入 USDT）→ 两条链同价同到期时优先 U 本位。
+	insP := []okx.Instrument{
+		goldenInstrument("BTC-USD-260327-54500-P", "P"),
+		goldenInstrument("BTC-USD_UM-260327-54500-P", "P"),
+	}
+	insP[1].SettleCcy = "USD"
+	ticksP := []okx.OptionTicker{
+		{InstID: "BTC-USD-260327-54500-P", BidPx: "0.02", AskPx: "0.03"},
+		{InstID: "BTC-USD_UM-260327-54500-P", BidPx: "250", AskPx: "260"},
+	}
+	dcdP := goldenDCDProduct("BTC-USDT-260327-54500-P", "P", 54500)
+	for name, order := range map[string][]okx.OptionTicker{
+		"正序": ticksP,
+		"反序": {ticksP[1], ticksP[0]},
+	} {
+		ds := Build([]okx.DCDProduct{dcdP}, insP, order, spot, goldenNow, DefaultParams())
+		if len(ds) != 1 {
+			t.Fatalf("%s: want 1 decision, got %d", name, len(ds))
+		}
+		if got := ds[0].Row.OptInstID; got != "BTC-USD_UM-260327-54500-P" {
+			t.Fatalf("%s: 低买应稳定匹配 U 本位同价档，实际 %s", name, got)
+		}
+	}
+
+	// 高卖（投入 BTC）→ 优先币本位。
+	insC := []okx.Instrument{
+		goldenInstrument("BTC-USD-260327-77000-C", "C"),
+		goldenInstrument("BTC-USD_UM-260327-77000-C", "C"),
+	}
+	insC[1].SettleCcy = "USD"
+	ticksC := []okx.OptionTicker{
+		{InstID: "BTC-USD-260327-77000-C", BidPx: "0.012", AskPx: "0.015"},
+		{InstID: "BTC-USD_UM-260327-77000-C", BidPx: "900", AskPx: "950"},
+	}
+	dcdC := goldenDCDProduct("BTC-USDT-260327-77000-C", "C", 77000)
+	for name, order := range map[string][]okx.OptionTicker{
+		"正序": ticksC,
+		"反序": {ticksC[1], ticksC[0]},
+	} {
+		ds := Build([]okx.DCDProduct{dcdC}, insC, order, spot, goldenNow, DefaultParams())
+		if len(ds) != 1 {
+			t.Fatalf("%s: want 1 decision, got %d", name, len(ds))
+		}
+		if got := ds[0].Row.OptInstID; got != "BTC-USD-260327-77000-C" {
+			t.Fatalf("%s: 高卖应稳定匹配币本位同价档，实际 %s", name, got)
+		}
+	}
+}
+
+// 合约乘数：1 张 = ctVal × ctMult（BTC 0.01），APR 与乘数无关；同时标记
+// 期权结算本位与投资币种不一致（USDT 申购 vs 币本位期权）。
+func TestMatchContractValueAndSettleMismatch(t *testing.T) {
+	insB := goldenInstrument("BTC-USD-260327-54500-P", "P")
+	insB.CtMult = "0.01"
+	insU := goldenInstrument("BTC-USD_UM-260327-54500-P", "P")
+	insU.Uly, insU.InstFamily = "BTC-USD_UM", "BTC-USD_UM"
+	insU.SettleCcy = "USDT"
+	insU.CtMult = "0.01"
+	ticks := []okx.OptionTicker{
+		{InstID: "BTC-USD-260327-54500-P", BidPx: "0.02"},
+		{InstID: "BTC-USD_UM-260327-54500-P", BidPx: "300"},
+	}
+	dcd := goldenDCDProduct("BTC-USDT-260327-54500-P", "P", 54500) // 投资 USDT
+	rows := Match([]okx.DCDProduct{dcd}, []okx.Instrument{insB, insU}, ticks,
+		map[string]float64{"BTC": goldenSpot}, goldenNow)
+	if len(rows) != 1 {
+		t.Fatalf("rows=%d", len(rows))
+	}
+	r := rows[0]
+	if !r.OptExact {
+		t.Fatalf("同价同到期应精确对齐: %+v", r)
+	}
+	if math.Abs(r.OptCtVal-0.01) > 1e-12 {
+		t.Fatalf("OptCtVal = %v，期望 0.01", r.OptCtVal)
+	}
+	// 同价同到期时优先与投资币种同本位（U 本位），因此不应标记抵押品不一致。
+	if r.OptInstID != "BTC-USD_UM-260327-54500-P" || r.SettleMismatch {
+		t.Fatalf("应优先 U 本位: inst=%s mismatch=%v", r.OptInstID, r.SettleMismatch)
+	}
+
+	// 只有币本位合约时：仍可比较 APR，但标记抵押品不一致（自动执行跳过）。
+	rows = Match([]okx.DCDProduct{dcd}, []okx.Instrument{insB}, ticks[:1],
+		map[string]float64{"BTC": goldenSpot}, goldenNow)
+	if !rows[0].SettleMismatch {
+		t.Fatalf("USDT 投资 + 币本位期权应标记抵押品不一致: %+v", rows[0])
 	}
 }

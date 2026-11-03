@@ -20,19 +20,28 @@ type Params struct {
 	// MinOptionEdge 期权 APR 须高出 DCY 的最小年化差值（小数，0.20=20pp）。
 	// diff ≥ MinOptionEdge → 押注期权；否则投注双币赢。
 	MinOptionEdge float64
+	// MinAbsEdge 单笔绝对收益差下限（小数，0.005 = 0.5%）。年化阈值在短期限
+	// 会放大噪声：20pp @7 天只有 0.38% 的实际收益差，一笔手续费/滑点就能吃掉。
+	// 因此再加一道不随期限缩水的绝对门槛。
+	MinAbsEdge float64
 	// MaxStrikeGapPct 行权价最大偏差百分比（相对现价），超过判定不可对齐。
 	MaxStrikeGapPct float64
 	// DaysMin/DaysMax 到期期限窗口（7–30 天）。
 	DaysMin, DaysMax float64
 	// CapitalCap 单笔建议金额上限（USDT）。
 	CapitalCap float64
+	// AutoMinDiff 自动执行要求的最低年化差（绝对值，小数；0 = 不设门槛）。
+	// 只作用于自动执行，不影响 Decide 的推荐动作：期权卖出要求 Diff 达标，
+	// DCY 申购要求反向差值达标，避免两条腿几乎无差异时仍自动下单。
+	AutoMinDiff float64
 }
 
 // DefaultParams 生产默认值。
 func DefaultParams() Params {
 	return Params{
 		MinOptionEdge:   0.20,
-		MaxStrikeGapPct: 0.5, // 行权价偏差 ≤ 现价的0.5%
+		MinAbsEdge:      0.005, // 单笔至少 0.5% 的实际收益差
+		MaxStrikeGapPct: 0.5,   // 行权价偏差 ≤ 现价的0.5%
 		DaysMin:         7,
 		DaysMax:         30,
 		CapitalCap:      5000,
@@ -74,6 +83,18 @@ type MatchRow struct {
 	OptBidPx     string  `json:"optBidPx"` // 原始串并保留；空 = 无买盘
 	OptSettleCcy string  `json:"optSettleCcy"`
 	StrikeErrPct float64 `json:"strikeErrPct"` // 相对现价的行权价偏差
+
+	// OptExact 是否存在「同行权价 + 同到期日（UTC）」的可执行合约。
+	// 只有精确对齐才允许给出买卖动作：用最近档（±0.5%）比 APR 会凭空造出
+	// 十几 pp 的年化差（0.5% 行权价差 × Delta≈0.5，7 天年化 ≈13pp）。
+	OptExact bool `json:"optExact"`
+	// SettleMismatch 期权结算本位与投资币种不一致（如 USDT 申购对上币本位
+	// 期权）：APR 可比，但抵押品/强平风险不同，自动执行需排除。
+	SettleMismatch bool `json:"settleMismatch"`
+	// OptCtVal 每张期权对应的标的数量 = instrument.ctVal × ctMult。
+	// OKX BTC 期权 1 张 = 0.01 BTC、ETH = 0.1 ETH；缺这个值会把敞口/权利金
+	// 放大 100 倍（BTC）或 10 倍（ETH）。
+	OptCtVal float64 `json:"optCtVal"`
 
 	Diff float64 `json:"diff"` // apr_opt − apr_dcy（年化）
 }

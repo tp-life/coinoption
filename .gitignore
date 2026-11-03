@@ -11,3 +11,6 @@ configs/config.local.toml
 # sqlite data
 *.db
 *.sqlite
+# local go build cache (sandbox-friendly)
+/.gocache/
+/.npmcache/

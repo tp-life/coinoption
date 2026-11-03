@@ -37,9 +37,12 @@ type snapMsg struct {
 	err  error
 }
 type orderResultMsg struct {
-	kind string
-	out  executor.Outcome
-	err  error
+	kind  string
+	key   string // 去重键（opt|instId / dcd|productId），与 executor 回执字段无关
+	auto  bool   // 是否自动执行单（成功后才计入计数/去重表）
+	label string // 提交摘要（自动失败记录里的「当时在做什么」）
+	out   executor.Outcome
+	err   error
 }
 type positionsMsg struct {
 	v   executor.PositionsView
@@ -54,12 +57,16 @@ type auditMsg struct {
 type Executor interface {
 	Mode() executor.Mode
 	SubmitOption(instID string, sz, limPx float64) (executor.Outcome, error)
+	SubmitOptionChecked(instID string, sz, limPx, minAPR float64) (executor.Outcome, error)
 	SubmitDCD(p okx.DCDProduct, amt float64) (executor.Outcome, error)
 	Positions() (executor.PositionsView, error)
 	Audit(n int) ([]store.AuditEvent, error)
 	LoadSettings() (store.Settings, error)
 	SaveSettings(store.Settings) error
 	State() executor.GuardState
+	// 自动失败记录（旧 → 新，最多 store.AutoFailureLimit 条；落盘跨重启保留）。
+	AutoFailures() ([]store.AutoFailure, error)
+	RecordAutoFailure(store.AutoFailure) error
 }
 
 // Fetcher TUI 依赖的数据接口。
@@ -93,6 +100,7 @@ const (
 	pickerExpiry
 	pickerSide
 	pickerSettle
+	pickerSort
 )
 
 // pickerItem 弹窗中的一行。
@@ -116,9 +124,12 @@ func (d orderDraft) key() string {
 
 type orderDraft struct {
 	kind    string // "option" | "dcd"
+	auto    bool   // 自动执行单（用于成功回执后计次/去重）
 	label   string // 摘要（确认页展示）
 	instID  string
 	sz      float64
+	ctVal   float64 // 期权每张标的数量（ctVal×ctMult；0 = 未知，按 1 张 1 币兜底）
+	minAPR  float64 // 自动单：成交前要求的最低卖方 APR（0 = 不复核）
 	product okx.DCDProduct
 	amt     float64
 }
@@ -160,6 +171,9 @@ type App struct {
 	// 结算本位过滤：0 全部 / 'B' 币本位 / 'U' U本位
 	settleFilter rune
 
+	// 表格排序：默认顺序 / 价格 / 期权APR / 差%
+	sorting sortSpec
+
 	// 弹窗选择（标的 / 到期日 / 方向）
 	picker    pickerKind
 	pickerIdx int
@@ -181,6 +195,11 @@ type App struct {
 	autoCount       int
 	autoNote        string
 	liveConfirmAuto bool // live 模式开启自动执行的二次确认层
+
+	// 自动失败记录（旧 → 新，最多 store.AutoFailureLimit 条）
+	autoFails     []store.AutoFailure
+	marketFailKey string
+	marketFailAt  time.Time
 }
 
 // New 创建 TUI 应用（executor 可为 nil → 只读推荐模式）。
@@ -204,7 +223,9 @@ func New(f Fetcher, exec Executor, uly string) App {
 	}
 	p := strategy.DefaultParams()
 	p.MinOptionEdge = st.MinOptionEdgePP / 100
+	p.MinAbsEdge = st.MinAbsEdgePct / 100
 	p.MaxStrikeGapPct = st.MaxStrikeGapPct
+	p.AutoMinDiff = st.MinDiffPct / 100
 	if exec != nil {
 		// 建议金额跟随 executor 单笔上限，避免默认值天生超限。
 		if lim := exec.State().Limits.PerOrderUSDT; lim > 0 {
@@ -225,10 +246,17 @@ func New(f Fetcher, exec Executor, uly string) App {
 		autoDone:     map[string]bool{},
 		sideFilter:   parseSidePref(st.SideFilter),
 		settleFilter: parseSettlePref(st.SettleFilter),
+		sorting:      parseSortSpec(st.SortBy),
 	}
 	if setter, ok := f.(ParamSetter); ok {
 		setter.SetParams(p)
 		a.setter = setter
+	}
+	// 失败记录跨重启保留：Settings 页随时可查最近 10 条。
+	if exec != nil {
+		if rows, err := exec.AutoFailures(); err == nil {
+			a.autoFails = rows
+		}
 	}
 	a.seedAutoDone()
 
@@ -271,24 +299,31 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case snapMsg:
 		a.loading = false
+		var failCmd tea.Cmd
 		if msg.err != nil {
 			// 保留上次成功快照：短暂网络抖动不清空决策表。
 			a.errMsg = msg.err.Error()
+			// 自动执行开着却拿不到行情 = 本轮策略失败，记下来（同原因 5 分钟一次）。
+			if a.autoOn && a.exec != nil {
+				if f, ok := a.noteAutoFailure("market", a.uly, msg.err.Error(), ""); ok {
+					failCmd = recordAutoFailureCmd(a.exec, f)
+				}
+			}
 		} else {
 			a.errMsg = ""
+			prev := a.cursorKey() // 换快照前抓选中行
 			a.snapRaw = msg.snap
 			a.snap = a.applyFilters(msg.snap)
-			a.refs = a.buildRefs()
-			a.table.SetRows(a.buildRows())
+			a = a.resetRowsKeeping(prev)
 		}
 		if a.exec != nil {
 			a.guard = a.exec.State()
 		}
 		if a.autoOn && a.exec != nil && msg.err == nil {
 			if d, note := a.autoCandidate(); d != nil {
-				a.autoCount++
+				// 先不写 autoDone：提交失败时不能占坑，否则这一轮机会直接丢掉。
+				// 冷却时间从提交时刻开始算，失败后 ≥60s 才会重试。
 				a.autoSince = time.Now()
-				a.autoDone[d.key()] = true
 				a.autoNote = "自动提交：" + d.label
 				a.flash = "⚙ " + a.autoNote
 				a.flashIsErr = false
@@ -297,15 +332,28 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.autoNote = note
 			}
 		}
-		return a, nil
+		return a, failCmd
 
 	case orderResultMsg:
 		if msg.err != nil {
 			a.flash = "✗ " + msg.err.Error()
 			a.flashIsErr = true
+			// 自动策略提交失败：记录原因（手动单失败只 flash，不进失败记录）。
+			if msg.auto && a.exec != nil {
+				if f, ok := a.noteAutoFailure(msg.kind, autoRefOfKey(msg.key), msg.err.Error(), msg.label); ok {
+					return a, recordAutoFailureCmd(a.exec, f)
+				}
+			}
 		} else {
 			a.flash = "✓ " + msg.out.Detail
 			a.flashIsErr = false
+			if msg.auto {
+				// 只有成功回执才计入自动执行次数并写入去重表；失败允许冷却后重试。
+				a.autoCount++
+				if msg.key != "" {
+					a.autoDone[msg.key] = true
+				}
+			}
 			if a.exec != nil {
 				a.guard = a.exec.State()
 			}
@@ -466,9 +514,9 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				a.sideFilter = 0
 				a.settleFilter = 0
 				if a.snapRaw != nil {
+					prev := a.cursorKey()
 					a.snap = a.snapRaw
-					a.refs = a.buildRefs()
-					a.table.SetRows(a.buildRows())
+					a = a.resetRowsKeeping(prev)
 				}
 				a.saveFilterPrefs()
 				a.flash, a.flashIsErr = "已清除筛选（全量）", false
@@ -492,6 +540,13 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "b":
 			// 弹窗选择结算本位（全部 / 币本位 / U本位）
 			a = a.openSettlePicker()
+			return a, nil
+		case "f":
+			// 弹窗选择排序键（价格 / 期权APR / 差%），仅表格视图有意义
+			if a.view != viewTable && a.view != viewChain {
+				return a, nil
+			}
+			a = a.openSortPicker()
 			return a, nil
 		case "p", "3":
 			app := a.togglePositions()
@@ -643,12 +698,16 @@ func (a App) detailLine() string {
 		}
 		parts = append(parts, fmt.Sprintf("%s · 到期 %s", tradeDesc(d), strategy.FormatExpTime(r.ExpTime)))
 		parts = append(parts, fmt.Sprintf("行权 %.0f · 偏差 %+.2f%%", r.Strike, r.StrikeErrPct))
+		parts = append(parts, toStrikeCell(r.OptType, r.Strike, a.snap.SpotPrice))
 		if a.snap.SpotPrice > 0 {
 			parts = append(parts, fmt.Sprintf("现价 %.0f · 距现价 %+.0f（%+.2f%%）",
 				a.snap.SpotPrice, r.Strike-a.snap.SpotPrice, (r.Strike-a.snap.SpotPrice)/a.snap.SpotPrice*100))
 		}
 		parts = append(parts, "买价 "+bidCell(r.OptBidPx))
 		parts = append(parts, "期权腿 "+strategy.SettleKindName(strategy.SettleKind(r.OptSettleCcy, r.OptInstID)))
+		if r.SettleMismatch {
+			parts = append(parts, "⚠ 抵押品本位与投资币种不一致")
+		}
 		if d.Action == strategy.ActionSubscribeDual && r.InvestCcy != "" {
 			parts = append(parts, "投入 "+r.InvestCcy)
 		}
@@ -676,10 +735,10 @@ func (a App) detailLine() string {
 			dcy = fmt.Sprintf("对应 DCY %s（APR %.2f%%），期权无买盘", d.Row.ProductID, d.Row.DcyAPR*100)
 		}
 	}
-	return hintStyle.Render(fmt.Sprintf(" %s · %s · %s · 到期 %s 08:00 · 行权 %.0f · 现价 %.0f · 距现价 %s · 买价 %s / 卖价 %s · 期权 APR %s · 结算 %s · %s · 参考视图，下单请按 1 回决策页",
+	return hintStyle.Render(fmt.Sprintf(" %s · %s · %s · 到期 %s 08:00 · 行权 %.0f · 现价 %.0f · 距现价 %s · %s · 买价 %s / 卖价 %s / 最新 %s · 期权 APR %s · 结算 %s · %s · 参考视图，下单请按 1 回决策页",
 		or.InstID, strategy.OptTypeName(or.OptType), strategy.SettleKindName(strategy.SettleKind(or.SettleCcy, or.InstID)),
-		strategy.InstExpiryDay(or.InstID), or.Strike, or.SpotPx, dist,
-		bidCell(or.BidPx), bidCell(or.AskPx), apr, or.SettleCcy, dcy))
+		strategy.InstExpiryDay(or.InstID), or.Strike, or.SpotPx, dist, toStrikeCell(or.OptType, or.Strike, or.SpotPx),
+		bidCell(or.BidPx), bidCell(or.AskPx), bidCell(or.LastPx), apr, or.SettleCcy, dcy))
 }
 
 // legendLine 方向/操作图例：明确「CALL/PUT」与「买/卖」的对应关系（两行避免窄屏换行）。
@@ -775,21 +834,22 @@ func (a App) headerLine() string {
 func (a App) footerLine() string {
 	if a.exec == nil {
 		if a.view == viewChain {
-			return "期权链参考（只读）：1 返回决策 · u/e/t/b 筛选 · r 刷新 · q 退出"
+			return "期权链参考（只读）：1 返回决策 · u/e/t/b 筛选 · f 排序 · r 刷新 · q 退出"
 		}
-		return "只读模式（未接入执行器）：2 期权链 · r 刷新 · q 退出"
+		return "只读模式（未接入执行器）：2 期权链 · f 排序 · r 刷新 · q 退出"
 	}
 	switch a.view {
 	case viewChain:
-		return "2/1 返回决策 · 期权链为参考视图（不直接下单）· u/e/t/b 筛选 · r 刷新"
+		return "2/1 返回决策 · 期权链为参考视图（不直接下单）· u/e/t/b 筛选 · f 排序 · r 刷新"
 	case viewPositions:
 		return "3/1 返回决策 · j/k 滚动 · 4 日志 · --settle 命令结算到期纸面单"
 	case viewAudit:
 		return "4/1 返回决策 · j/k 滚动 · 最新 200 条（submit/reject/settle/restore）"
 	case viewSettings:
-		return "a 自动执行开关 · [ / ] 阈值 ±5pp · 1/Esc 返回 · 重启后需重新确认"
+		return "a 自动执行开关 · [ / ] 阈值 ±5pp · j/k 滚动（失败记录在底部）· 1/Esc 返回"
 	default:
 		keys := "o 卖期权 / d 申购双币赢 · 2 期权链 · p 持仓 · l 日志 · u 币种 / e 到期 / t 方向"
+		keys += " · f 排序"
 		if !a.expFilter.IsZero() || a.sideFilter != 0 {
 			keys += " · Esc 清除筛选"
 		}
@@ -812,9 +872,14 @@ func (a App) settingsView() string {
 		"",
 		"策略参数（[ / ] 调整阈值 ±5pp，下一次刷新生效）",
 		fmt.Sprintf("  期权边际阈值  : %.0f pp   （期权 APR 高出 DCY 不足此值 → 申购双币赢）", a.settings.MinOptionEdgePP),
+		fmt.Sprintf("  单笔绝对边际  : %.2f%%     （一笔实际收益差低于此值 → 申购双币赢）", a.settings.MinAbsEdgePct),
+		"  期权手续费    : 0.03%     （普通档挂单/吃单，已从期权 APR 扣除）",
 		fmt.Sprintf("  行权价最大偏差: %.2f%%", a.settings.MaxStrikeGapPct),
 		fmt.Sprintf("  期限窗口      : %.0f–%.0f 天（固定）", a.params.DaysMin, a.params.DaysMax),
 		fmt.Sprintf("  单笔建议上限  : %.0f USDT", a.params.CapitalCap),
+		fmt.Sprintf("  资金总额      : %.0f USDT（总敞口上限，单笔 %.0f；Web 设置页可改）",
+			a.settings.CapitalUSDT, g.Limits.PerOrderUSDT),
+		fmt.Sprintf("  自动交易差%%   : %.2f%%（|期权APR−DCY APR| 低于此值自动跳过；0 = 不设门槛）", a.settings.MinDiffPct),
 		"",
 		"风控硬上限（executor 强制，只读；启动时用 --limits 覆盖）",
 		fmt.Sprintf("  单笔 %.0f / 总敞口 %.0f USDT · 并行 %d 笔 · 日限 %d 笔",
@@ -831,7 +896,38 @@ func (a App) settingsView() string {
 	if a.autoNote != "" {
 		lines = append(lines, "", "最近："+a.autoNote)
 	}
+	lines = append(lines, "", fmt.Sprintf("自动失败记录（最近 %d/%d 条，落盘 auto_failures.jsonl，重启可查）",
+		len(a.autoFails), store.AutoFailureLimit))
+	if len(a.autoFails) == 0 {
+		lines = append(lines, hintStyle.Render("  暂无：自动提交失败或行情失败时会记下原因"))
+	}
+	for i := len(a.autoFails) - 1; i >= 0; i-- {
+		f := a.autoFails[i]
+		line := fmt.Sprintf("  %s  %s", f.Ts.Local().Format("01-02 15:04:05"), autoFailKindName(f.Kind))
+		if f.Ref != "" {
+			line += " " + trimTo(f.Ref, 28)
+		}
+		line += "：" + trimTo(f.Reason, 60)
+		if f.Count > 1 {
+			line += fmt.Sprintf("（×%d）", f.Count)
+		}
+		lines = append(lines, line)
+	}
 	return a.window(lines)
+}
+
+// autoFailKindName 失败类别 → 中文标签（与 Web 页面一致）。
+func autoFailKindName(kind string) string {
+	switch kind {
+	case "option":
+		return "卖期权"
+	case "dcd":
+		return "申购DCY"
+	case "market":
+		return "行情"
+	default:
+		return kind
+	}
 }
 
 // autoConfirmPanel 实盘开启自动执行的二次确认。
@@ -930,7 +1026,13 @@ func (a App) persistSettings() bool {
 
 // autoCandidate 选本轮自动执行标的：按策略排序取第一笔「可下单且未自动做过」的候选。
 func (a App) autoCandidate() (*orderDraft, string) {
-	if a.snap == nil {
+	// 自动执行用未过滤快照：否则看图时设置的标的/方向/本位/到期筛选会悄悄
+	// 改变交易范围（sideFilter 还会落盘，重启后继续影响自动执行）。
+	snap := a.snapRaw
+	if snap == nil {
+		snap = a.snap
+	}
+	if snap == nil {
 		return nil, ""
 	}
 	if !a.autoSince.IsZero() && time.Since(a.autoSince) < autoCooldown {
@@ -944,17 +1046,58 @@ func (a App) autoCandidate() (*orderDraft, string) {
 	if remaining <= 0 {
 		return nil, "自动跳过：单笔/总敞口额度已用尽"
 	}
-	spot := a.snap.SpotPrice
+	spot := snap.SpotPrice
 
-	for _, d := range a.snap.Decisions {
-		switch d.Action {
-		case strategy.ActionBuyOption:
-			if !d.Row.OptMatched || spot <= 0 {
+	// 按「差%」降序挑最优，而不是按展示排序取第一条（展示顺序是动作分组 +
+	// 到期/行权价，和收益差无关）。
+	// 方向（PUT/CALL）是用户持久化的策略偏好，自动执行沿用；到期/本位/搜索
+	// 只是看图条件，不参与自动执行筛选。
+	side := a.sideFilter
+	cands := make([]strategy.Decision, 0, len(snap.Decisions))
+	for _, d := range snap.Decisions {
+		if d.Action != strategy.ActionBuyOption && d.Action != strategy.ActionSubscribeDual {
+			continue
+		}
+		if side != 0 && sideKey(d.Row.OptType) != side {
+			continue
+		}
+		cands = append(cands, d)
+	}
+	sort.SliceStable(cands, func(i, j int) bool { return cands[i].Row.Diff > cands[j].Row.Diff })
+
+	skippedMismatch := false
+	skippedDiff := false
+	minDiff := a.params.AutoMinDiff
+	for _, d := range cands {
+		// 差值比例门槛：卖期权看 Diff，申购 DCY 看反方向（DCY 领先期权多少）。
+		if minDiff > 0 {
+			edge := d.Row.Diff
+			if d.Action == strategy.ActionSubscribeDual {
+				edge = -d.Row.Diff
+			}
+			if edge < minDiff {
+				skippedDiff = true
 				continue
 			}
-			sz := math.Floor(remaining / spot)
+		}
+		switch d.Action {
+		case strategy.ActionBuyOption:
+			if !d.Row.OptMatched || spot <= 0 || d.Row.OptCtVal <= 0 {
+				continue // 缺合约乘数时无法安全估算敞口
+			}
+			if d.Row.SettleMismatch {
+				// 抵押品本位与投资币种不一致（如 USDT 现金 vs 币本位期权），
+				// 自动执行不替用户跨抵押品下单。
+				skippedMismatch = true
+				continue
+			}
+			per := spot * d.Row.OptCtVal // 每张名义（USDT）
+			if per <= 0 {
+				continue
+			}
+			sz := math.Floor(remaining / per)
 			if sz < 1 {
-				continue // 单笔上限不足 1 张（BTC 默认额度即是此情形）
+				continue // 单笔上限不足 1 张
 			}
 			sz = math.Min(sz, 20) // 单轮防手滑上限
 			key := "opt|" + d.Row.OptInstID
@@ -963,13 +1106,16 @@ func (a App) autoCandidate() (*orderDraft, string) {
 			}
 			return &orderDraft{
 				kind:   "option",
+				auto:   true,
 				instID: d.Row.OptInstID,
 				sz:     sz,
+				ctVal:  d.Row.OptCtVal,
+				minAPR: d.Row.DcyAPR + a.params.MinOptionEdge,
 				label: fmt.Sprintf("卖出 %s %s %.0f 张（期权 APR %.1f%% vs DCY %.1f%%，差 %.1fpp）",
 					strategy.OptTypeName(d.Row.OptType), d.Row.OptInstID, sz, d.Row.OptAPR*100, d.Row.DcyAPR*100, d.Row.Diff*100),
 			}, ""
 		case strategy.ActionSubscribeDual:
-			prod, ok := a.snap.Products[d.Row.ProductID]
+			prod, ok := snap.Products[d.Row.ProductID]
 			if !ok {
 				continue
 			}
@@ -995,18 +1141,28 @@ func (a App) autoCandidate() (*orderDraft, string) {
 			if prod.MaxSize > 0 && amt > float64(prod.MaxSize) {
 				amt = float64(prod.MaxSize)
 			}
+			if prod.StepSz > 0 {
+				amt = math.Floor(amt/float64(prod.StepSz)) * float64(prod.StepSz)
+			}
 			if amt <= 0 {
 				continue
 			}
 			amt = math.Round(amt*1e8) / 1e8
 			return &orderDraft{
 				kind:    "dcd",
+				auto:    true,
 				product: prod,
 				amt:     amt,
 				label: fmt.Sprintf("申购 %s %.4f %s（DCY APR %.1f%% vs 期权 %.1f%%，差 %.1fpp）",
 					prod.ProductID, amt, prod.NotionalCcy, d.Row.DcyAPR*100, d.Row.OptAPR*100, d.Row.Diff*100),
 			}, ""
 		}
+	}
+	if skippedMismatch {
+		return nil, "自动跳过：最优候选的期权抵押品本位与投资币种不一致（需手动确认）"
+	}
+	if skippedDiff {
+		return nil, fmt.Sprintf("自动跳过：差值未达 %.2f%% 门槛（设置页可调）", minDiff*100)
 	}
 	return nil, "自动等待：本轮无可执行候选（额度不足或无对齐机会）"
 }
@@ -1123,8 +1279,13 @@ func (a App) estimateExposure(d *orderDraft) float64 {
 		return 0
 	}
 	if d.kind == "option" {
-		// 单张名义 = ctVal × 现货；BTC/ETH/SOL 期权 ctVal 均为 1 个币。
-		return d.sz * a.snap.SpotPrice
+		// 单张名义 = ctVal × ctMult × 现货：BTC 期权 1 张 = 0.01 BTC、ETH = 0.1。
+		// ctVal 未知时退回旧的「1 张 = 1 币」估算（只影响面板展示，实际风控在 executor）。
+		per := 1.0
+		if d.ctVal > 0 {
+			per = d.ctVal
+		}
+		return d.sz * a.snap.SpotPrice * per
 	}
 	if d.product.NotionalCcy == "USDT" {
 		return d.amt
@@ -1140,6 +1301,69 @@ func (a App) currentRef() (rowRef, bool) {
 		return rowRef{}, false
 	}
 	return a.refs[cur], true
+}
+
+// refKey 行引用的稳定标识（产品/合约 ID），用于刷新/重排后把光标留在原行。
+func (a App) refKey(ref rowRef) string {
+	if a.snap == nil {
+		return ""
+	}
+	if ref.kind == rowOption {
+		if ref.idx >= 0 && ref.idx < len(a.snap.OptionRows) {
+			return "opt|" + a.snap.OptionRows[ref.idx].InstID
+		}
+		return ""
+	}
+	if ref.idx >= 0 && ref.idx < len(a.snap.Decisions) {
+		return "dcd|" + a.snap.Decisions[ref.idx].Row.ProductID
+	}
+	return ""
+}
+
+// cursorKey 当前选中行的稳定标识（无选中/越界时为空）。
+func (a App) cursorKey() string {
+	ref, ok := a.currentRef()
+	if !ok {
+		return ""
+	}
+	return a.refKey(ref)
+}
+
+// resetRows 重建行引用与表格行，并尽量把光标留在原来那一行。
+//
+// 按价格/APR 实时排序时行会在刷新间上下移动：若只按索引保留光标，
+// 「选中行」会悄悄换成别的产品，此时按 o/d 下错单的风险很高。
+func (a App) resetRows() App {
+	return a.resetRowsKeeping(a.cursorKey())
+}
+
+// resetRowsKeeping 同 resetRows，但用调用方在「换快照/换筛选项之前」抓到的
+// 行标识——a.snap 一旦换掉，旧 refs 指向的就已经不是原来那条产品了。
+func (a App) resetRowsKeeping(key string) App {
+	a.refs = a.buildRefs()
+	a.table.SetRows(a.buildRows())
+	return a.restoreCursor(key)
+}
+
+// restoreCursor 按稳定标识找回行号；找不到（行被筛掉/合约消失）时收敛到首行。
+// 返回 App：table 是 App 的字段，值接收者里的 SetCursor 只改副本。
+func (a App) restoreCursor(key string) App {
+	if len(a.refs) == 0 {
+		a.table.SetCursor(0)
+		return a
+	}
+	if key != "" {
+		for i, ref := range a.refs {
+			if a.refKey(ref) == key {
+				a.table.SetCursor(i)
+				return a
+			}
+		}
+	}
+	if a.table.Cursor() < 0 || a.table.Cursor() >= len(a.refs) {
+		a.table.SetCursor(0)
+	}
+	return a
 }
 
 func (a App) startOption() (tea.Model, tea.Cmd) {
@@ -1160,6 +1384,7 @@ func (a App) startOption() (tea.Model, tea.Cmd) {
 	a.draft = &orderDraft{
 		kind:   "option",
 		instID: d.Row.OptInstID,
+		ctVal:  d.Row.OptCtVal,
 		label: fmt.Sprintf("卖出 %s %s（行权 %.0f，%s 到期，期权 APR %.2f%%）",
 			strategy.OptTypeName(d.Row.OptType), d.Row.OptInstID, d.Row.Strike, d.Row.ExpTime.Format("2006-01-02"), d.Row.OptAPR*100),
 	}
@@ -1180,8 +1405,9 @@ func (a App) startDCD() (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 	d := a.snap.Decisions[ref.idx]
-	if d.Action != strategy.ActionSubscribeDual {
-		a.flash, a.flashIsErr = "该行建议不是「申购双币赢」", true
+	// 手动申购：subscribe_dual 建议之外的「不可对齐」行也允许（自动执行仍然只挑建议）。
+	if d.Action != strategy.ActionSubscribeDual && d.Action != strategy.ActionUnaligned {
+		a.flash, a.flashIsErr = "该行没有可申购的 DCY 产品", true
 		return a, nil
 	}
 	prod, ok := a.snap.Products[d.Row.ProductID]
@@ -1196,11 +1422,15 @@ func (a App) startDCD() (tea.Model, tea.Cmd) {
 	if def <= 0 {
 		def = 0.01
 	}
+	tag := ""
+	if d.Action != strategy.ActionSubscribeDual {
+		tag = "（未对齐·手动）"
+	}
 	a.draft = &orderDraft{
 		kind:    "dcd",
 		product: prod,
-		label: fmt.Sprintf("申购双币赢·%s %s：行权 %.0f，absYield %.6f（APR %.2f%%），投入 %s，到期 %s",
-			strategy.DcySideName(d.Row.OptType), prod.ProductID, float64(prod.Strike), float64(prod.AbsYield),
+		label: fmt.Sprintf("申购双币赢·%s %s%s：行权 %.0f，absYield %.6f（APR %.2f%%），投入 %s，到期 %s",
+			strategy.DcySideName(d.Row.OptType), prod.ProductID, tag, float64(prod.Strike), float64(prod.AbsYield),
 			float64(prod.AnnualizedYield)*100, prod.NotionalCcy, time.UnixMilli(int64(prod.ExpTime)).Format("2006-01-02")),
 	}
 	a.inputMode = true
@@ -1334,6 +1564,22 @@ func (a App) openSettlePicker() App {
 	return a
 }
 
+// openSortPicker 打开排序弹窗（当前排序键预选中）。
+func (a App) openSortPicker() App {
+	a.picker = pickerSort
+	a.pickerIdx = 0
+	cur := a.sorting.String()
+	for i, it := range a.pickerItems() {
+		if it.value == cur {
+			a.pickerIdx = i
+			break
+		}
+	}
+	a.flash = ""
+	a.flashIsErr = false
+	return a
+}
+
 // openExpiryPicker 打开到期日弹窗（当前筛选项预选中）。
 func (a App) openExpiryPicker() App {
 	a.picker = pickerExpiry
@@ -1383,6 +1629,17 @@ func (a App) pickerItems() []pickerItem {
 			{label: "币本位（BTC-USD 链）", value: "B", note: fmt.Sprintf("%d 行", c['B'])},
 			{label: "U本位（BTC-USD_UM 链）", value: "U", note: fmt.Sprintf("%d 行", c['U'])},
 		}
+	case pickerSort:
+		// 升/降序列成显式选项：当前排序状态一眼可见，不需要记「再按一次反向」。
+		return []pickerItem{
+			{label: "默认顺序（动作 · 到期 · 行权价）", value: ""},
+			{label: "价格 高→低", value: "price:desc", note: "买价折USDT；无买盘用最新价"},
+			{label: "价格 低→高", value: "price:asc", note: "买价折USDT；无买盘用最新价"},
+			{label: "期权APR 高→低", value: "apr:desc", note: "无买盘行沉底"},
+			{label: "期权APR 低→高", value: "apr:asc", note: "无买盘行沉底"},
+			{label: "差% 高→低", value: "diff:desc", note: "期权更优在前"},
+			{label: "差% 低→高", value: "diff:asc", note: "双币赢更优在前"},
+		}
 	}
 	return nil
 }
@@ -1406,9 +1663,9 @@ func (a App) applyPicker(it pickerItem) (tea.Model, tea.Cmd) {
 			return a.startExpiryInput(), nil
 		case "":
 			a.expFilter = time.Time{}
+			prev := a.cursorKey()
 			a.snap = a.applyFilters(a.snapRaw)
-			a.refs = a.buildRefs()
-			a.table.SetRows(a.buildRows())
+			a = a.resetRowsKeeping(prev)
 			a.flash, a.flashIsErr = "已清除到期筛选 · 当前组合 "+a.filterSummary(), false
 			return a, nil
 		}
@@ -1418,9 +1675,9 @@ func (a App) applyPicker(it pickerItem) (tea.Model, tea.Cmd) {
 			return a, nil
 		}
 		a.expFilter = time.Date(t.Year(), t.Month(), t.Day(), 8, 0, 0, 0, time.UTC)
+		prev := a.cursorKey()
 		a.snap = a.applyFilters(a.snapRaw)
-		a.refs = a.buildRefs()
-		a.table.SetRows(a.buildRows())
+		a = a.resetRowsKeeping(prev)
 		a.flash, a.flashIsErr = "当前组合 → "+a.filterSummary(), false
 		return a, nil
 	case pickerSide:
@@ -1430,9 +1687,9 @@ func (a App) applyPicker(it pickerItem) (tea.Model, tea.Cmd) {
 		default:
 			a.sideFilter = rune(it.value[0])
 		}
+		prev := a.cursorKey()
 		a.snap = a.applyFilters(a.snapRaw)
-		a.refs = a.buildRefs()
-		a.table.SetRows(a.buildRows())
+		a = a.resetRowsKeeping(prev)
 		a.saveFilterPrefs()
 		a.flash, a.flashIsErr = "当前组合 → "+a.filterSummary(), false
 		return a, nil
@@ -1443,11 +1700,17 @@ func (a App) applyPicker(it pickerItem) (tea.Model, tea.Cmd) {
 		default:
 			a.settleFilter = rune(it.value[0])
 		}
+		prev := a.cursorKey()
 		a.snap = a.applyFilters(a.snapRaw)
-		a.refs = a.buildRefs()
-		a.table.SetRows(a.buildRows())
+		a = a.resetRowsKeeping(prev)
 		a.saveFilterPrefs()
 		a.flash, a.flashIsErr = "当前组合 → "+a.filterSummary(), false
+		return a, nil
+	case pickerSort:
+		a.sorting = parseSortSpec(it.value)
+		a = a.rebuildTable()
+		a.saveSortPref()
+		a.flash, a.flashIsErr = "排序 → "+a.sorting.label(), false
 		return a, nil
 	}
 	return a, nil
@@ -1468,6 +1731,9 @@ func (a App) pickerView() string {
 	}
 	if a.picker == pickerSettle {
 		title = "选择结算本位（币本位 / U本位）"
+	}
+	if a.picker == pickerSort {
+		title = "选择排序（价格 / 期权APR / 差%）"
 	}
 	lines := []string{warnStyle.Render("┌ " + title)}
 	for i, it := range items {
@@ -1510,6 +1776,15 @@ func (a *App) saveFilterPrefs() {
 	if a.settleFilter != 0 {
 		a.settings.SettleFilter = string(a.settleFilter)
 	}
+	_ = a.exec.SaveSettings(a.settings)
+}
+
+// saveSortPref 把当前排序键写入 settings.json（重启后恢复）。
+func (a *App) saveSortPref() {
+	if a.exec == nil {
+		return
+	}
+	a.settings.SortBy = a.sorting.String()
 	_ = a.exec.SaveSettings(a.settings)
 }
 
@@ -1678,8 +1953,15 @@ func (a App) filterBar() string {
 			parts = append(parts, hintStyle.Render(txt))
 		}
 	}
+	// 排序状态：只在「按值排序」时高亮，默认顺序保持弱化，避免误以为表格是固定的。
+	parts = append(parts, hintStyle.Render("· 排序"))
+	if a.sorting.active() {
+		parts = append(parts, warnStyle.Render("["+a.sorting.label()+"]"))
+	} else {
+		parts = append(parts, hintStyle.Render("[默认]"))
+	}
 	line := " " + strings.Join(parts, "  ")
-	tail := hintStyle.Render("  ·  t/b/e 选择 / Esc 清除")
+	tail := hintStyle.Render("  ·  t/b/e 选择 · f 排序 / Esc 清除")
 	width := a.width
 	if width <= 0 {
 		width = 120
@@ -1687,8 +1969,7 @@ func (a App) filterBar() string {
 	limit := width - lipgloss.Width(tail) - 2
 	// 窄终端兜底：四组筛选 chip 放不下时退化为一行摘要，避免换行破坏表格。
 	if lipgloss.Width(line) > limit {
-		return " " + hintStyle.Render("组合") + " " + infoStyle.Render(a.filterSummary()) +
-			hintStyle.Render("   t 方向 / b 本位 / e 到期 / Esc 清除")
+		return a.compactFilterBar()
 	}
 	if len(ds) > 0 {
 		line += hintStyle.Render("  · 到期  ")
@@ -1716,6 +1997,29 @@ func (a App) filterBar() string {
 		}
 	}
 	return line + tail
+}
+
+// compactFilterBar 窄终端下的组合条：先保留全部快捷键提示，仍放不下就只留
+// 组合摘要 + 排序状态，最后兜底成一句排序提示——任何宽度都不能换行（换行会
+// 把表格整体顶下去、破坏 j/k 视线）。
+func (a App) compactFilterBar() string {
+	width := a.width
+	if width <= 0 {
+		width = 120
+	}
+	tiers := []string{
+		" " + hintStyle.Render("组合") + " " + infoStyle.Render(a.filterSummary()) +
+			hintStyle.Render("  排序 "+a.sorting.label()+" · t 方向/b 本位/e 到期/f 排序/Esc 清除"),
+		" " + hintStyle.Render("组合") + " " + infoStyle.Render(a.filterSummary()) +
+			hintStyle.Render(" · 排序 ") + warnStyle.Render(a.sorting.label()),
+		" " + hintStyle.Render("排序 ") + warnStyle.Render(a.sorting.label()),
+	}
+	for _, line := range tiers {
+		if lipgloss.Width(line) <= width {
+			return line
+		}
+	}
+	return ""
 }
 
 // expPanel 到期时间输入面板（含可用到期日提示）。
@@ -1768,11 +2072,53 @@ func fetchPositionsCmd(a App) tea.Cmd {
 func submitDraftCmd(a App, d orderDraft) tea.Cmd {
 	return func() tea.Msg {
 		if d.kind == "option" {
+			if d.minAPR > 0 {
+				out, err := a.exec.SubmitOptionChecked(d.instID, d.sz, 0, d.minAPR)
+				return orderResultMsg{kind: d.kind, key: d.key(), auto: d.auto, label: d.label, out: out, err: err}
+			}
 			out, err := a.exec.SubmitOption(d.instID, d.sz, 0)
-			return orderResultMsg{kind: d.kind, out: out, err: err}
+			return orderResultMsg{kind: d.kind, key: d.key(), auto: d.auto, label: d.label, out: out, err: err}
 		}
 		out, err := a.exec.SubmitDCD(d.product, d.amt)
-		return orderResultMsg{kind: d.kind, out: out, err: err}
+		return orderResultMsg{kind: d.kind, key: d.key(), auto: d.auto, label: d.label, out: out, err: err}
+	}
+}
+
+// autoRefOfKey 去重键（opt|instId / dcd|productId）→ 标的。
+func autoRefOfKey(key string) string {
+	if i := strings.IndexByte(key, '|'); i >= 0 {
+		return key[i+1:]
+	}
+	return key
+}
+
+// noteAutoFailure 把一次自动失败写入内存环形表（最新在后），返回待落盘的记录。
+// 行情失败在自动执行期间每秒重试，同一原因 5 分钟内只记一次，避免刷屏。
+func (a *App) noteAutoFailure(kind, ref, reason, detail string) (store.AutoFailure, bool) {
+	if reason == "" {
+		reason = "未知原因"
+	}
+	now := time.Now().UTC()
+	if kind == "market" {
+		key := kind + "|" + ref + "|" + reason
+		if key == a.marketFailKey && now.Sub(a.marketFailAt) < 5*time.Minute {
+			return store.AutoFailure{}, false
+		}
+		a.marketFailKey, a.marketFailAt = key, now
+	}
+	f := store.AutoFailure{Ts: now, Kind: kind, Ref: ref, Reason: reason, Detail: detail}
+	a.autoFails = store.PushAutoFailure(a.autoFails, f, now)
+	return f, true
+}
+
+// recordAutoFailureCmd 把失败记录落盘（不阻塞 UI 主循环）。
+func recordAutoFailureCmd(exec Executor, f store.AutoFailure) tea.Cmd {
+	if exec == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		_ = exec.RecordAutoFailure(f)
+		return nil
 	}
 }
 
@@ -1781,22 +2127,25 @@ func tickCmd() tea.Cmd {
 }
 
 // buildRefs 行索引 → 数据结构引用（决策页只看 DCY 决策，期权链页只看期权）。
+// 返回前按当前排序键重排：refs 的次序即表格行序，保证详情行/下单始终跟随
+// 选中行（行内容与索引解耦）。
 func (a App) buildRefs() []rowRef {
 	if a.snap == nil {
 		return nil
 	}
+	var refs []rowRef
 	if a.view == viewChain {
-		refs := make([]rowRef, 0, len(a.snap.OptionRows))
+		refs = make([]rowRef, 0, len(a.snap.OptionRows))
 		for i := range a.snap.OptionRows {
 			refs = append(refs, rowRef{kind: rowOption, idx: i})
 		}
-		return refs
+	} else {
+		refs = make([]rowRef, 0, len(a.snap.Decisions))
+		for i := range a.snap.Decisions {
+			refs = append(refs, rowRef{kind: rowDecision, idx: i})
+		}
 	}
-	refs := make([]rowRef, 0, len(a.snap.Decisions))
-	for i := range a.snap.Decisions {
-		refs = append(refs, rowRef{kind: rowDecision, idx: i})
-	}
-	return refs
+	return a.sortRefs(refs)
 }
 
 // rebuildTable 按当前视图重建行索引、列头与表格行（决策页 / 期权链页共用同一表格）。
@@ -1804,93 +2153,93 @@ func (a App) rebuildTable() App {
 	// 先清空行再换列：bubbles table 渲染时按列数遍历行单元格，若行比列长会越界。
 	a.table.SetRows(nil)
 	a.table.SetColumns(a.tableColumns(a.width))
-	a.refs = a.buildRefs()
-	a.table.SetRows(a.buildRows())
-	if a.table.Cursor() < 0 || a.table.Cursor() >= len(a.refs) {
-		a.table.SetCursor(0)
-	}
-	return a
+	return a.resetRows()
 }
 
 // buildRows 按当前视图生成表格行：决策页只看 DCY 决策，期权链页只看期权。
+// 行序严格跟随 a.refs（已按排序键排好），否则选中行与详情/下单会错位。
 func (a App) buildRows() []table.Row {
 	if a.snap == nil {
 		return []table.Row{}
 	}
-	if a.view == viewChain {
-		return a.buildChainRows()
-	}
-	return a.buildDecisionRows()
-}
-
-// buildDecisionRows 主视图：一条 DCY 产品一行（含对齐到的期权合约）。
-func (a App) buildDecisionRows() []table.Row {
-	rows := make([]table.Row, 0, len(a.snap.Decisions))
-	for _, d := range a.snap.Decisions {
-		r := d.Row
-		product := r.ProductID
-		if r.OptMatched {
-			product += " → " + strings.TrimPrefix(r.OptInstID, r.Uly+"-")
-		}
-		amt := "—"
-		if d.SuggestedAmt > 0 {
-			amt = fmt.Sprintf("%.0f %s", d.SuggestedAmt, r.InvestCcy)
-		}
-		// 无买盘时算不出期权 APR / 差值，显示 — 而不是 0.00%。
-		optApr, diff := "—", "—"
-		if r.OptBidPx != "" {
-			optApr = pct(r.OptAPR)
-			diff = diffCell(r.Diff)
-		}
-		rows = append(rows, table.Row{
-			decisionLabel(d),
-			product,
-			r.ExpTime.UTC().Format("2006-01-02"),
-			strategy.OptTypeName(r.OptType),
-			shortSettle(strategy.SettleKind(r.OptSettleCcy, r.OptInstID)),
-			fmt.Sprintf("%.0f", r.Strike),
-			distCell(r.Strike, a.snap.SpotPrice),
-			bidCell(r.OptBidPx),
-			pct(r.DcyAPR), optApr, diff,
-			fmt.Sprintf("%.0f", r.Days),
-			amt,
-		})
-	}
-	return rows
-}
-
-// buildChainRows 参考视图：完整卖方有效期权链；有 DCY 对应档时同时给出
-// DCY APR 与差值（列数与 chainColumnsFor 一致）。
-func (a App) buildChainRows() []table.Row {
-	rows := make([]table.Row, 0, len(a.snap.OptionRows))
-	for _, or := range a.snap.OptionRows {
-		apr := "—"
-		if or.APRValid {
-			apr = pct(or.OptAPR)
-		}
-		name := or.InstID
-		dcyApr, diff := "—", "—"
-		if d, ok := a.dcyForOpt(or.InstID); ok {
-			name += hintStyle.Render(" ←DCY")
-			dcyApr = pct(d.Row.DcyAPR)
-			if or.APRValid {
-				diff = diffCell(or.OptAPR - d.Row.DcyAPR)
+	rows := make([]table.Row, 0, len(a.refs))
+	for _, ref := range a.refs {
+		if ref.kind == rowOption {
+			if ref.idx < 0 || ref.idx >= len(a.snap.OptionRows) {
+				continue
 			}
+			rows = append(rows, a.chainRow(a.snap.OptionRows[ref.idx]))
+			continue
 		}
-		rows = append(rows, table.Row{
-			optionLabel(or),
-			name,
-			strategy.InstExpiryDay(or.InstID),
-			strategy.OptTypeName(or.OptType),
-			shortSettle(strategy.SettleKind(or.SettleCcy, or.InstID)),
-			fmt.Sprintf("%.0f", or.Strike),
-			distCell(or.Strike, or.SpotPx),
-			bidCell(or.BidPx),
-			apr, dcyApr, diff,
-			fmt.Sprintf("%.0f", or.Days),
-		})
+		if ref.idx < 0 || ref.idx >= len(a.snap.Decisions) {
+			continue
+		}
+		rows = append(rows, a.decisionRow(a.snap.Decisions[ref.idx]))
 	}
 	return rows
+}
+
+// decisionRow 主视图：一条 DCY 产品一行（含对齐到的期权合约）。
+func (a App) decisionRow(d strategy.Decision) table.Row {
+	r := d.Row
+	product := r.ProductID
+	if r.OptMatched {
+		product += " → " + strings.TrimPrefix(r.OptInstID, r.Uly+"-")
+	}
+	amt := "—"
+	if d.SuggestedAmt > 0 {
+		amt = fmt.Sprintf("%.0f %s", d.SuggestedAmt, r.InvestCcy)
+	}
+	// 无买盘时算不出期权 APR / 差值，显示 — 而不是 0.00%。
+	optApr, diff := "—", "—"
+	if r.OptBidPx != "" {
+		optApr = pct(r.OptAPR)
+		diff = diffCell(r.Diff)
+	}
+	return table.Row{
+		decisionLabel(d),
+		product,
+		r.ExpTime.UTC().Format("2006-01-02"),
+		strategy.OptTypeName(r.OptType),
+		shortSettle(strategy.SettleKind(r.OptSettleCcy, r.OptInstID)),
+		fmt.Sprintf("%.0f", r.Strike),
+		distCell(r.Strike, a.snap.SpotPrice),
+		bidCell(r.OptBidPx),
+		pct(r.DcyAPR), optApr, diff,
+		fmt.Sprintf("%.0f", r.Days),
+		amt,
+	}
+}
+
+// chainRow 参考视图：完整卖方有效期权链；有 DCY 对应档时同时给出
+// DCY APR 与差值（列数与 chainColumnsFor 一致）。
+func (a App) chainRow(or strategy.OptionRow) table.Row {
+	apr := "—"
+	if or.APRValid {
+		apr = pct(or.OptAPR)
+	}
+	name := or.InstID
+	dcyApr, diff := "—", "—"
+	if d, ok := a.dcyForOpt(or.InstID); ok {
+		name += hintStyle.Render(" ←DCY")
+		dcyApr = pct(d.Row.DcyAPR)
+		if or.APRValid {
+			diff = diffCell(or.OptAPR - d.Row.DcyAPR)
+		}
+	}
+	return table.Row{
+		optionLabel(or),
+		name,
+		strategy.InstExpiryDay(or.InstID),
+		strategy.OptTypeName(or.OptType),
+		shortSettle(strategy.SettleKind(or.SettleCcy, or.InstID)),
+		fmt.Sprintf("%.0f", or.Strike),
+		distCell(or.Strike, or.SpotPx),
+		bidCell(or.BidPx),
+		lastCell(or.LastPx),
+		apr, dcyApr, diff,
+		fmt.Sprintf("%.0f", or.Days),
+	}
 }
 
 // dcyForOpt 找出与该期权合约对齐的 DCY 决策（无则 ok=false）。
@@ -1930,8 +2279,40 @@ func distCell(strike, spot float64) string {
 	return fmt.Sprintf("%+.2f%%", (strike-spot)/spot*100)
 }
 
+// toStrikeCell 行权价相对现价还要跌/涨多少：PUT 看跌幅（安全垫），
+// CALL 看涨幅；已越过行权价（实值方向）显示「已穿过」。
+func toStrikeCell(optType rune, strike, spot float64) string {
+	if spot <= 0 || strike <= 0 {
+		return "到行权 —"
+	}
+	d := (strike - spot) / spot * 100
+	switch optType {
+	case 'P', 'p':
+		drop := -d
+		if drop >= 0 {
+			return fmt.Sprintf("需跌 %.2f%%", drop)
+		}
+		return fmt.Sprintf("已穿过行权 %.2f%%", -drop)
+	case 'C', 'c':
+		if d >= 0 {
+			return fmt.Sprintf("需涨 %.2f%%", d)
+		}
+		return fmt.Sprintf("已穿过行权 %.2f%%", -d)
+	}
+	return "到行权 —"
+}
+
 // bidCell 买一价（权利金原始串）；无买盘时显示 —，表示暂不可卖出。
 func bidCell(v string) string {
+	if strings.TrimSpace(v) == "" {
+		return "—"
+	}
+	return v
+}
+
+// lastCell 最新成交价：无买卖盘但成交过的档位（如 _UM 冷门行权价）也把价格
+// 展示出来，避免整行看起来「没有价格」。
+func lastCell(v string) string {
 	if strings.TrimSpace(v) == "" {
 		return "—"
 	}
@@ -1984,16 +2365,17 @@ func (a App) tableColumns(totalWidth int) []table.Column {
 }
 
 // chainColumnsFor 期权链参考视图的列宽：合约列吃掉剩余宽度。
+// 固定列 78 + 2×列数（13 列），与决策页同口径，120 宽终端刚好铺满。
 func chainColumnsFor(totalWidth int) []table.Column {
-	const ncol = 12
+	const ncol = 13
 	if totalWidth <= 0 {
 		totalWidth = 132
 	}
 	budget := totalWidth - 2*ncol
-	const fixed = 8 + 11 + 4 + 5 + 8 + 8 + 8 + 8 + 8 + 6 + 3 // 操作/到期/方向/本位/行权/距现价/买价/期权APR/DCY/差/天
+	const fixed = 8 + 11 + 4 + 5 + 7 + 7 + 7 + 7 + 7 + 7 + 5 + 3 // 操作/到期/方向/本位/行权/距现价/买价/最新/期权APR/DCY/差/天
 	contract := budget - fixed
-	if contract < 18 {
-		contract = 18
+	if contract < 16 {
+		contract = 16
 	}
 	if contract > 40 {
 		contract = 40
@@ -2004,12 +2386,13 @@ func chainColumnsFor(totalWidth int) []table.Column {
 		{Title: "到期(UTC)", Width: 11},
 		{Title: "方向", Width: 4},
 		{Title: "本位", Width: 5},
-		{Title: "行权价", Width: 8},
-		{Title: "距现价%", Width: 8},
-		{Title: "买价", Width: 8},
-		{Title: "期权APR", Width: 8},
-		{Title: "DCY APR", Width: 8},
-		{Title: "差%", Width: 6},
+		{Title: "行权价", Width: 7},
+		{Title: "距现价%", Width: 7},
+		{Title: "买价", Width: 7},
+		{Title: "最新", Width: 7},
+		{Title: "期权APR", Width: 7},
+		{Title: "DCY APR", Width: 7},
+		{Title: "差%", Width: 5},
 		{Title: "天", Width: 3},
 	}
 }

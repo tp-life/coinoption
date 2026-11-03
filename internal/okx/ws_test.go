@@ -3,8 +3,11 @@ package okx
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -123,4 +126,61 @@ func TestStreamTickersReconnectsAndResubscribes(t *testing.T) {
 		t.Fatalf("connections = %d, want >=2", got)
 	}
 	cancel()
+}
+
+// 回归（2026-11 用户反馈）：「一直 WS 重连中」而 REST 正常。
+// REST 走 http.Client 默认 Transport 会跟随 HTTPS_PROXY，WS 的 Dialer 此前
+// 只是 `&websocket.Dialer{...}`，Proxy 为 nil 直接裸连，于是在只配环境变量
+// 代理的环境里永远握手失败。用子进程隔离，绕开 ProxyFromEnvironment 的
+// 进程级环境缓存（sync.Once，测试进程内 t.Setenv 可能不生效）。
+func TestWSDialerUsesEnvironmentProxy(t *testing.T) {
+	if os.Getenv("COINOPTION_WS_PROXY_HELPER") == "1" {
+		c := NewClient()
+		req, err := http.NewRequest(http.MethodGet, "https://ws.okx.com/ws/v5/public", nil)
+		if err != nil {
+			fmt.Printf("REQ_ERR=%v\n", err)
+			return
+		}
+		u, err := c.wsDialer().Proxy(req)
+		if err != nil {
+			fmt.Printf("PROXY_ERR=%v\n", err)
+			return
+		}
+		if u == nil {
+			fmt.Println("PROXY=<nil>")
+			return
+		}
+		fmt.Printf("PROXY=%s\n", u)
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestWSDialerUsesEnvironmentProxy$")
+	cmd.Env = append(os.Environ(),
+		"COINOPTION_WS_PROXY_HELPER=1",
+		"HTTPS_PROXY=http://127.0.0.1:7890",
+		"HTTP_PROXY=", "ALL_PROXY=", "NO_PROXY=", "no_proxy=",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("helper 进程失败: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "PROXY=http://127.0.0.1:7890") {
+		t.Fatalf("WS dialer 未跟随 HTTPS_PROXY（会一直重连中）: %s", out)
+	}
+}
+
+// 显式 --proxy 必须优先于环境变量。
+func TestWSDialerPrefersExplicitProxy(t *testing.T) {
+	c := NewClient(WithProxy("socks5://127.0.0.1:1080"))
+	req, err := http.NewRequest(http.MethodGet, "https://ws.okx.com/ws/v5/public", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	u, err := c.wsDialer().Proxy(req)
+	if err != nil {
+		t.Fatalf("proxy func: %v", err)
+	}
+	if u == nil || u.String() != "socks5://127.0.0.1:1080" {
+		t.Fatalf("显式代理应优先，实际 %v", u)
+	}
 }

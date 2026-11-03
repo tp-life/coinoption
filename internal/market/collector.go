@@ -97,12 +97,11 @@ func FetchWith(c *okx.Client, dcyUly string, p strategy.Params) (*Snapshot, erro
 	snapshot.OptionRows = strategy.RankOptions(instruments, tickers, spotMap, time.Now())
 
 	// 4. DCY 产品（尽力而为；无 Key/模拟盘下 401/500 → 降级为纯期权观察）
+	// sfp/dcd 限速 1 req/s（User ID 级）由 okx.Client 统一节流（含重试），
+	// 各调用点无需再自己 sleep——此前 CLI 路径漏写间隔会稳定撞 50011。
 	var dcds []okx.DCDProduct
 	var warns []string
-	for i, ot := range []string{"C", "P"} {
-		if i > 0 {
-			time.Sleep(1100 * time.Millisecond) // sfp/dcd 限速 1 req/s（User ID 级）
-		}
+	for _, ot := range []string{"C", "P"} {
 		prods, err := c.GetDCDProducts(base, "USDT", ot)
 		if err != nil {
 			warns = append(warns, ot+": "+shortErr(err))
@@ -118,6 +117,14 @@ func FetchWith(c *okx.Client, dcyUly string, p strategy.Params) (*Snapshot, erro
 			snapshot.Products[p.ProductID] = p
 		}
 		snapshot.Decisions = strategy.Build(dcds, instruments, tickers, spotMap, time.Now(), p)
+		if len(warns) > 0 {
+			partial := "DCY 部分刷新失败（该方向暂无数据）: " + strings.Join(warns, "; ")
+			if snapshot.Warn != "" {
+				snapshot.Warn += "; " + partial
+			} else {
+				snapshot.Warn = partial
+			}
+		}
 	} else {
 		dcyWarn := "双币赢不可用（需实盘 API Key；模拟盘无金融产品）→ [" + strings.Join(warns, "; ") + "]"
 		if snapshot.Warn != "" {

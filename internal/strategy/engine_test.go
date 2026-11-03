@@ -24,6 +24,15 @@ var (
 	tenorDays   = 365.0 / 25 // = 14.6 年化天数倍数
 )
 
+// netAPRForTest 独立复算「扣普通档 0.03% 手续费」后的年化，用于黄金用例断言。
+func netAPRForTest(gross, days float64) float64 {
+	fee := 0.0003 * 365 / days
+	if cap := 0.07 * gross; cap < fee {
+		fee = cap
+	}
+	return gross - fee
+}
+
 func assertNear(t *testing.T, name string, got, want, tol float64) {
 	t.Helper()
 	if math.Abs(got-want) > tol {
@@ -84,10 +93,21 @@ func goldenTickers() []okx.OptionTicker {
 }
 
 func TestNormalizeYield(t *testing.T) {
-	if got := NormalizeYield(0.0541); got != 0.0541 {
+	// 小数形态（列表接口）
+	if got := NormalizeYield(0.0541, 0.00232413, 25); got != 0.0541 {
 		t.Fatalf("decimal yield should pass through: got %v", got)
 	}
-	assertNear(t, "percent→decimal", NormalizeYield(69.65), 0.6965, 1e-12)
+	// 百分数形态（quote 接口）：69.65% → 0.6965
+	assertNear(t, "percent→decimal", NormalizeYield(69.65, 0.05, 25), 0.6965, 1e-12)
+
+	// >100% 年化不能再被 >1 规则砍成 1%：
+	// 7 天 2% 绝对收益 = 104.2857% 年化，两种量纲都要还原成 1.042857。
+	abs, days := 0.02, 7.0
+	assertNear(t, "104% 小数形态", NormalizeYield(1.042857, abs, days), 1.042857, 1e-6)
+	assertNear(t, "104% 百分数形态", NormalizeYield(104.2857, abs, days), 1.042857, 1e-6)
+
+	// 绝对收益缺失时退回旧规则（>1 视为百分数）。
+	assertNear(t, "fallback percent", NormalizeYield(69.65, 0, 0), 0.6965, 1e-12)
 }
 
 func TestTenorConstant(t *testing.T) {
@@ -107,7 +127,7 @@ func TestCase1OptionBetter(t *testing.T) {
 	}
 	d := ds[0]
 
-	targetOptAPR := (0.02 * goldenSpot) / 54500 * (365.0 / 25)
+	targetOptAPR := netAPRForTest((0.02*goldenSpot)/54500*(365.0/25), 25)
 	assertNear(t, "optAPR", d.Row.OptAPR, targetOptAPR, 1e-9)
 	assertNear(t, "dcyAPR", d.Row.DcyAPR, 0.0541, 1e-12)
 
@@ -131,7 +151,7 @@ func TestCase2DCYBetter(t *testing.T) {
 		map[string]float64{"BTC": goldenSpot}, goldenNow, DefaultParams())
 	d := ds[0]
 
-	targetOptAPR := (0.012 * goldenSpot) / 77000 * (365.0 / 25)
+	targetOptAPR := netAPRForTest((0.012*goldenSpot)/77000*(365.0/25), 25)
 	assertNear(t, "optAPR", d.Row.OptAPR, targetOptAPR, 1e-9)
 
 	wantDiff := targetOptAPR - 0.0541 // ≈ 0.0697
@@ -146,12 +166,23 @@ func TestCase2DCYBetter(t *testing.T) {
 	}
 }
 
-// Case3：DCY 产品的到期日在期权链上没有同期（±1 天）产品 → 不可对齐 no_option_quote。
-func TestCase3NoOptionQuote(t *testing.T) {
-	// 45 天后的到期日，黄金 fixture 的期权链只有 25 天到期，无任何匹配候选
+// Case3：期限窗口外的产品（45 天）即使期权链没有同期合约，也应先报 out_of_tenor，
+// 而不是被「无期权报价」掩盖。
+func TestCase3OutOfTenor(t *testing.T) {
 	dcd := goldenDCDProduct("BTC-USDT-260511-54500-P", "P", 54500)
 	dcd.ExpTime = okx.FlexInt(goldenExpMS + int64(45*86400*1000))
 	ds := Build([]okx.DCDProduct{dcd}, goldenInstruments(), goldenTickers(),
+		map[string]float64{"BTC": goldenSpot}, goldenNow, DefaultParams())
+	d := ds[0]
+	if d.Action != ActionNone || d.ReasonCode != "out_of_tenor" {
+		t.Fatalf("want none/out_of_tenor, got %s/%s", d.Action, d.ReasonCode)
+	}
+}
+
+// Case3b：期限窗口内但期权链完全没有同向合约 → no_option_quote。
+func TestCase3NoOptionQuote(t *testing.T) {
+	dcd := goldenDCDProduct("BTC-USDT-260327-54500-P", "P", 54500)
+	ds := Build([]okx.DCDProduct{dcd}, goldenInstruments(), nil,
 		map[string]float64{"BTC": goldenSpot}, goldenNow, DefaultParams())
 	d := ds[0]
 	if d.Action != ActionUnaligned || d.ReasonCode != "no_option_quote" {
@@ -192,7 +223,7 @@ func TestUSDTMarginedVariantMatches(t *testing.T) {
 	if len(rows) != 1 || !rows[0].OptMatched {
 		t.Fatalf("_UM variant should match: %+v", rows)
 	}
-	target := 1200.0 / 54500 * (365.0 / 25) // 无 spot 乘数
+	target := netAPRForTest(1200.0/54500*(365.0/25), 25) // 无 spot 乘数
 	assertNear(t, "optAPR(USDT)", rows[0].OptAPR, target, 1e-9)
 }
 
@@ -259,6 +290,42 @@ func TestNearestStrikeBeatsDeepITM(t *testing.T) {
 	if r.StrikeErrPct != 0 {
 		t.Fatalf("exact strike should give zero gap: %.6f", r.StrikeErrPct)
 	}
-	target := (0.023 * goldenSpot) / 80000 * (365.0 / 25)
+	target := netAPRForTest((0.023*goldenSpot)/80000*(365.0/25), 25)
 	assertNear(t, "optAPR", r.OptAPR, target, 1e-9)
+}
+
+// 只差结算时刻（同一天 16:00 vs 08:00）算精确；跨到相邻日期就不再可执行，
+// 否则等于用另一份到期日的合约权利金比 APR。
+func TestBuildRequiresSameExpiryDate(t *testing.T) {
+	dcd := goldenDCDProduct("BTC-USDT-260327-54500-P", "P", 54500)
+	dcd.ExpTime = okx.FlexInt(goldenExpMS + 16*3600*1000) // 期权 03-27 08:00 → DCY 03-28 00:00
+	ds := Build([]okx.DCDProduct{dcd}, goldenInstruments(), goldenTickers(),
+		map[string]float64{"BTC": goldenSpot}, goldenNow, DefaultParams())
+	d := ds[0]
+	if d.Row.OptExact {
+		t.Fatalf("相邻日期不应是精确到期: %+v", d.Row)
+	}
+	if d.Action != ActionUnaligned || d.ReasonCode != "no_exact_contract" {
+		t.Fatalf("want unaligned/no_exact_contract, got %s/%s", d.Action, d.ReasonCode)
+	}
+}
+
+// 双门槛：年化差 ≥20pp 但一笔实际收益差 <0.5%（如 7 天 20pp=0.38%）时不出手；
+// 同样年化差在 30 天期限（2.05%）则允许。
+func TestDecideRequiresAbsoluteEdge(t *testing.T) {
+	row := MatchRow{
+		OptMatched: true, OptExact: true, OptBidPx: "0.01", OptType: 'P',
+		Strike: 60000, Spot: 60000, InvestCcy: "USDT",
+		DcyAPR: 0.2, OptAPR: 0.45, Diff: 0.25, Days: 7,
+	}
+	p := DefaultParams()
+	d := Decide(row, p)
+	if d.Action != ActionSubscribeDual || d.ReasonCode != "edge_abs_small" {
+		t.Fatalf("7 天 25pp（0.48%%）应放弃期权: %s/%s", d.Action, d.ReasonCode)
+	}
+	row.Days = 30
+	d = Decide(row, p)
+	if d.Action != ActionBuyOption {
+		t.Fatalf("30 天 25pp（2.05%%）应押注期权: %s/%s", d.Action, d.ReasonCode)
+	}
 }

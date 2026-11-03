@@ -3,6 +3,7 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -65,6 +66,18 @@ func (e *Executor) Client() *okx.Client { return e.client }
 // State 风控状态快照。
 func (e *Executor) State() GuardState { return e.guard.Snapshot() }
 
+// AutoFailures 最近的自动执行失败记录（旧 → 新，最多 store.AutoFailureLimit 条）。
+func (e *Executor) AutoFailures() ([]store.AutoFailure, error) { return e.st.LoadAutoFailures() }
+
+// RecordAutoFailure 记录一条自动执行失败（落盘，环形保留最近 10 条）。
+func (e *Executor) RecordAutoFailure(f store.AutoFailure) error { return e.st.RecordAutoFailure(f) }
+
+// SetCapital 运行期调整资金总额（Web 设置页保存后立即生效）：
+// 总敞口 = 资金总额，单笔上限 = 资金总额 × 40%，并发/日限保持不变。
+func (e *Executor) SetCapital(capitalUSDT float64) {
+	e.guard.SetLimits(e.guard.Snapshot().Limits.WithCapital(capitalUSDT))
+}
+
 // SpotOf 币种现价（结算基准 / 审计展示用）。
 func (e *Executor) SpotOf(ccy string) (float64, error) { return e.toUSDT(1, ccy) }
 
@@ -104,11 +117,10 @@ type optPlan struct {
 	bid     float64
 	px      float64 // 挂价（限价=limPx 或 bid）
 	strike  float64
-	ctVal   float64
-	mult    float64 // ctMult（_UM=0.01；未给=1）
+	ctVal   float64 // 每张合约对应的标的数量 = ctVal × ctMult（BTC 0.01 / ETH 0.1）
 	base    string  // 名义币（ctValCcy，退 instId 前缀）
-	expUSDT float64 // 卖方敞口（风控口径）
-	prem    float64 // 每张权利金（结算币口径）= px × ctVal × mult
+	expUSDT float64 // 卖方敞口（风控口径）= sz × ctVal × 现货
+	prem    float64 // 每张权利金（结算币口径）= px × ctVal
 }
 
 // SubmitOption 卖出期权。sz 张数；limPx>0 用限价，>0 未给时以当前 bid 追卖。
@@ -119,10 +131,60 @@ func (e *Executor) SubmitOption(instID string, sz, limPx float64) (Outcome, erro
 	if err != nil {
 		return Outcome{}, err
 	}
+	return e.submitOptionPlan(p, sz)
+}
+
+// SubmitOptionChecked 与 SubmitOption 相同，但会用最新 bid 重算卖方 APR，
+// 低于 minAPR 时放弃（自动执行防止“1 秒前的决策、下单时 edge 已消失”）。
+func (e *Executor) SubmitOptionChecked(instID string, sz, limPx, minAPR float64) (Outcome, error) {
+	p, err := e.optPrecheck(instID, sz, limPx)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if minAPR > 0 {
+		apr, err := e.optionAPROf(p)
+		if err != nil {
+			return Outcome{}, fmt.Errorf("复核卖方 APR 失败: %w", err)
+		}
+		if apr < minAPR {
+			return Outcome{}, fmt.Errorf("行情变动：当前卖方 APR %.2f%% 低于要求 %.2f%%，已放弃",
+				apr*100, minAPR*100)
+		}
+	}
+	return e.submitOptionPlan(p, sz)
+}
+
+func (e *Executor) submitOptionPlan(p optPlan, sz float64) (Outcome, error) {
 	if e.mode == ModeSimLocal {
 		return e.placeOptionSim(p, sz)
 	}
 	return e.placeOptionAPI(p, sz)
+}
+
+// optionAPROf 用 plan 里的最新价/元数据复算卖方 APR（与 strategy 同口径）。
+func (e *Executor) optionAPROf(p optPlan) (float64, error) {
+	expMS, err := strconv.ParseInt(p.inst.ExpTime, 10, 64)
+	if err != nil || expMS <= 0 {
+		return 0, fmt.Errorf("到期时间缺失")
+	}
+	spot := 0.0
+	if strategy.SettleKind(p.inst.SettleCcy, p.inst.InstID) == 'B' {
+		spot, err = e.toUSDT(1, p.base)
+		if err != nil {
+			return 0, err
+		}
+	}
+	q := strategy.OptQuote{
+		InstID:    p.inst.InstID,
+		OptType:   rune(p.inst.OptType[0]),
+		Strike:    p.strike,
+		Expiry:    time.UnixMilli(expMS).UTC(),
+		BidPx:     strconv.FormatFloat(p.px, 'f', -1, 64),
+		CtVal:     p.ctVal,
+		SettleCcy: p.inst.SettleCcy,
+	}
+	apr, _, err := strategy.ShortOptionAPR(q, spot, time.Now().UTC())
+	return apr, err
 }
 
 func (e *Executor) optPrecheck(instID string, sz, limPx float64) (optPlan, error) {
@@ -140,6 +202,21 @@ func (e *Executor) optPrecheck(instID string, sz, limPx float64) (optPlan, error
 	base := ins.CtValCcy
 	if base == "" {
 		base = strings.Split(instID, "-")[0]
+	}
+	// OKX 期权的 1 张名义 = ctVal × ctMult：BTC 0.01、ETH 0.1。
+	// 只乘 ctVal 会把卖方敞口、权利金、纸面结算全部放大 100 倍（BTC）/
+	// 10 倍（ETH），默认单笔 2000 USDT 会因此拒掉每一张期权单。
+	mult := 1.0
+	if ins.CtMult != "" {
+		if m, err := strconv.ParseFloat(ins.CtMult, 64); err == nil && m > 0 {
+			mult = m
+		}
+	}
+	if ctVal > 0 && mult > 0 {
+		ctVal *= mult
+	}
+	if ctVal <= 0 {
+		return optPlan{}, fmt.Errorf("期权合约乘数缺失（ctVal=%q ctMult=%q）", ins.CtVal, ins.CtMult)
 	}
 	tks, err := e.client.GetTicker(instID)
 	if err != nil {
@@ -166,21 +243,14 @@ func (e *Executor) optPrecheck(instID string, sz, limPx float64) (optPlan, error
 			strike = parseFloatz(segs[len(segs)-2])
 		}
 	}
-	mult := 1.0
-	if ins.CtMult != "" {
-		if m, err := strconv.ParseFloat(ins.CtMult, 64); err == nil && m > 0 {
-			mult = m
-		}
-	}
-	// 敞口（风控口径）≈ 合约名义 = sz × ctVal × 现货份：
-	//   实测 BTC 期权（币本位/UM）单张名义均为 ctVal=1 BTC，行权价只是结算基准，
-	//   卖方风险敞口锚定合约名义现货值。
+	// 敞口（风控口径）≈ 合约名义 = sz × 每张标的数量 × 现货：
+	//   BTC 期权 1 张 = 0.01 BTC、ETH = 0.1 ETH（ctVal × ctMult）。
 	expUSDT, err := e.toUSDT(sz*ctVal, base)
 	if err != nil {
 		return optPlan{}, fmt.Errorf("卖方敞口折算: %w", err)
 	}
 	return optPlan{
-		inst: ins, bid: bid, px: px, strike: strike, ctVal: ctVal, mult: mult,
+		inst: ins, bid: bid, px: px, strike: strike, ctVal: ctVal,
 		base: base, expUSDT: expUSDT, prem: px * ctVal,
 	}, nil
 }
@@ -286,9 +356,10 @@ func (e *Executor) SubmitDCD(p okx.DCDProduct, amt float64) (Outcome, error) {
 			invest = p.QuoteCcy
 		}
 	}
-	amtUSDT, err := e.toUSDT(amt, invest)
-	if err != nil {
-		return Outcome{}, err
+	// 申购截止：快照可能来自缓存/上一轮，晚到会直接下错单。
+	if p.TradeEndTime > 0 && time.Now().UnixMilli() > int64(p.TradeEndTime) {
+		return Outcome{}, fmt.Errorf("产品已过申购截止（%s）",
+			time.UnixMilli(int64(p.TradeEndTime)).Local().Format("01-02 15:04"))
 	}
 	// 产品规模区间（产品级规则先于资金风控）
 	if p.MinSize > 0 && amt < float64(p.MinSize) {
@@ -296,7 +367,18 @@ func (e *Executor) SubmitDCD(p okx.DCDProduct, amt float64) (Outcome, error) {
 	}
 	if p.MaxSize > 0 && amt > float64(p.MaxSize) {
 		amt = float64(p.MaxSize)
-		amtUSDT, _ = e.toUSDT(amt, invest)
+	}
+	// 申购步长：不足一步会被 OKX 拒绝；向下取整到 stepSz 的整数倍。
+	if step := float64(p.StepSz); step > 0 {
+		amt = math.Floor(amt/step+1e-9) * step
+		amt = math.Round(amt*1e8) / 1e8
+	}
+	if amt <= 0 || (p.MinSize > 0 && amt < float64(p.MinSize)) {
+		return Outcome{}, fmt.Errorf("扣除步长后低于产品最小申购 %.2f %s", float64(p.MinSize), invest)
+	}
+	amtUSDT, err := e.toUSDT(amt, invest)
+	if err != nil {
+		return Outcome{}, err
 	}
 	if e.mode == ModeLive && e.client != nil {
 		return e.submitDCDLive(p, amt, amtUSDT, invest)
@@ -322,6 +404,16 @@ func (e *Executor) submitDCDLive(p okx.DCDProduct, amt, amtUSDT float64, invest 
 		return Outcome{}, fmt.Errorf("报价失败: %w", err)
 	}
 	q := qs[0]
+	// 报价是最终成交口径：若实时绝对收益明显低于快照（行情/额度变化），
+	// 不再按过期决策下单。
+	if p.AbsYield > 0 && q.AbsYield > 0 && q.AbsYield < float64(p.AbsYield)*0.995 {
+		e.guard.Release(amtUSDT)
+		_ = e.st.Audit(store.AuditEvent{Event: "error", Subject: p.ProductID,
+			AmtUSDT: amtUSDT, Mode: string(ModeLive),
+			Detail: fmt.Sprintf("报价收益下降：快照 %.6f → 实时 %.6f，放弃申购", float64(p.AbsYield), q.AbsYield)})
+		return Outcome{}, fmt.Errorf("实时报价绝对收益 %.6f 低于快照 %.6f，放弃本次申购",
+			q.AbsYield, float64(p.AbsYield))
+	}
 	res, err := e.client.PostDCDTrade(q.QuoteID)
 	if err != nil {
 		e.guard.Release(amtUSDT)

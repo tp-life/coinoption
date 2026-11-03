@@ -36,20 +36,21 @@ type Live struct {
 	tickers     map[string]okx.OptionTicker
 	spot        okx.SpotTicker
 	dcds        []okx.DCDProduct
+	dcdByDir    map[string][]okx.DCDProduct // 按方向（C/P）保留最近一次成功结果
 	products    map[string]okx.DCDProduct
 	snap        *Snapshot
 	lastBuild   time.Time
 	dirty       bool
 	chainWarn   []string
 	dcyWarn     string
+	dcdFails    int // 连续失败的 DCY 刷新轮数（用于快速重试退避）
 	wsConnected bool
 	wsStatus    string
+	wsErr       string // 最近一次 WS 断线/握手错误（展示给用户，便于定位代理问题）
 	wsGen       int
 	wsCancel    context.CancelFunc
 	loopCancel  context.CancelFunc
 	closed      bool
-
-	dcdDelay time.Duration // 测试可置 0；生产 1.1s（DCD 限速 1 req/s）
 }
 
 // NewLive 创建实时缓存（尚未启动；Start 负责首次 REST 快照 + WS 订阅）。
@@ -64,7 +65,7 @@ func NewLive(c *okx.Client, uly string, p strategy.Params) *Live {
 		p:        p,
 		instByID: make(map[string]okx.Instrument),
 		tickers:  make(map[string]okx.OptionTicker),
-		dcdDelay: 1100 * time.Millisecond,
+		dcdByDir: make(map[string][]okx.DCDProduct, 2),
 		wsStatus: "connecting",
 	}
 }
@@ -109,7 +110,7 @@ func (l *Live) bootstrap() error {
 	if len(spots) == 0 {
 		return fmt.Errorf("现货行情为空: %s", l.uly)
 	}
-	dcds, dwarn := l.fetchDCD()
+	dcds := l.fetchDCD()
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -117,10 +118,8 @@ func (l *Live) bootstrap() error {
 	l.instByID = indexInstruments(ins)
 	l.tickers = indexTickers(tks)
 	l.spot = spots[0]
-	l.dcds = dcds
-	l.products = indexProducts(dcds)
+	l.applyDCDLocked(dcds)
 	l.chainWarn = append(iwarns, twarns...)
-	l.dcyWarn = dwarn
 	l.snap = l.buildLocked()
 	l.lastBuild = time.Now()
 	return nil
@@ -201,6 +200,11 @@ func (l *Live) buildLocked() *Snapshot {
 	if l.dcyWarn != "" {
 		warns = append(warns, l.dcyWarn)
 	}
+	// WS 断线时把原因带给用户：此前只显示「WS 重连中」，无法判断是代理没
+	// 生效、证书问题还是服务端拒绝，排查全靠猜。
+	if !l.wsConnected && l.wsErr != "" {
+		warns = append(warns, "WS 未连接（行情走 REST 30s 兜底）: "+l.wsErr)
+	}
 	if len(warns) > 0 {
 		snap.Warn = strings.Join(warns, "; ")
 	}
@@ -212,16 +216,41 @@ func (l *Live) refreshLoop(ctx context.Context) {
 	defer slow.Stop()
 	inst := time.NewTicker(5 * time.Minute)
 	defer inst.Stop()
+	// DCY 单独计时：成功 30s 一轮，失败后 5s/10s/20s 快速重试，
+	// 避免首轮失败后整块决策表空等半分钟。
+	dcd := time.NewTimer(l.nextDCDDelay())
+	defer dcd.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-slow.C:
 			l.refreshREST()
-			l.refreshDCD()
 		case <-inst.C:
 			l.refreshInstruments(ctx)
+		case <-dcd.C:
+			l.refreshDCD()
+			dcd.Reset(l.nextDCDDelay())
 		}
+	}
+}
+
+// nextDCDDelay DCY 下一轮刷新间隔：正常 30s；连续失败时退避 5s→10s→20s→30s。
+func (l *Live) nextDCDDelay() time.Duration {
+	l.mu.Lock()
+	fails := l.dcdFails
+	l.mu.Unlock()
+	switch {
+	case fails <= 0:
+		return 30 * time.Second
+	case fails == 1:
+		return 5 * time.Second
+	case fails == 2:
+		return 10 * time.Second
+	case fails == 3:
+		return 20 * time.Second
+	default:
+		return 30 * time.Second
 	}
 }
 
@@ -272,20 +301,57 @@ func (l *Live) refreshREST() {
 }
 
 func (l *Live) refreshDCD() {
-	dcds, warn := l.fetchDCD()
+	res := l.fetchDCD()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if len(dcds) > 0 {
-		l.dcds = dcds
-		l.products = indexProducts(dcds)
-		l.dcyWarn = warn
-	} else if len(l.dcds) > 0 {
-		// 刷新失败但已有旧数据：沿用，避免决策表闪空。
-		l.dcyWarn = "DCY 刷新失败，沿用上次数据: " + warn
-	} else {
-		l.dcyWarn = warn
-	}
+	l.applyDCDLocked(res)
 	l.dirty = true
+}
+
+// dcdResult 单个方向（C/P）的拉取结果；err 非空表示该方向本轮失败。
+type dcdResult struct {
+	products []okx.DCDProduct
+	err      string
+}
+
+// applyDCDLocked 按方向合并结果：
+//   - 成功的方向覆盖本方向缓存（空列表也算成功，代表该方向当前无可售产品）
+//   - 失败的方向沿用上次成功数据，只更新告警文案
+//
+// 此前的实现是「只要任意方向有数据就整体替换」，C 成功/P 失败时 P 方向的
+// 产品会整批从决策表消失（用户观感：明明有的产品没显示），下个周期才回来。
+func (l *Live) applyDCDLocked(res map[string]dcdResult) {
+	if l.dcdByDir == nil {
+		l.dcdByDir = make(map[string][]okx.DCDProduct, 2)
+	}
+	var failDirs []string
+	for _, ot := range []string{"C", "P"} {
+		r := res[ot]
+		if r.err != "" {
+			failDirs = append(failDirs, ot+": "+r.err)
+			continue
+		}
+		l.dcdByDir[ot] = r.products
+	}
+
+	l.dcds = make([]okx.DCDProduct, 0, len(l.dcdByDir["C"])+len(l.dcdByDir["P"]))
+	l.dcds = append(l.dcds, l.dcdByDir["C"]...)
+	l.dcds = append(l.dcds, l.dcdByDir["P"]...)
+	l.products = indexProducts(l.dcds)
+
+	if len(failDirs) > 0 {
+		l.dcdFails++
+	} else {
+		l.dcdFails = 0
+	}
+	switch {
+	case len(failDirs) == 0:
+		l.dcyWarn = ""
+	case len(l.dcds) > 0:
+		l.dcyWarn = "DCY 部分刷新失败，沿用上次数据 → [" + strings.Join(failDirs, "; ") + "]"
+	default:
+		l.dcyWarn = "双币赢不可用（需实盘 API Key；模拟盘无金融产品）→ [" + strings.Join(failDirs, "; ") + "]"
+	}
 }
 
 func (l *Live) refreshInstruments(ctx context.Context) {
@@ -355,12 +421,25 @@ func (l *Live) onWSStatus(gen int, s okx.WSStatus) {
 	switch {
 	case !s.Connected:
 		l.wsStatus = "reconnecting"
+		l.wsErr = trimErr(s.Err)
 	case s.Err != "":
 		l.wsStatus = "degraded"
+		l.wsErr = trimErr(s.Err)
 	default:
 		l.wsStatus = "live"
+		l.wsErr = ""
 	}
 	l.dirty = true
+}
+
+// trimErr 截断错误文案，避免把整段拨号错误塞进页面 meta。
+func trimErr(s string) string {
+	const max = 180
+	s = strings.TrimSpace(s)
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }
 
 func (l *Live) restartWS(ctx context.Context) {
@@ -437,27 +516,20 @@ func (l *Live) fetchTickers() ([]okx.OptionTicker, []string, error) {
 	return tks, warns, nil
 }
 
-func (l *Live) fetchDCD() ([]okx.DCDProduct, string) {
-	var out []okx.DCDProduct
-	var warns []string
-	for i, ot := range []string{"C", "P"} {
-		if i > 0 && l.dcdDelay > 0 {
-			time.Sleep(l.dcdDelay) // sfp/dcd 限速 1 req/s（User ID 级）
-		}
+// fetchDCD 拉取两个方向的在售产品，逐方向独立成败。
+// 端点限速 1 req/s（User ID 级）由 okx.Client 统一节流（含重试），这里不再
+// 手动 sleep——此前各调用点各写一份间隔，CLI 路径漏写就会稳定撞 50011。
+func (l *Live) fetchDCD() map[string]dcdResult {
+	out := make(map[string]dcdResult, 2)
+	for _, ot := range []string{"C", "P"} {
 		prods, err := l.c.GetDCDProducts(l.base, "USDT", ot)
 		if err != nil {
-			warns = append(warns, ot+": "+shortErr(err))
+			out[ot] = dcdResult{err: shortErr(err)}
 			continue
 		}
-		out = append(out, prods...)
+		out[ot] = dcdResult{products: prods}
 	}
-	if len(out) == 0 {
-		return nil, "双币赢不可用（需实盘 API Key；模拟盘无金融产品）→ [" + strings.Join(warns, "; ") + "]"
-	}
-	if len(warns) > 0 {
-		return out, "DCY 部分刷新失败: " + strings.Join(warns, "; ")
-	}
-	return out, ""
+	return out
 }
 
 func indexInstruments(ins []okx.Instrument) map[string]okx.Instrument {

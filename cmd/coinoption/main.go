@@ -20,6 +20,7 @@ import (
 	"github.com/tp/coinoption/internal/executor"
 	"github.com/tp/coinoption/internal/market"
 	"github.com/tp/coinoption/internal/okx"
+	"github.com/tp/coinoption/internal/store"
 	"github.com/tp/coinoption/internal/strategy"
 	"github.com/tp/coinoption/internal/ui"
 	"github.com/tp/coinoption/internal/web"
@@ -56,7 +57,8 @@ func main() {
 	passphrase := flag.String("passphrase", os.Getenv("COINOPTION_PASSPHRASE"), "API Passphrase（环境变量 COINOPTION_PASSPHRASE）")
 	webEnabled := flag.Bool("web", false, "启动 Web 看板（GET /；API：/api/decisions?uly=BTC-USDT&exp=2026-11-06）")
 	webAddr := flag.String("addr", ":8080", "Web 服务监听地址（--web 开启时生效）")
-	webTrade := flag.Bool("web-trade", false, "Web 看板启用手动下单（默认只读；live 模式会提交真实订单）")
+	webCode := flag.String("web-code", os.Getenv("COINOPTION_WEB_CODE"), "Web 授权码（整站访问控制；不传则读取 settings.json，首次自动生成并打印；也可用环境变量 COINOPTION_WEB_CODE）")
+	readOnly := flag.Bool("read-only", false, "Web 看板只读（不装配执行器、不自动交易）；默认开启交易，自动交易沿用 settings.json（默认关闭）")
 	wsEnabled := flag.Bool("ws", true, "启用 OKX WebSocket 实时行情（断线自动重连；--ws=false 回退 REST 轮询）")
 	flag.Parse()
 
@@ -108,13 +110,14 @@ func main() {
 		}
 	case *webEnabled:
 		// Web 展示服务：决策看板页 + JSON API。
-		// --web-trade 时装配 executor（复用与 TUI 相同的风控/审计/模式路由），
-		// 否则保持只读，避免默认暴露下单入口。
+		// 默认装配 executor（复用与 TUI 相同的风控/审计/模式路由）；
+		// --read-only 时保持只读，只看看板。整站启用授权码。
 		var (
 			client *okx.Client
 			ex     *executor.Executor
+			st     *store.Store
 		)
-		if *webTrade {
+		if !*readOnly {
 			cli := cliExec{
 				mode: *mode, proxy: *proxy,
 				apiKey: *apiKey, secret: *secret, passphrase: *passphrase,
@@ -127,13 +130,14 @@ func main() {
 				os.Exit(1)
 			}
 			client = ex.Client()
+			st = ex.Store()
 			if ex.Mode() == executor.ModeLive {
 				if msg, err := ex.SyncLiveGuard(); err != nil {
 					fmt.Fprintf(os.Stderr, "[warn] 平台仓位恢复失败: %v\n", err)
 				} else {
 					fmt.Fprintln(os.Stderr, "[restore]", msg)
 				}
-				fmt.Fprintln(os.Stderr, "⚠ Web 实盘下单已启用：任何能访问该端口的人都能提交真实订单")
+				fmt.Fprintln(os.Stderr, "⚠ Web 实盘下单已启用：获得授权码的人都能提交真实订单")
 			}
 			if host, _, err := net.SplitHostPort(*webAddr); err == nil &&
 				(host == "" || host == "0.0.0.0" || host == "::") {
@@ -141,23 +145,89 @@ func main() {
 			}
 		} else {
 			client = buildClient(*proxy, *apiKey, *secret, *passphrase, *demo)
+			var err error
+			st, err = store.New(*storeDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "数据目录不可用: %v\n", err)
+				os.Exit(1)
+			}
 		}
+		settings, err := st.LoadSettings()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[warn] 读取 settings.json 失败，使用默认值: %v\n", err)
+			settings = store.DefaultSettings()
+		}
+
 		fetcher := &market.Fetcher{C: client, UseWS: *wsEnabled}
 		defer fetcher.Close()
-		opts := make([]web.ServerOption, 0, 1)
+		opts := make([]web.ServerOption, 0, 8)
+		opts = append(opts, web.WithSettingsStore(st), web.WithAutoFailures(st))
+
+		// 授权码优先级：--web-code / COINOPTION_WEB_CODE > settings.json 摘要 > 随机生成。
+		switch {
+		case strings.TrimSpace(*webCode) != "":
+			code := strings.TrimSpace(*webCode)
+			opts = append(opts, web.WithAuthCode(code))
+			if h := web.HashCode(code); settings.WebAuthCodeHash != h {
+				settings.WebAuthCodeHash = h
+				if err := st.SaveSettings(settings); err != nil {
+					fmt.Fprintf(os.Stderr, "[warn] 授权码摘要保存失败: %v\n", err)
+				}
+			}
+			fmt.Fprintln(os.Stderr, "🔑 Web 授权码：使用 --web-code / COINOPTION_WEB_CODE 指定的值")
+		case settings.WebAuthCodeHash != "":
+			opts = append(opts, web.WithAuthHash(settings.WebAuthCodeHash))
+			fmt.Fprintln(os.Stderr, "🔑 Web 授权码：已启用（settings.json 中的摘要）")
+		default:
+			code, gerr := web.GenerateAuthCode()
+			if gerr != nil {
+				fmt.Fprintf(os.Stderr, "生成 Web 授权码失败: %v\n", gerr)
+				os.Exit(1)
+			}
+			settings.WebAuthCodeHash = web.HashCode(code)
+			if err := st.SaveSettings(settings); err != nil {
+				fmt.Fprintf(os.Stderr, "[warn] 授权码摘要保存失败（下次启动会重新生成）: %v\n", err)
+			}
+			opts = append(opts, web.WithAuthCode(code))
+			fmt.Printf("🔑 Web 授权码（首次生成）: %s\n", code)
+		}
+
 		if ex != nil {
-			opts = append(opts, web.WithTrader(ex))
+			// 自动交易默认关闭（与 TUI 一致）；开启后落盘 settings.json，
+			// sim 模式重启沿用，live 模式启动仍强制关闭（必须在页面当次确认）。
+			autoDefault := ex.Mode() != executor.ModeLive && settings.AutoTrade
+			if ex.Mode() == executor.ModeLive && settings.AutoTrade {
+				settings.AutoTrade = false
+				_ = st.SaveSettings(settings)
+				fmt.Fprintln(os.Stderr, "⚠ 实盘启动：自动交易已强制关闭，需在 Web 设置页当次开启")
+			}
+			p := strategy.DefaultParams()
+			p.MinOptionEdge = settings.MinOptionEdgePP / 100
+			p.MinAbsEdge = settings.MinAbsEdgePct / 100
+			p.MaxStrikeGapPct = settings.MaxStrikeGapPct
+			p.AutoMinDiff = settings.MinDiffPct / 100
+			if lim := ex.State().Limits.PerOrderUSDT; lim > 0 {
+				p.CapitalCap = lim
+			}
+			opts = append(opts, web.WithTrader(ex), web.WithAutoTrade(autoDefault), web.WithAutoParams(p))
 		}
 		srv := web.New(fetcher, *uly, *webAddr, opts...)
 		tradeTxt := "只读"
 		if ex != nil {
-			tradeTxt = "手动下单已启用（" + string(ex.Mode()) + "）"
+			tradeTxt = "交易已启用（" + string(ex.Mode()) + "）"
+			if ex.Mode() == executor.ModeLive {
+				tradeTxt += " · 自动交易默认暂停，请在设置页开启"
+			} else if settings.AutoTrade {
+				tradeTxt += " · 自动交易已开启"
+			} else {
+				tradeTxt += " · 自动交易关闭（设置页可开启）"
+			}
 		}
 		display := *webAddr
 		if strings.HasPrefix(display, ":") {
 			display = "0.0.0.0" + display
 		}
-		fmt.Printf("web 服务已启动: http://%s  (GET / 看板 / GET /api/decisions / %s)\n", display, tradeTxt)
+		fmt.Printf("web 服务已启动: http://%s  （整站需授权码；GET / 看板 / GET /api/decisions / %s）\n", display, tradeTxt)
 		if err := srv.ListenAndServe(); err != nil {
 			fmt.Fprintf(os.Stderr, "web server failed: %v\n", err)
 			os.Exit(1)

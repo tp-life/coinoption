@@ -22,14 +22,16 @@ type fakeFetcher struct{ snap *market.Snapshot }
 func (f fakeFetcher) FetchSnapshot(string) (*market.Snapshot, error) { return f.snap, nil }
 
 type fakeExec struct {
-	optCalls  int
-	dcdCalls  int
-	lastInst  string
-	lastSz    float64
-	lastDCD   okx.DCDProduct
-	auditRows []store.AuditEvent
-	mode      executor.Mode
-	settings  store.Settings
+	optCalls     int
+	dcdCalls     int
+	lastInst     string
+	lastSz       float64
+	lastDCD      okx.DCDProduct
+	auditRows    []store.AuditEvent
+	autoFailRows []store.AutoFailure
+	fail         error
+	mode         executor.Mode
+	settings     store.Settings
 }
 
 func (f *fakeExec) Mode() executor.Mode {
@@ -53,12 +55,29 @@ func (f *fakeExec) SaveSettings(v store.Settings) error {
 func (f *fakeExec) SubmitOption(instID string, sz, lim float64) (executor.Outcome, error) {
 	f.optCalls++
 	f.lastInst, f.lastSz = instID, sz
+	if f.fail != nil {
+		return executor.Outcome{}, f.fail
+	}
 	return executor.Outcome{Detail: "paper sell ok", Sim: true}, nil
+}
+
+func (f *fakeExec) SubmitOptionChecked(instID string, sz, lim, minAPR float64) (executor.Outcome, error) {
+	return f.SubmitOption(instID, sz, lim)
 }
 func (f *fakeExec) SubmitDCD(p okx.DCDProduct, amt float64) (executor.Outcome, error) {
 	f.dcdCalls++
 	f.lastDCD = p
+	if f.fail != nil {
+		return executor.Outcome{}, f.fail
+	}
 	return executor.Outcome{Detail: "paper dcd ok", Sim: true}, nil
+}
+
+func (f *fakeExec) AutoFailures() ([]store.AutoFailure, error) { return f.autoFailRows, nil }
+
+func (f *fakeExec) RecordAutoFailure(fa store.AutoFailure) error {
+	f.autoFailRows = store.PushAutoFailure(f.autoFailRows, fa, time.Now())
+	return nil
 }
 func (f *fakeExec) Positions() (executor.PositionsView, error) {
 	return executor.PositionsView{
@@ -682,13 +701,52 @@ func TestTUIColumnsFitWidth(t *testing.T) {
 	app, _ := bootApp(t)
 	m, _ := app.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	app = m.(App)
-	total := 0
-	for _, c := range app.table.Columns() {
-		total += c.Width + 2 // 单元格左右内边距各 1
+	fit := func(view string) {
+		total := 0
+		for _, c := range app.table.Columns() {
+			total += c.Width + 2 // 单元格左右内边距各 1
+		}
+		if total > 120 {
+			t.Fatalf("%s视图在终端 120 宽时列宽总和 %d 超宽", view, total)
+		}
 	}
-	if total > 120 {
-		t.Fatalf("终端 120 宽时列宽总和 %d 超宽", total)
+	fit("决策")
+	// 期权链视图多一列「最新」，同样必须在 120 宽内铺得下。
+	m, _ = app.Update(key('2'))
+	app = m.(App)
+	fit("期权链")
+}
+
+// 每行单元格数必须与列数一致：少了会被 bubbles table 静默错位，
+// 期权链新增「最新」列后尤其容易漏。
+func TestTUIRowCellsMatchColumns(t *testing.T) {
+	app, _ := bootApp(t)
+	check := func(view string) {
+		cols := len(app.table.Columns())
+		rows := app.table.Rows()
+		if len(rows) == 0 {
+			t.Fatalf("%s视图没有行，测试数据失效", view)
+		}
+		for i, r := range rows {
+			if len(r) != cols {
+				t.Fatalf("%s视图第 %d 行有 %d 个单元格，列数 %d", view, i, len(r), cols)
+			}
+		}
 	}
+	check("决策")
+
+	// 测试快照默认没有期权链，补一条「仅 last 价」的 _UM 合约再验期权链视图。
+	snap := buildTestSnap()
+	snap.OptionRows = []strategy.OptionRow{{
+		InstID: "BTC-USD_UM-261113-70000-P", Uly: "BTC-USD_UM", OptType: 'P',
+		Strike: 70000, BidPx: "", AskPx: "", LastPx: "260",
+		Days: 10, SettleCcy: "USD", SpotPx: 76000,
+	}}
+	m, _ := app.Update(snapMsg{snap: snap})
+	app = m.(App)
+	m, _ = app.Update(key('2'))
+	app = m.(App)
+	check("期权链")
 }
 
 // ─── Settings / 自动执行 ───
@@ -758,8 +816,14 @@ func TestTUIAutoExecutesDCDCandidate(t *testing.T) {
 	if fe.dcdCalls != 1 || fe.lastDCD.ProductID != "BTC-USDT-261106-80000-P" {
 		t.Fatalf("应自动申购 DCY: calls=%d prod=%s", fe.dcdCalls, fe.lastDCD.ProductID)
 	}
-	if app.autoCount != 1 || app.autoNote == "" {
-		t.Fatalf("自动执行计数/说明未记录: %+v", app.autoNote)
+	if app.autoNote == "" {
+		t.Fatalf("自动执行说明未记录")
+	}
+	// 成功回执后才计入次数并写去重表。
+	m, _ = app.Update(msg)
+	app = m.(App)
+	if app.autoCount != 1 || !app.autoDone["dcd|BTC-USDT-261106-80000-P"] {
+		t.Fatalf("成功回执后应计数并去重: count=%d done=%v", app.autoCount, app.autoDone)
 	}
 
 	// 冷却期内不重复；冷却结束后同产品也不重复。
@@ -780,11 +844,13 @@ func TestTUIAutoExecutesDCDCandidate(t *testing.T) {
 }
 
 func TestTUIAutoSkipsOptionWhenCapTooSmall(t *testing.T) {
-	// 期权行在前但单笔 2000 USDT < 1 张（约 8 万）→ 应跳过期权，落到 DCY。
+	// 期权行在前但单笔 2000 USDT < 1 张（按 1 BTC/张 构造）→ 应跳过期权，落到 DCY。
 	fe := &fakeExec{settings: store.Settings{MinOptionEdgePP: 20, MaxStrikeGapPct: 0.5, AutoTrade: true}}
-	a := New(fakeFetcher{snap: buildTestSnap()}, fe, "BTC-USDT")
+	snap := buildTestSnap()
+	snap.Decisions[0].Row.OptCtVal = 1 // 1 BTC/张：79,500 > 单笔 2000
+	a := New(fakeFetcher{snap: snap}, fe, "BTC-USDT")
 	m, _ := a.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
-	m, cmd := m.Update(snapMsg{snap: buildTestSnap()})
+	m, cmd := m.Update(snapMsg{snap: snap})
 	if cmd == nil {
 		t.Fatal("应产生自动提交命令")
 	}
@@ -973,4 +1039,44 @@ func TestTUIRowsMatchColumns(t *testing.T) {
 	m, _ = app.Update(key('2'))
 	app = m.(App)
 	check("期权链页")
+}
+
+// 不可对齐的行也允许手动申购 DCY（与 Web 一致）。
+func TestTUIUnalignedRowAllowsManualDCD(t *testing.T) {
+	app, _ := bootApp(t)
+	snap := buildTestSnap()
+	snap.Decisions[1].Action = strategy.ActionUnaligned
+	snap.Decisions[1].ReasonCode = "no_exact_contract"
+	m, _ := app.Update(snapMsg{snap: snap})
+	app = m.(App)
+	m, _ = app.Update(down())
+	app = m.(App)
+	m, _ = app.Update(key('d'))
+	app = m.(App)
+	if !app.inputMode || app.draft == nil || app.draft.kind != "dcd" {
+		t.Fatalf("不可对齐行应打开 DCY 数量输入: input=%v draft=%+v", app.inputMode, app.draft)
+	}
+	if !strings.Contains(app.draft.label, "未对齐") {
+		t.Fatalf("手动申购应标注未对齐: %q", app.draft.label)
+	}
+}
+
+func TestToStrikeCell(t *testing.T) {
+	cases := []struct {
+		name   string
+		typ    rune
+		strike float64
+		spot   float64
+		want   string
+	}{
+		{"PUT 需跌", 'P', 70000, 76000, "需跌 7.89%"},
+		{"PUT 已穿", 'P', 77000, 76770, "已穿过行权 0.30%"},
+		{"CALL 需涨", 'C', 80000, 76000, "需涨 5.26%"},
+		{"CALL 已穿", 'C', 75000, 76000, "已穿过行权 1.32%"},
+	}
+	for _, c := range cases {
+		if got := toStrikeCell(c.typ, c.strike, c.spot); got != c.want {
+			t.Fatalf("%s: got %q want %q", c.name, got, c.want)
+		}
+	}
 }

@@ -41,18 +41,37 @@ func Decide(row MatchRow, p Params) Decision {
 		}
 	}
 
-	if !row.OptMatched || row.OptBidPx == "" {
-		// 未找到同向同到期合约，或合约存在但无买盘（仅报价）：都算不出
-		// 可执行的卖方 APR，标注为不可对齐。
+	// 期限窗口先判：长周期产品即使没有同价同到期合约，原因也应显示期限，
+	// 而不是被「无期权报价」掩盖。
+	if row.Days < p.DaysMin || row.Days > p.DaysMax {
+		d.Action = ActionNone
+		d.ReasonCode = "out_of_tenor"
+		return d
+	}
+
+	if !row.OptMatched {
+		// 连展示层都没对齐到任何合约。
 		d.Action = ActionUnaligned
 		d.ReasonCode = "no_option_quote"
 		return d
 	}
-
-	// 期限窗口过滤：7–30 天（先于行权价检查，长周期产品的原因更准确）
-	if row.Days < p.DaysMin || row.Days > p.DaysMax {
-		d.Action = ActionNone
-		d.ReasonCode = "out_of_tenor"
+	if !row.OptExact {
+		// 有合约但不是「同行权价 + 同到期日」：只做展示对齐，不做动作。
+		// 用最近档比 APR 的偏差（0.5% 行权价 × Delta≈0.5，7 天年化 ≈13pp）
+		// 足以凭空跨过 20pp 阈值。
+		if math.Abs(row.StrikeErrPct) > p.MaxStrikeGapPct {
+			d.Action = ActionUnaligned
+			d.ReasonCode = "strike_gap_too_big"
+			return d
+		}
+		d.Action = ActionUnaligned
+		d.ReasonCode = "no_exact_contract"
+		return d
+	}
+	if row.OptBidPx == "" {
+		// 精确档存在但没有买盘：算不出可执行的卖方 APR。
+		d.Action = ActionUnaligned
+		d.ReasonCode = "no_option_quote"
 		return d
 	}
 
@@ -62,16 +81,22 @@ func Decide(row MatchRow, p Params) Decision {
 		return d
 	}
 
+	// 年化阈值 + 单笔绝对收益双门槛：20pp 在 7 天期限只有 0.38% 的实际
+	// 收益差，固定年化阈值会在短期限放行噪声，在长期限又过度保守。
+	absEdge := row.Diff * row.Days / 365
 	switch {
-	case row.Diff >= p.MinOptionEdge:
+	case row.Diff >= p.MinOptionEdge && absEdge >= p.MinAbsEdge:
 		d.Action = ActionBuyOption
 		d.ReasonCode = "option_apr_higher"
 	default:
 		d.Action = ActionSubscribeDual
-		if row.Diff >= 0 {
-			d.ReasonCode = "diff_small"
-		} else {
+		switch {
+		case row.Diff < 0:
 			d.ReasonCode = "option_apr_worse"
+		case row.Diff >= p.MinOptionEdge:
+			d.ReasonCode = "edge_abs_small" // 年化够、但一笔实际收益太薄
+		default:
+			d.ReasonCode = "diff_small"
 		}
 	}
 

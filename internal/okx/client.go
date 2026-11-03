@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -49,7 +50,18 @@ type Client struct {
 	wsURL     string   // 覆盖 WebSocket 公共行情地址（测试/特殊网络）
 	limiter   *rate.Limiter
 	retryBase time.Duration // 重试退避基数（测试可调小）
+
+	// dcdGap/dcdLast 给双币赢（sfp/dcd）端点做独立节流：官方限速是
+	// 「1 request per second，User ID 级」，与公开行情的 10rps 限速器无关。
+	// 放在客户端而不是调用方，是为了让重试也遵守 1s 窗口——此前重试退避
+	// 从 400ms 起步，会在同一个 1 秒窗口里再撞一次 50011。
+	dcdMu   sync.Mutex
+	dcdLast time.Time
+	dcdGap  time.Duration
 }
+
+// dcdMinGap 双币赢端点的默认最小请求间隔（官方 1 req/s，留 100ms 余量）。
+const dcdMinGap = 1100 * time.Millisecond
 
 // NewClient 创建客户端。未提供 WithAuth 时为纯公开数据（无需密钥）。
 func NewClient(opts ...Option) *Client {
@@ -63,6 +75,7 @@ func NewClient(opts ...Option) *Client {
 		// 公开行情速率上限 20 req/2s，统一取 10 rps、burst 10 留余量
 		limiter:   rate.NewLimiter(rate.Limit(10), 10),
 		retryBase: 400 * time.Millisecond,
+		dcdGap:    dcdMinGap,
 	}
 	for _, o := range opts {
 		o(c)
@@ -98,6 +111,12 @@ func WithBaseURL(u string) Option {
 // WithTimeout 覆盖 HTTP 超时。
 func WithTimeout(d time.Duration) Option {
 	return func(c *Client) { c.http.Timeout = d }
+}
+
+// WithDCDGap 覆盖双币赢端点（sfp/dcd/*）的最小请求间隔（默认 1.1s）。
+// 测试或批量核对时可设为 0 关闭节流；生产不要低于 1s（官方限速 1 req/s）。
+func WithDCDGap(d time.Duration) Option {
+	return func(c *Client) { c.dcdGap = d }
 }
 
 // WithProxy 配置 HTTP/SOCKS5 代理（如 http://127.0.0.1:7890 / socks5://127.0.0.1:1080）。
@@ -332,6 +351,9 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte) 
 	const maxAttempts = 3
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := c.waitDCDGap(ctx, path); err != nil {
+			return nil, err
+		}
 		if err := c.limiter.Wait(ctx); err != nil {
 			return nil, fmt.Errorf("rate limiter: %w", err)
 		}
@@ -356,6 +378,48 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte) 
 		}
 	}
 	return nil, fmt.Errorf("retry exhausted: %w", lastErr)
+}
+
+// isDCDPath 判断是否双币赢（金融产品）端点，这些端点按 User ID 限速 1 req/s。
+func isDCDPath(path string) bool {
+	return strings.HasPrefix(path, "/api/v5/finance/sfp/dcd/")
+}
+
+// waitDCDGap 为双币赢请求预留一个 1s 窗口：同一次调用（含重试）与并发调用
+// 之间都至少间隔 dcdGap。dcdGap<=0 时不做任何等待（测试用）。
+func (c *Client) waitDCDGap(ctx context.Context, path string) error {
+	if c.dcdGap <= 0 || !isDCDPath(path) {
+		return nil
+	}
+	for {
+		c.dcdMu.Lock()
+		now := time.Now()
+		if c.dcdLast.IsZero() || !now.Before(c.dcdLast.Add(c.dcdGap)) {
+			c.dcdLast = now
+			c.dcdMu.Unlock()
+			return nil
+		}
+		wait := c.dcdLast.Add(c.dcdGap).Sub(now)
+		c.dcdMu.Unlock()
+		if err := sleepCtx(ctx, wait); err != nil {
+			return err
+		}
+	}
+}
+
+// sleepCtx 可被 ctx 取消的等待。
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // retryDelay 返回是否重试与本次退避时长。

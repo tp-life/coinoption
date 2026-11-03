@@ -178,7 +178,13 @@ func (e *Executor) SyncLiveGuard() (string, error) {
 			if base == "" {
 				base = strings.Split(p.InstID, "-")[0]
 			}
-			u, err := e.toUSDT(-float64(p.Pos)*parseFloatz(ins.CtVal), base)
+			// 每张名义 = ctVal × ctMult（BTC 0.01 / ETH 0.1）；只乘 ctVal 会把
+			// 平台空头敞口放大 100 倍（BTC）/10 倍（ETH）。
+			ctVal := parseFloatz(ins.CtVal)
+			if m := parseFloatz(ins.CtMult); m > 0 {
+				ctVal *= m
+			}
+			u, err := e.toUSDT(-float64(p.Pos)*ctVal, base)
 			if err != nil {
 				notes = append(notes, fmt.Sprintf("%s 折算失败: %v", p.InstID, err))
 				continue

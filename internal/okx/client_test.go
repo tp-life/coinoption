@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -274,5 +275,53 @@ func TestInvalidProxyShortCircuits(t *testing.T) {
 	_, err := c.request(context.Background(), http.MethodGet, "/x", nil)
 	if err == nil || !contains(err.Error(), "代理配置错误") {
 		t.Fatalf("无效代理应短路报错，得到: %v", err)
+	}
+}
+
+// 回归（2026-11）：双币赢端点限速 1 req/s（User ID 级），但调用方各写各的
+// 间隔，CLI --dump/--smoke 漏写就会稳定撞 50011；重试退避 400ms 起步也会在
+// 同一个 1 秒窗口里再撞一次。现在由 Client 层按路径统一节流（含重试）。
+func TestDCDRequestsArePaced(t *testing.T) {
+	var mu sync.Mutex
+	var at []time.Time
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		at = append(at, time.Now())
+		mu.Unlock()
+		io.WriteString(w, jsonCode("0", `[]`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(WithBaseURL(srv.URL), WithDCDGap(80*time.Millisecond))
+	c.retryBase = time.Millisecond
+	for _, ot := range []string{"C", "P"} {
+		if _, err := c.GetDCDProducts("BTC", "USDT", ot); err != nil {
+			t.Fatalf("GetDCDProducts(%s): %v", ot, err)
+		}
+	}
+	mu.Lock()
+	got := len(at)
+	gap := time.Duration(0)
+	if got == 2 {
+		gap = at[1].Sub(at[0])
+	}
+	mu.Unlock()
+	if got != 2 {
+		t.Fatalf("请求数 = %d，期望 2", got)
+	}
+	if gap < 75*time.Millisecond {
+		t.Fatalf("两次 DCD 请求间隔 %v，应 ≥ 节流间隔（会撞 50011）", gap)
+	}
+
+	// 非 DCD 路径不应被节流：同客户端连发两次公开行情要很快。
+	start := time.Now()
+	if _, err := c.GetSpotTicker("BTC-USDT"); err != nil {
+		t.Fatalf("spot: %v", err)
+	}
+	if _, err := c.GetSpotTicker("BTC-USDT"); err != nil {
+		t.Fatalf("spot: %v", err)
+	}
+	if d := time.Since(start); d > 75*time.Millisecond {
+		t.Fatalf("公开行情被 DCD 节流误伤，耗时 %v", d)
 	}
 }

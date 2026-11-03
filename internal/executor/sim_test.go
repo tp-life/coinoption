@@ -95,6 +95,11 @@ func TestSettleOptionShortLoss(t *testing.T) {
 	if ccy != "USD" || !nearly(loss, 6000) {
 		t.Fatalf("UM 损失不符: %v %s", loss, ccy)
 	}
+	// BTC 期权 1 张 = 0.01 BTC（ctVal×ctMult）：1 张 C 80000→83000 只损失 30 USD 等值
+	loss, ccy, _ = SettleOptionShortLoss('C', 80000, 83000, 1, 0.01, "USD")
+	if ccy != "USD" || !nearly(loss, 30) {
+		t.Fatalf("0.01 BTC/张 的损失不符: %v %s", loss, ccy)
+	}
 	// 归零
 	loss, _, note := SettleOptionShortLoss('P', 80000, 83000, 1, 1, "BTC")
 	if loss != 0 || note == "" {

@@ -135,3 +135,40 @@ func TestGuardCheckDoesNotReserve(t *testing.T) {
 		t.Fatalf("Check 不应占用: %+v", s)
 	}
 }
+
+// 资金总额派生：总敞口 = 资金总额，单笔 = 40%（默认 5000→2000 保持不变）。
+func TestLimitsWithCapital(t *testing.T) {
+	l := DefaultLimits()
+	if got := l.WithCapital(5000); got.TotalExposureUSDT != 5000 || got.PerOrderUSDT != 2000 {
+		t.Fatalf("默认资金派生不符: %+v", got)
+	}
+	if got := l.WithCapital(10000); got.TotalExposureUSDT != 10000 || got.PerOrderUSDT != 4000 {
+		t.Fatalf("10000 资金派生不符: %+v", got)
+	}
+	if got := l.WithCapital(0); got != l {
+		t.Fatalf("非法资金应原样返回: %+v", got)
+	}
+}
+
+// 运行期改资金总额：上限立即生效，已占用的敞口不回收；
+// 新上限低于当前敞口时后续下单被拒（但在持订单不受影响）。
+func TestGuardSetLimitsRuntime(t *testing.T) {
+	g := newTestGuard(DefaultLimits())
+	if err := g.ReserveLimits(1800); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	g.SetLimits(g.Snapshot().Limits.WithCapital(10000))
+	s := g.Snapshot()
+	if s.ExposureUSDT != 1800 || s.RemainingUSDT != 8200 || s.Limits.PerOrderUSDT != 4000 {
+		t.Fatalf("调高资金后状态不符: %+v", s)
+	}
+	if err := g.ReserveLimits(4000); err != nil {
+		t.Fatalf("8200 额度内 4000 应放行: %v", err)
+	}
+	g.SetLimits(g.Snapshot().Limits.WithCapital(2000))
+	err := g.ReserveLimits(100)
+	var le *LimitError
+	if err == nil || !AsLimit(err, &le) || le.Field != "total_exposure" {
+		t.Fatalf("调低资金到低于敞口后应拒 total_exposure: %v", err)
+	}
+}
