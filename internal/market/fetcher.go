@@ -19,6 +19,8 @@ import (
 type Fetcher struct {
 	C     *okx.Client
 	UseWS bool
+	// IVHist 可选的 IV 历史采样器（分位）；启动时注入，运行期只读。
+	IVHist *IVHistory
 
 	mu           sync.Mutex
 	p            strategy.Params
@@ -88,6 +90,7 @@ func (f *Fetcher) liveSnapshot(uly string, p strategy.Params) (*Snapshot, error)
 	f.mu.Unlock()
 
 	l := NewLive(f.C, uly, p)
+	l.SetIVHistory(f.IVHist)
 	ctx, cancel := context.WithCancel(context.Background())
 	err := l.Start(ctx)
 
@@ -123,7 +126,7 @@ func (f *Fetcher) restSnapshot(uly string, p strategy.Params) (*Snapshot, error)
 	}
 	f.mu.Unlock()
 
-	snap, err := FetchWith(f.C, uly, p)
+	snap, err := FetchWithIV(f.C, uly, p, f.IVHist)
 	if err != nil {
 		return nil, err
 	}

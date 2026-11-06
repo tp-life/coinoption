@@ -34,6 +34,15 @@ const (
 	wsBatchSize    = 300 // 单次 subscribe 参数条数（远低于 64KB 上限）
 )
 
+// wsResubDelay 单个订阅被服务端拒绝后的重试间隔（测试可覆盖）。
+var wsResubDelay = time.Second
+
+// wsSubArg 一条 tickers 订阅。
+type wsSubArg struct {
+	Channel string `json:"channel"`
+	InstID  string `json:"instId"`
+}
+
 // WSStatus 连接状态回调（Connected=false 时 Err 为断线/握手错误）。
 type WSStatus struct {
 	Connected bool      `json:"connected"`
@@ -90,15 +99,17 @@ func (c *Client) StreamTickers(ctx context.Context, instIDs []string,
 
 	backoff := time.Second
 	for {
+		start := time.Now()
 		connected, err := c.streamTickersOnce(ctx, ids, onTicker, onStatus)
 		if ctx.Err() != nil {
 			return nil
 		}
-		if !connected {
-			// 握手失败：退避后重试；连接成功过则重置退避。
-			backoff = maxDuration(backoff, time.Second)
-		} else {
+		// 只有「握手成功且连接稳定存活 ≥30s」才重置退避。否则服务端在
+		// upgrade 后立刻断开（订阅被拒/封禁/维护）会变成 1s 一次的热重连。
+		if connected && time.Since(start) >= 30*time.Second {
 			backoff = time.Second
+		} else {
+			backoff = maxDuration(backoff, time.Second)
 		}
 		if onStatus != nil {
 			msg := ""
@@ -123,8 +134,13 @@ func (c *Client) StreamTickers(ctx context.Context, instIDs []string,
 func (c *Client) streamTickersOnce(ctx context.Context, ids []string,
 	onTicker func(OptionTicker), onStatus func(WSStatus)) (bool, error) {
 
+	// 每次连接一个子 context：连接结束时 resub/ping 协程必须一起退出，
+	// 否则每次断线重连都会泄漏一个阻塞在 ctx.Done() 的 goroutine。
+	connCtx, connCancel := context.WithCancel(ctx)
+	defer connCancel()
+
 	d := c.wsDialer()
-	conn, resp, err := d.DialContext(ctx, c.publicWSURL(), nil)
+	conn, resp, err := d.DialContext(connCtx, c.publicWSURL(), nil)
 	if err != nil {
 		return false, err
 	}
@@ -139,7 +155,7 @@ func (c *Client) streamTickersOnce(ctx context.Context, ids []string,
 	defer close(stopClose)
 	go func() {
 		select {
-		case <-ctx.Done():
+		case <-connCtx.Done():
 			_ = conn.Close()
 		case <-stopClose:
 		}
@@ -163,34 +179,59 @@ func (c *Client) streamTickersOnce(ctx context.Context, ids []string,
 		return conn.WriteMessage(websocket.TextMessage, []byte(s))
 	}
 
+	subscribe := func(id string, args []wsSubArg) error {
+		return writeJSON(map[string]any{"id": id, "op": "subscribe", "args": args})
+	}
+
 	// 分批订阅：单条 JSON 不超过 64KB；批间稍作停顿，避免瞬时写爆。
 	for start := 0; start < len(ids); start += wsBatchSize {
 		end := start + wsBatchSize
 		if end > len(ids) {
 			end = len(ids)
 		}
-		args := make([]map[string]string, 0, end-start)
+		args := make([]wsSubArg, 0, end-start)
 		for _, id := range ids[start:end] {
-			args = append(args, map[string]string{"channel": "tickers", "instId": id})
+			args = append(args, wsSubArg{Channel: "tickers", InstID: id})
 		}
-		if err := writeJSON(map[string]any{
-			"id":   fmt.Sprintf("%d", start),
-			"op":   "subscribe",
-			"args": args,
-		}); err != nil {
+		if err := subscribe(fmt.Sprintf("sub-%d", start), args); err != nil {
 			return true, err
 		}
 		if end < len(ids) {
 			select {
-			case <-ctx.Done():
+			case <-connCtx.Done():
 				return true, nil
 			case <-time.After(50 * time.Millisecond):
 			}
 		}
 	}
 
+	// 被服务端拒绝的单个订阅：重试 3 次（指数间隔固定 1s）。
+	// 以前 error 事件只上报、不重试，那几张合约会一直没行情，直到整条连接
+	// 断开重连——用户表现为「某些行权价价格不动」，很难排查。
+	resub := make(chan wsSubArg, 256)
+	go func() {
+		attempts := make(map[string]int, 8)
+		for {
+			select {
+			case <-connCtx.Done():
+				return
+			case a := <-resub:
+				if attempts[a.InstID] >= 3 {
+					continue
+				}
+				attempts[a.InstID]++
+				select {
+				case <-connCtx.Done():
+					return
+				case <-time.After(wsResubDelay):
+				}
+				_ = subscribe("resub-"+a.InstID, []wsSubArg{a})
+			}
+		}
+	}()
+
 	// 心跳：OKX 要求 30s 内有数据/心跳，否则服务端断链。
-	pingCtx, cancelPing := context.WithCancel(ctx)
+	pingCtx, cancelPing := context.WithCancel(connCtx)
 	defer cancelPing()
 	go func() {
 		t := time.NewTicker(wsPingEvery)
@@ -230,12 +271,21 @@ func (c *Client) streamTickersOnce(ctx context.Context, ids []string,
 		case "subscribe", "unsubscribe", "notice":
 			continue
 		case "error":
+			msg := fmt.Sprintf("WS 订阅/服务错误 %s: %s", env.Code, env.Msg)
+			var arg struct {
+				Channel string `json:"channel"`
+				InstID  string `json:"instId"`
+			}
+			if len(env.Arg) > 0 && json.Unmarshal(env.Arg, &arg) == nil && arg.InstID != "" {
+				select {
+				case resub <- wsSubArg{Channel: "tickers", InstID: arg.InstID}:
+					msg += "（将重试订阅 " + arg.InstID + "）"
+				default:
+					msg += "（重试队列已满，等待重连）"
+				}
+			}
 			if onStatus != nil {
-				onStatus(WSStatus{
-					Connected: true,
-					At:        time.Now(),
-					Err:       fmt.Sprintf("WS 订阅/服务错误 %s: %s", env.Code, env.Msg),
-				})
+				onStatus(WSStatus{Connected: true, At: time.Now(), Err: msg})
 			}
 			continue
 		}

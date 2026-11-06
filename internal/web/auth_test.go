@@ -137,8 +137,11 @@ func TestAuthCodeChangeInvalidatesSessions(t *testing.T) {
 		t.Fatal("修改授权码后应要求重新登录（relogin=true）")
 	}
 	saved, _ := fs.snapshot()
-	if saved.WebAuthCodeHash != HashCode("newcode") {
-		t.Fatalf("settings.json 里的授权码摘要不符: %q", saved.WebAuthCodeHash)
+	if !VerifyCodeHash(saved.WebAuthCodeHash, "newcode") {
+		t.Fatalf("settings.json 里的授权码摘要无法校验新码: %q", saved.WebAuthCodeHash)
+	}
+	if strings.HasPrefix(saved.WebAuthCodeHash, HashCode("newcode")) {
+		t.Fatal("不应再落盘裸 SHA-256 摘要（应为 PBKDF2）")
 	}
 	if code, _ := doReq(t, c, http.MethodGet, ts.URL+"/", ""); code != http.StatusSeeOther {
 		t.Fatalf("改码后旧会话仍可用: %d", code)
@@ -160,5 +163,49 @@ func TestAuthRejectsMalformedHash(t *testing.T) {
 	}
 	if a.check("") {
 		t.Fatal("未设置有效摘要时不得放行空授权码")
+	}
+}
+
+// PBKDF2 摘要：可校验、带随机盐、兼容旧版 SHA-256。
+func TestCodeHashPBKDF2(t *testing.T) {
+	spec, err := NewCodeHash("letmein")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(spec, "pbkdf2-sha256$") {
+		t.Fatalf("摘要格式 = %q", spec)
+	}
+	if !VerifyCodeHash(spec, "letmein") {
+		t.Fatal("正确授权码应通过")
+	}
+	if VerifyCodeHash(spec, "letmein2") || VerifyCodeHash(spec, "") {
+		t.Fatal("错误/空授权码不应通过")
+	}
+	again, _ := NewCodeHash("letmein")
+	if again == spec {
+		t.Fatal("同一授权码两次摘要应因随机盐而不同")
+	}
+	if !ValidCodeHash(spec) || ValidCodeHash("nope") {
+		t.Fatal("ValidCodeHash 判断错误")
+	}
+	// 旧版兼容。
+	if !VerifyCodeHash(HashCode("old"), "old") {
+		t.Fatal("旧版 SHA-256 摘要应继续可登录")
+	}
+	if !ValidCodeHash(HashCode("old")) {
+		t.Fatal("旧版摘要应视为合法")
+	}
+}
+
+// 空授权码必须 fail-closed：整站锁死，而不是无鉴权裸奔。
+func TestWithAuthCodeEmptyFailsClosed(t *testing.T) {
+	ts, c := newAuthServer(t, "")
+	if code, _ := doReq(t, c, http.MethodGet, ts.URL+"/", ""); code != http.StatusSeeOther {
+		t.Fatalf("GET / = %d，期望 303 到登录页", code)
+	}
+	for _, code := range []string{"", "anything", "letmein"} {
+		if got, _ := doLogin(t, c, ts.URL, code); got != http.StatusUnauthorized && got != http.StatusBadRequest {
+			t.Fatalf("空授权码不应允许登录（code=%q 得 %d）", code, got)
+		}
 	}
 }

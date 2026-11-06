@@ -6,6 +6,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tp/coinoption/internal/okx"
@@ -35,6 +36,9 @@ type Outcome struct {
 	Premium   float64 // 期权：权利金（结算币口径）
 	Sim       bool    // 是否纸面单
 	Detail    string  // 人读说明
+	// Warnings 手动下单的「只提示不拦截」项（越限/无法校验）。自动执行不会
+	// 产生该字段：自动路径仍然硬拒绝。空 = 全部通过。
+	Warnings []string
 }
 
 // SpotFunc 币种→USDT 现价（风控折算 + 模拟结算价基准）。
@@ -47,6 +51,24 @@ type Executor struct {
 	guard  *Guard
 	st     *store.Store
 	spot   SpotFunc
+
+	// 当日已实现盈亏缓存（日亏损门禁每 tick 都会读，避免每次都打平台接口）。
+	pnlMu  sync.Mutex
+	pnlAt  time.Time
+	pnlVal float64
+	// settleMu 串行化到期结算：TUI 定时结算与下单前结算可能并发，否则同一笔
+	// 纸面单会被结算两次、把风控敞口重复释放。
+	settleMu sync.Mutex
+
+	// posMu 串行化持仓视图组装；posAt/posVal 为 5s 缓存（见 Positions）。
+	posMu  sync.Mutex
+	posAt  time.Time
+	posVal PositionsView
+
+	// liveDCD 缓存平台 DCY 订单（当日盈亏 + 组合 Delta/压力校验共用，60s）。
+	liveMu     sync.Mutex
+	liveAt     time.Time
+	liveOrders []okx.DCDOrder
 }
 
 // New 装配。
@@ -76,6 +98,33 @@ func (e *Executor) RecordAutoFailure(f store.AutoFailure) error { return e.st.Re
 // 总敞口 = 资金总额，单笔上限 = 资金总额 × 40%，并发/日限保持不变。
 func (e *Executor) SetCapital(capitalUSDT float64) {
 	e.guard.SetLimits(e.guard.Snapshot().Limits.WithCapital(capitalUSDT))
+}
+
+// SetRiskLimits 在资金派生值之上覆盖总敞口/单笔上限（0 = 保留派生值）。
+// Web 设置页先 SetCapital 再调用本方法，确保「资金总额」与「风险上限」解耦。
+func (e *Executor) SetRiskLimits(totalExposureUSDT, perOrderUSDT float64) {
+	e.guard.SetLimits(e.guard.Snapshot().Limits.WithRiskOverrides(totalExposureUSDT, perOrderUSDT))
+}
+
+// invalidatePositions 让下一次 Positions() 重新取数（下单/结算/赎回后调用）。
+func (e *Executor) invalidatePositions() {
+	e.posMu.Lock()
+	e.posAt = time.Time{}
+	e.posMu.Unlock()
+}
+
+// SetRiskCaps 更新 v2 组合风控上限（DCY 累计 Delta、压力情景）。
+// 与 --limits 解耦：这几项只由策略参数派生，不属于「账户风险上限」。
+func (e *Executor) SetRiskCaps(dcdDeltaUSDT, stressShockPct, stressLossPct float64) {
+	lim := e.guard.Snapshot().Limits
+	lim.DCDDeltaExposureUSDT = dcdDeltaUSDT
+	if stressShockPct > 0 && stressShockPct < 1 {
+		lim.StressShockPct = stressShockPct
+	}
+	if stressLossPct > 0 && stressLossPct < 1 {
+		lim.StressLossPct = stressLossPct
+	}
+	e.guard.SetLimits(lim)
 }
 
 // SpotOf 币种现价（结算基准 / 审计展示用）。
@@ -127,16 +176,29 @@ type optPlan struct {
 // live / sim-okx → OKX API（sim-okx 自动带 x-simulated-trading 头）；
 // sim-local → 纸面单落库（[SIM] 徽标）。
 func (e *Executor) SubmitOption(instID string, sz, limPx float64) (Outcome, error) {
+	return e.submitOption(instID, sz, limPx, false)
+}
+
+// SubmitOptionAdvisory 手动卖期权：风控上限只提示，不拦截。
+// 自动执行仍走 SubmitOption（硬拒绝）。
+func (e *Executor) SubmitOptionAdvisory(instID string, sz, limPx float64) (Outcome, error) {
+	return e.submitOption(instID, sz, limPx, true)
+}
+
+func (e *Executor) submitOption(instID string, sz, limPx float64, advisory bool) (Outcome, error) {
+	defer e.invalidatePositions()
+	e.SettleDueQuiet() // 到期纸面单先落地，释放敞口（否则额度只增不减）
 	p, err := e.optPrecheck(instID, sz, limPx)
 	if err != nil {
 		return Outcome{}, err
 	}
-	return e.submitOptionPlan(p, sz)
+	return e.submitOptionPlan(p, sz, advisory)
 }
 
 // SubmitOptionChecked 与 SubmitOption 相同，但会用最新 bid 重算卖方 APR，
 // 低于 minAPR 时放弃（自动执行防止“1 秒前的决策、下单时 edge 已消失”）。
 func (e *Executor) SubmitOptionChecked(instID string, sz, limPx, minAPR float64) (Outcome, error) {
+	defer e.invalidatePositions()
 	p, err := e.optPrecheck(instID, sz, limPx)
 	if err != nil {
 		return Outcome{}, err
@@ -151,14 +213,14 @@ func (e *Executor) SubmitOptionChecked(instID string, sz, limPx, minAPR float64)
 				apr*100, minAPR*100)
 		}
 	}
-	return e.submitOptionPlan(p, sz)
+	return e.submitOptionPlan(p, sz, false)
 }
 
-func (e *Executor) submitOptionPlan(p optPlan, sz float64) (Outcome, error) {
+func (e *Executor) submitOptionPlan(p optPlan, sz float64, advisory bool) (Outcome, error) {
 	if e.mode == ModeSimLocal {
-		return e.placeOptionSim(p, sz)
+		return e.placeOptionSim(p, sz, advisory)
 	}
-	return e.placeOptionAPI(p, sz)
+	return e.placeOptionAPI(p, sz, advisory)
 }
 
 // optionAPROf 用 plan 里的最新价/元数据复算卖方 APR（与 strategy 同口径）。
@@ -197,6 +259,10 @@ func (e *Executor) optPrecheck(instID string, sz, limPx float64) (optPlan, error
 	ins, err := e.instrumentByID(instID)
 	if err != nil {
 		return optPlan{}, err
+	}
+	// 方向缺失/未知时后续 rune(ins.OptType[0]) 会 panic；这里前置拒绝。
+	if _, ok := strategy.ParseOptType(ins.OptType); !ok {
+		return optPlan{}, fmt.Errorf("合约方向缺失/非法（optType=%q）: %s", ins.OptType, instID)
 	}
 	ctVal := parseFloatz(ins.CtVal)
 	base := ins.CtValCcy
@@ -256,15 +322,19 @@ func (e *Executor) optPrecheck(instID string, sz, limPx float64) (optPlan, error
 }
 
 // placeOptionAPI 风控 → API → 留痕；失败释敞、拒绝留审计。
-func (e *Executor) placeOptionAPI(p optPlan, sz float64) (Outcome, error) {
+func (e *Executor) placeOptionAPI(p optPlan, sz float64, advisory bool) (Outcome, error) {
 	mode := e.mode // live | sim-okx
-	if err := e.guard.ReserveLimits(p.expUSDT); err != nil {
+	var warns []string
+	if advisory {
+		warns = e.guard.ReserveLimitsAdvisory(p.expUSDT)
+	} else if err := e.guard.ReserveLimits(p.expUSDT); err != nil {
 		_ = e.st.Audit(store.AuditEvent{
 			Event: "reject", Subject: p.inst.InstID, Reason: err.Error(),
 			AmtUSDT: p.expUSDT, Mode: string(mode), Detail: "期权卖出-风控前置拒绝",
 		})
 		return Outcome{}, err
 	}
+	clOrdID := newClOrdID()
 	ordID, err := e.client.PostOptionOrder(okx.OptionOrderReq{
 		InstID:  p.inst.InstID,
 		TdMode:  "cross",
@@ -273,35 +343,51 @@ func (e *Executor) placeOptionAPI(p optPlan, sz float64) (Outcome, error) {
 		OrdType: "limit",
 		Sz:      trimFloat(sz),
 		Px:      trimFloat(p.px),
+		ClOrdID: clOrdID,
 	})
 	if err != nil {
+		// 结果未知（超时/5xx/断连）时订单可能已成交：保持敞口占用并标记待对账，
+		// 绝不 Release——否则风控会低估敞口，自动执行还可能再下一单。
+		if okx.IsAmbiguous(err) {
+			_ = e.st.Audit(store.AuditEvent{Event: "unknown", Subject: p.inst.InstID,
+				Reason: err.Error(), AmtUSDT: p.expUSDT, Mode: string(mode),
+				Detail: fmt.Sprintf("卖 %s 张 clOrdId=%s：结果未知，额度保持占用，请用订单号对账",
+					trimFloat(sz), clOrdID)})
+			return Outcome{}, err
+		}
 		e.guard.Release(p.expUSDT)
 		_ = e.st.Audit(store.AuditEvent{Event: "error", Subject: p.inst.InstID,
-			Reason: err.Error(), AmtUSDT: p.expUSDT, Mode: string(mode)})
+			Reason: err.Error(), AmtUSDT: p.expUSDT, Mode: string(mode),
+			Detail: "clOrdId=" + clOrdID})
 		return Outcome{}, err
 	}
 	_ = e.st.SaveOrder(store.Order{
 		ID: ordID, Kind: "option", Mode: string(mode), Ref: p.inst.InstID,
 		Amt: sz, AmtUSDT: p.expUSDT,
-		Raw: fmt.Sprintf("卖 %s 张 @%s %s（每张权利金 %.8f %s）",
-			trimFloat(sz), trimFloat(p.px), p.base, p.prem, settleHint(p)),
+		Raw: fmt.Sprintf("卖 %s 张 @%s %s clOrdId=%s（每张权利金 %.8f %s）",
+			trimFloat(sz), trimFloat(p.px), p.base, clOrdID, p.prem, settleHint(p)),
 	})
+	detail := fmt.Sprintf("卖出 %s 张 限价 %s（敞口≈%.2f USDT）",
+		trimFloat(sz), trimFloat(p.px), p.expUSDT)
 	_ = e.st.Audit(store.AuditEvent{
 		Event: "submit", Subject: p.inst.InstID, AmtUSDT: p.expUSDT, Mode: string(mode),
-		Detail: fmt.Sprintf("卖出 %s 张 限价 %s（敞口≈%.2f USDT）",
-			trimFloat(sz), trimFloat(p.px), p.expUSDT),
+		Detail: withAdvisoryNote(detail, warns),
 	})
 	return Outcome{
 		Mode: mode, Kind: "option", Ref: p.inst.InstID, OrdID: ordID,
 		Amt: sz, AmtUSDT: p.expUSDT, Premium: p.prem,
 		Detail: fmt.Sprintf("订单 %s：卖 %s 张 限价 %s（敞口≈%.2f USDT）",
 			ordID, trimFloat(sz), trimFloat(p.px), p.expUSDT),
+		Warnings: warns,
 	}, nil
 }
 
 // placeOptionSim 纸面期权单：记录行权价/权利金/结算币，模拟结算引擎到期摊平。
-func (e *Executor) placeOptionSim(p optPlan, sz float64) (Outcome, error) {
-	if err := e.guard.ReserveLimits(p.expUSDT); err != nil {
+func (e *Executor) placeOptionSim(p optPlan, sz float64, advisory bool) (Outcome, error) {
+	var warns []string
+	if advisory {
+		warns = e.guard.ReserveLimitsAdvisory(p.expUSDT)
+	} else if err := e.guard.ReserveLimits(p.expUSDT); err != nil {
 		_ = e.st.Audit(store.AuditEvent{
 			Event: "reject", Subject: p.inst.InstID, Reason: err.Error(),
 			AmtUSDT: p.expUSDT, Mode: string(e.mode), Detail: "期权纸面单-风控拒绝",
@@ -330,21 +416,42 @@ func (e *Executor) placeOptionSim(p optPlan, sz float64) (Outcome, error) {
 	}
 	_ = e.st.Audit(store.AuditEvent{
 		Event: "submit", Subject: p.inst.InstID, AmtUSDT: p.expUSDT, Mode: string(e.mode),
-		Detail: fmt.Sprintf("[SIM] 纸面卖出 %s 张 限价 %s（每张 %.8f %s）",
-			trimFloat(sz), trimFloat(p.px), p.prem, settleHint(p)),
+		Detail: withAdvisoryNote(fmt.Sprintf("[SIM] 纸面卖出 %s 张 限价 %s（每张 %.8f %s）",
+			trimFloat(sz), trimFloat(p.px), p.prem, settleHint(p)), warns),
 	})
 	return Outcome{
 		Mode: e.mode, Kind: "option", Ref: p.inst.InstID, OrdID: o.ID,
 		Amt: sz, AmtUSDT: p.expUSDT, Premium: p.prem, Sim: true,
 		Detail: fmt.Sprintf("[SIM] %s：纸面卖出 %s 张 限价 %s（权利金 %.8f %s）",
 			o.ID, trimFloat(sz), trimFloat(p.px), p.prem, p.inst.SettleCcy),
+		Warnings: warns,
 	}, nil
 }
 
 // ─── DCY 申购 ─────────────────────────────────────────────────────
 
 // SubmitDCD 申购双币赢（live: quote→trade 两步；sim: 纸面单）。
+// 自动执行走这里：风控上限硬拒绝。
 func (e *Executor) SubmitDCD(p okx.DCDProduct, amt float64) (Outcome, error) {
+	return e.submitDCD(p, amt, false)
+}
+
+// SubmitDCDAdvisory 手动申购：单笔/总敞口/并发/日笔数、累计 Delta 与压力
+// 情景都只提示（写入 Outcome.Warnings 与审计），不再拦截。产品本身的硬规则
+// （最小申购、步长、申购截止）仍然生效——那些是交易所会直接拒的。
+func (e *Executor) SubmitDCDAdvisory(p okx.DCDProduct, amt float64) (Outcome, error) {
+	return e.submitDCD(p, amt, true)
+}
+
+func (e *Executor) submitDCD(p okx.DCDProduct, amt float64, advisory bool) (Outcome, error) {
+	defer e.invalidatePositions()
+	e.SettleDueQuiet() // 到期纸面单先落地，释放敞口
+	optType, ok := strategy.ParseOptType(p.OptType)
+	if !ok {
+		// 后续 rune(p.OptType[0]) 会 panic；产品方向缺失时直接拒绝。
+		return Outcome{}, fmt.Errorf("产品方向缺失/非法（optType=%q）: %s", p.OptType, p.ProductID)
+	}
+	p.OptType = string(optType) // 归一化为大写单字符，供下游安全索引
 	if amt <= 0 {
 		return Outcome{}, fmt.Errorf("申购量必须为正: %v", amt)
 	}
@@ -380,14 +487,42 @@ func (e *Executor) SubmitDCD(p okx.DCDProduct, amt float64) (Outcome, error) {
 	if err != nil {
 		return Outcome{}, err
 	}
-	if e.mode == ModeLive && e.client != nil {
-		return e.submitDCDLive(p, amt, amtUSDT, invest)
+	// v2 组合风控：累计 Delta + 压力情景。自动 → 硬拒绝；手动 → 只提示。
+	var warns []string
+	if advisory {
+		probs, why := e.dcdRiskProblems(p, amtUSDT)
+		for _, le := range probs {
+			warns = append(warns, "组合风控："+le.Error())
+		}
+		if why != "" {
+			warns = append(warns, "组合风控无法校验："+why)
+		}
+	} else if err := e.checkDCDRisk(p, amtUSDT); err != nil {
+		_ = e.st.Audit(store.AuditEvent{
+			Event: "reject", Subject: p.ProductID, Reason: err.Error(),
+			AmtUSDT: amtUSDT, Mode: string(e.mode), Detail: "DCY 组合风控拒绝",
+		})
+		return Outcome{}, err
 	}
-	return e.submitDCDSim(p, amt, amtUSDT, invest)
+	if e.mode == ModeLive && e.client != nil {
+		return e.submitDCDLive(p, amt, amtUSDT, invest, advisory, warns)
+	}
+	return e.submitDCDSim(p, amt, amtUSDT, invest, advisory, warns)
 }
 
-func (e *Executor) submitDCDLive(p okx.DCDProduct, amt, amtUSDT float64, invest string) (Outcome, error) {
-	if err := e.guard.ReserveLimits(amtUSDT); err != nil {
+// withAdvisoryNote 审计里标注「手动放行」的越限项，便于事后对账。
+func withAdvisoryNote(detail string, warns []string) string {
+	if len(warns) == 0 {
+		return detail
+	}
+	return detail + "；手动放行（仅提示）：" + strings.Join(warns, "；")
+}
+
+func (e *Executor) submitDCDLive(p okx.DCDProduct, amt, amtUSDT float64, invest string,
+	advisory bool, warns []string) (Outcome, error) {
+	if advisory {
+		warns = append(warns, e.guard.ReserveLimitsAdvisory(amtUSDT)...)
+	} else if err := e.guard.ReserveLimits(amtUSDT); err != nil {
 		_ = e.st.Audit(store.AuditEvent{
 			Event: "reject", Subject: p.ProductID, Reason: err.Error(),
 			AmtUSDT: amtUSDT, Mode: string(ModeLive), Detail: "DCY 申购-风控前置拒绝",
@@ -405,17 +540,31 @@ func (e *Executor) submitDCDLive(p okx.DCDProduct, amt, amtUSDT float64, invest 
 	}
 	q := qs[0]
 	// 报价是最终成交口径：若实时绝对收益明显低于快照（行情/额度变化），
-	// 不再按过期决策下单。
-	if p.AbsYield > 0 && q.AbsYield > 0 && q.AbsYield < float64(p.AbsYield)*0.995 {
-		e.guard.Release(amtUSDT)
-		_ = e.st.Audit(store.AuditEvent{Event: "error", Subject: p.ProductID,
-			AmtUSDT: amtUSDT, Mode: string(ModeLive),
-			Detail: fmt.Sprintf("报价收益下降：快照 %.6f → 实时 %.6f，放弃申购", float64(p.AbsYield), q.AbsYield)})
-		return Outcome{}, fmt.Errorf("实时报价绝对收益 %.6f 低于快照 %.6f，放弃本次申购",
-			q.AbsYield, float64(p.AbsYield))
+	// 不再按过期决策下单。报价端点的 absYield 出现过百分数形态，先归一到
+	// 小数口径再比较，否则 1.7 vs 0.017 会让这道保护永远通过。
+	quotedYield := normalizeQuoteYield(q.AbsYield, float64(p.AbsYield))
+	if p.AbsYield > 0 && quotedYield > 0 && quotedYield < float64(p.AbsYield)*0.995 {
+		if advisory {
+			warns = append(warns, fmt.Sprintf("实时报价收益 %.4f%% 低于快照 %.4f%%（已按提示继续）",
+				quotedYield*100, float64(p.AbsYield)*100))
+		} else {
+			e.guard.Release(amtUSDT)
+			_ = e.st.Audit(store.AuditEvent{Event: "error", Subject: p.ProductID,
+				AmtUSDT: amtUSDT, Mode: string(ModeLive),
+				Detail: fmt.Sprintf("报价收益下降：快照 %.6f → 实时 %.6f，放弃申购", float64(p.AbsYield), quotedYield)})
+			return Outcome{}, fmt.Errorf("实时报价绝对收益 %.6f 低于快照 %.6f，放弃本次申购",
+				quotedYield, float64(p.AbsYield))
+		}
 	}
 	res, err := e.client.PostDCDTrade(q.QuoteID)
 	if err != nil {
+		// 交易 POST 结果未知时不能释放敞口（可能已申购成功）。
+		if okx.IsAmbiguous(err) {
+			_ = e.st.Audit(store.AuditEvent{Event: "unknown", Subject: p.ProductID,
+				AmtUSDT: amtUSDT, Mode: string(ModeLive), Reason: err.Error(),
+				Detail: fmt.Sprintf("quote %s 下单结果未知，额度保持占用，请用 quoteId/ordId 对账", q.QuoteID)})
+			return Outcome{}, fmt.Errorf("下单结果未知（勿自动重试）: %w", err)
+		}
 		e.guard.Release(amtUSDT)
 		_ = e.st.Audit(store.AuditEvent{Event: "error", Subject: p.ProductID,
 			Reason: err.Error(), AmtUSDT: amtUSDT, Mode: string(ModeLive),
@@ -429,23 +578,27 @@ func (e *Executor) submitDCDLive(p okx.DCDProduct, amt, amtUSDT float64, invest 
 	_ = e.st.SaveOrder(store.Order{
 		ID: ordID, Kind: "dcd", Mode: string(ModeLive), Ref: p.ProductID,
 		Amt: amt, AmtUSDT: amtUSDT, QuoteID: q.QuoteID,
-		Raw: fmt.Sprintf("state=%s absYield=%.8f validUntil=%v", state, float64(q.AbsYield), q.ValidUntil),
+		Raw: fmt.Sprintf("state=%s absYield=%.8f validUntil=%v", state, quotedYield, q.ValidUntil),
 	})
 	_ = e.st.Audit(store.AuditEvent{
 		Event: "submit", Subject: p.ProductID, AmtUSDT: amtUSDT, Mode: string(ModeLive),
-		Detail: fmt.Sprintf("申购 %.4f %s（quote %s，绝对收益 %.8f）",
-			amt, invest, q.QuoteID, float64(q.AbsYield)),
+		Detail: withAdvisoryNote(fmt.Sprintf("申购 %.4f %s（quote %s，绝对收益 %.8f）",
+			amt, invest, q.QuoteID, quotedYield), warns),
 	})
 	return Outcome{
 		Mode: ModeLive, Kind: "dcd", Ref: p.ProductID, OrdID: ordID, QuoteID: q.QuoteID,
 		Amt: amt, InvestCcy: invest, AmtUSDT: amtUSDT,
 		Detail: fmt.Sprintf("申购成功 state=%s 订单 %s（绝对收益 %.8f %s）",
-			state, ordID, float64(q.AbsYield), invest),
+			state, ordID, quotedYield, invest),
+		Warnings: warns,
 	}, nil
 }
 
-func (e *Executor) submitDCDSim(p okx.DCDProduct, amt, amtUSDT float64, invest string) (Outcome, error) {
-	if err := e.guard.ReserveLimits(amtUSDT); err != nil {
+func (e *Executor) submitDCDSim(p okx.DCDProduct, amt, amtUSDT float64, invest string,
+	advisory bool, warns []string) (Outcome, error) {
+	if advisory {
+		warns = append(warns, e.guard.ReserveLimitsAdvisory(amtUSDT)...)
+	} else if err := e.guard.ReserveLimits(amtUSDT); err != nil {
 		_ = e.st.Audit(store.AuditEvent{
 			Event: "reject", Subject: p.ProductID, Reason: err.Error(),
 			AmtUSDT: amtUSDT, Mode: string(e.mode), Detail: "DCY 纸面申购-风控拒绝",
@@ -473,14 +626,15 @@ func (e *Executor) submitDCDSim(p okx.DCDProduct, amt, amtUSDT float64, invest s
 	}
 	_ = e.st.Audit(store.AuditEvent{
 		Event: "submit", Subject: p.ProductID, AmtUSDT: amtUSDT, Mode: string(e.mode),
-		Detail: fmt.Sprintf("[SIM] 纸面申购 %.4f %s（到期 %s）",
-			amt, invest, o.ExpTime.Format(time.RFC3339)),
+		Detail: withAdvisoryNote(fmt.Sprintf("[SIM] 纸面申购 %.4f %s（到期 %s）",
+			amt, invest, o.ExpTime.Format(time.RFC3339)), warns),
 	})
 	return Outcome{
 		Mode: e.mode, Kind: "dcd", Ref: p.ProductID, OrdID: o.ID,
 		Amt: amt, InvestCcy: invest, AmtUSDT: amtUSDT, Sim: true,
 		Detail: fmt.Sprintf("[SIM] %s：纸面申购 %.4f %s，到期 %s（预估收益 %.8f %s）",
 			o.ID, amt, invest, o.ExpTime.Format("2006-01-02"), amt*float64(p.AbsYield), invest),
+		Warnings: warns,
 	}, nil
 }
 
@@ -559,3 +713,24 @@ func settleHint(p optPlan) string {
 }
 
 func simID(kind string) string { return fmt.Sprintf("sim-%s-%d", kind, time.Now().UnixNano()) }
+
+// newClOrdID 客户端订单号（OKX 要求 ≤32 位字母数字）：用于超时后对账/去重。
+func newClOrdID() string { return fmt.Sprintf("co%d", time.Now().UnixNano()) }
+
+// normalizeQuoteYield 把 DCY 报价的 absYield 归一到小数口径。
+// 产品列表是小数（0.017 = 1.7%），但 quote 端点曾出现百分数（1.7）。
+// 用快照值做锚：快照是小数、报价 ≥1 且比例 >20 倍时按百分数处理。
+func normalizeQuoteYield(quoted, snapshot float64) float64 {
+	if quoted <= 0 {
+		return quoted
+	}
+	if snapshot > 0 && snapshot < 1 && quoted >= 1 {
+		if v := quoted / 100; v > 0 && v < 1 {
+			return v
+		}
+	}
+	if snapshot > 0 && quoted/snapshot > 20 {
+		return quoted / 100
+	}
+	return quoted
+}

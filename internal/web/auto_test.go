@@ -10,6 +10,7 @@ import (
 
 	"github.com/tp/coinoption/internal/executor"
 	"github.com/tp/coinoption/internal/market"
+	"github.com/tp/coinoption/internal/okx"
 	"github.com/tp/coinoption/internal/store"
 	"github.com/tp/coinoption/internal/strategy"
 )
@@ -17,6 +18,60 @@ import (
 func autoTestEngine(tr Trader, snap *market.Snapshot) *autoEngine {
 	f := &cachedFetcher{f: &fakeFetcher{snap: snap}, entries: map[string]cacheEntry{}}
 	return newAutoEngine(tr, f, "BTC-USDT", strategy.DefaultParams(), false)
+}
+
+// v1：有 Score 时按 Score（风险调整后 EV）排序，而不是按 raw Diff/edge。
+// 即使 A 的 DCY 相对期权领先更多，B 的单位 Delta EV 更高，也应选 B。
+func TestAutoEnginePicksBestScore(t *testing.T) {
+	snap := testSnap()
+	snap.SpotPrice = 80000
+	snap.Decisions = []strategy.Decision{
+		{Action: strategy.ActionSubscribeDual, Score: 0.01, Row: strategy.MatchRow{
+			ProductID: "edge", InvestCcy: "USDT", DcyAPR: 0.20, Diff: -0.30, Days: 10,
+		}, SuggestedAmt: 100},
+		{Action: strategy.ActionSubscribeDual, Score: 0.05, Row: strategy.MatchRow{
+			ProductID: "score", InvestCcy: "USDT", DcyAPR: 0.20, Diff: 0.01, Days: 10,
+		}, SuggestedAmt: 100},
+	}
+	snap.Products = map[string]okx.DCDProduct{
+		"edge":  {ProductID: "edge", NotionalCcy: "USDT", MinSize: 10, MaxSize: 100000, StepSz: 1},
+		"score": {ProductID: "score", NotionalCcy: "USDT", MinSize: 10, MaxSize: 100000, StepSz: 1},
+	}
+	eng := autoTestEngine(&fakeTrader{mode: executor.ModeSimLocal}, snap)
+	order, note := eng.candidate(snap, map[string]bool{}, eng.params)
+	if order == nil {
+		t.Fatalf("应产生候选，note=%q", note)
+	}
+	if order.product.ProductID != "score" {
+		t.Fatalf("应选 Score 更高的 score，实际 %s（note=%q）", order.product.ProductID, note)
+	}
+}
+
+// 回归：DCY 候选必须按 −Diff 排序（DCY 领先越多越好），不能按裸 Diff 降序。
+// 旧实现会把 Diff=+0.01（期权略好）排在 Diff=-0.30（DCY 领先 30pp）前面。
+func TestAutoEnginePicksBestDCYEdge(t *testing.T) {
+	snap := testSnap()
+	snap.SpotPrice = 80000
+	snap.Decisions = []strategy.Decision{
+		{Action: strategy.ActionSubscribeDual, Row: strategy.MatchRow{
+			ProductID: "near", InvestCcy: "USDT", DcyAPR: 0.20, Diff: 0.01, Days: 10,
+		}, SuggestedAmt: 100},
+		{Action: strategy.ActionSubscribeDual, Row: strategy.MatchRow{
+			ProductID: "far", InvestCcy: "USDT", DcyAPR: 0.20, Diff: -0.30, Days: 10,
+		}, SuggestedAmt: 100},
+	}
+	snap.Products = map[string]okx.DCDProduct{
+		"near": {ProductID: "near", NotionalCcy: "USDT", MinSize: 10, MaxSize: 100000, StepSz: 1},
+		"far":  {ProductID: "far", NotionalCcy: "USDT", MinSize: 10, MaxSize: 100000, StepSz: 1},
+	}
+	eng := autoTestEngine(&fakeTrader{mode: executor.ModeSimLocal}, snap)
+	order, note := eng.candidate(snap, map[string]bool{}, eng.params)
+	if order == nil {
+		t.Fatalf("应产生候选，note=%q", note)
+	}
+	if order.product.ProductID != "far" {
+		t.Fatalf("应选 DCY 领先 30pp 的 far，实际 %s（note=%q）", order.product.ProductID, note)
+	}
 }
 
 // 自动张数 = 额度 / (现价 × ctVal × ctMult)：BTC 1 张 0.01 BTC，
@@ -33,7 +88,7 @@ func TestAutoEngineCandidateSizesByContractValue(t *testing.T) {
 
 	tr := &fakeTrader{mode: executor.ModeSimLocal}
 	eng := autoTestEngine(tr, snap)
-	order, note := eng.candidate(snap, map[string]bool{})
+	order, note := eng.candidate(snap, map[string]bool{}, eng.params)
 	if order == nil {
 		t.Fatalf("应产生候选，note=%q", note)
 	}
@@ -59,7 +114,7 @@ func TestAutoEngineSkipsSettleMismatch(t *testing.T) {
 	snap.Decisions[0].Row.SettleMismatch = true
 
 	eng := autoTestEngine(&fakeTrader{mode: executor.ModeSimLocal}, snap)
-	order, note := eng.candidate(snap, map[string]bool{})
+	order, note := eng.candidate(snap, map[string]bool{}, eng.params)
 	if order != nil {
 		t.Fatalf("抵押品不一致不应自动下单: %+v", order)
 	}
@@ -81,7 +136,7 @@ func TestAutoEngineSkipsDone(t *testing.T) {
 	snap.Decisions[0].Row.OptExact = true
 
 	eng := autoTestEngine(&fakeTrader{mode: executor.ModeSimLocal}, snap)
-	order, _ := eng.candidate(snap, map[string]bool{"opt|BTC-USD-261106-80000-C": true})
+	order, _ := eng.candidate(snap, map[string]bool{"opt|BTC-USD-261106-80000-C": true}, eng.params)
 	if order != nil {
 		t.Fatalf("已做过的合约不应重复: %+v", order)
 	}
@@ -103,7 +158,7 @@ func TestAutoEngineMinDiffGate(t *testing.T) {
 	p := strategy.DefaultParams()
 	p.AutoMinDiff = 0.35 // 30pp < 35pp
 	eng.SetParams(p)
-	order, note := eng.candidate(snap, map[string]bool{})
+	order, note := eng.candidate(snap, map[string]bool{}, eng.params)
 	if order != nil {
 		t.Fatalf("差%% 未达门槛不应下单: %+v", order)
 	}
@@ -114,7 +169,7 @@ func TestAutoEngineMinDiffGate(t *testing.T) {
 	// 门槛降到 25pp 后同一候选可执行。
 	p.AutoMinDiff = 0.25
 	eng.SetParams(p)
-	if order, _ := eng.candidate(snap, map[string]bool{}); order == nil {
+	if order, _ := eng.candidate(snap, map[string]bool{}, eng.params); order == nil {
 		t.Fatal("达到门槛后应产生候选")
 	}
 
@@ -125,7 +180,7 @@ func TestAutoEngineMinDiffGate(t *testing.T) {
 	p.AutoMinDiff = 0.05
 	eng2 := autoTestEngine(&fakeTrader{mode: executor.ModeSimLocal}, snap2)
 	eng2.SetParams(p)
-	order, note = eng2.candidate(snap2, map[string]bool{})
+	order, note = eng2.candidate(snap2, map[string]bool{}, eng2.params)
 	if order != nil {
 		t.Fatalf("DCY 反方向差值未达门槛不应下单: %+v", order)
 	}
@@ -359,5 +414,84 @@ func TestAPIAutoFailuresEndToEnd(t *testing.T) {
 	rows, err := st.LoadAutoFailures()
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("失败记录未落盘: rows=%+v err=%v", rows, err)
+	}
+}
+
+// pnlTrader 包装 fakeTrader，注入「当日已实现盈亏」。
+type pnlTrader struct {
+	*fakeTrader
+	pnl float64
+	err error
+}
+
+func (p *pnlTrader) RealizedPnLToday(time.Time) (float64, error) { return p.pnl, p.err }
+
+// 日亏损门禁：亏损达到 capital×DailyLossPct 时必须暂停自动执行。
+func TestAutoEngineDailyLossPause(t *testing.T) {
+	snap := testSnap()
+	tr := &pnlTrader{fakeTrader: &fakeTrader{mode: executor.ModeSimLocal}, pnl: -1000}
+	eng := newAutoEngine(tr, &cachedFetcher{f: &fakeFetcher{snap: snap}, entries: map[string]cacheEntry{}},
+		"BTC-USDT", strategy.DefaultParams(), true)
+	order, note := eng.candidate(snap, map[string]bool{}, eng.params)
+	if order != nil {
+		t.Fatalf("日亏损已达上限仍产生候选: %+v", order)
+	}
+	if !strings.Contains(note, "自动暂停") {
+		t.Fatalf("应提示日亏损暂停，实际 %q", note)
+	}
+
+	// 亏损未达线时不应被这条门禁拦住（用 note 区分）。
+	tr.pnl = -10
+	_, note2 := eng.candidate(snap, map[string]bool{}, eng.params)
+	if strings.Contains(note2, "自动暂停") {
+		t.Fatalf("亏损未达线不应暂停: %q", note2)
+	}
+}
+
+// 结果未知（可能已成交）时保持去重占坑，不能被 60s 冷却后的下一轮重复提交。
+func TestAutoEngineAmbiguousFailureKeepsDedupe(t *testing.T) {
+	snap := testSnap()
+	snap.SpotPrice = 80000
+	snap.Decisions = snap.Decisions[:1]
+	snap.Decisions[0].Row.OptBidPx = "0.01"
+	snap.Decisions[0].Row.OptCtVal = 0.01
+	snap.Decisions[0].Row.OptAPR = 0.5
+	snap.Decisions[0].Row.DcyAPR = 0.2
+	snap.Decisions[0].Row.Diff = 0.3
+	snap.Decisions[0].Row.OptExact = true
+
+	tr := &fakeTrader{mode: executor.ModeSimLocal,
+		fail: &okx.AmbiguousError{Op: "option_order", Err: errors.New("timeout")}}
+	eng := newAutoEngine(tr, &cachedFetcher{f: &fakeFetcher{snap: snap}, entries: map[string]cacheEntry{}},
+		"BTC-USDT", strategy.DefaultParams(), true)
+	eng.cooldown = 0
+	eng.step()
+	if tr.optCalls != 1 {
+		t.Fatalf("应提交 1 次，实际 %d", tr.optCalls)
+	}
+	key := "opt|BTC-USD-261106-80000-C"
+	if !eng.done[key] {
+		t.Fatalf("结果未知必须保持去重占坑: %v", eng.done)
+	}
+	eng.step()
+	if tr.optCalls != 1 {
+		t.Fatalf("结果未知后不应重复提交，实际 %d", tr.optCalls)
+	}
+}
+
+// 行情过期（WS 断线/DCY 刷新失败）时必须暂停自动执行，而不是拿旧报价下单。
+func TestAutoEngineStaleQuotesPaused(t *testing.T) {
+	snap := testSnap()
+	snap.DcdAt = time.Now().Add(-2 * time.Minute)
+	eng := autoTestEngine(&fakeTrader{mode: executor.ModeSimLocal}, snap)
+	if _, note := eng.candidate(snap, map[string]bool{}, eng.params); !strings.Contains(note, "过期") {
+		t.Fatalf("DCY 报价过期应暂停，实际 %q", note)
+	}
+
+	snap2 := testSnap()
+	snap2.SpotAt = time.Now().Add(-2 * time.Minute)
+	eng2 := autoTestEngine(&fakeTrader{mode: executor.ModeSimLocal}, snap2)
+	if _, note := eng2.candidate(snap2, map[string]bool{}, eng2.params); !strings.Contains(note, "过期") {
+		t.Fatalf("现货过期应暂停，实际 %q", note)
 	}
 }

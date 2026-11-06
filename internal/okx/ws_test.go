@@ -184,3 +184,96 @@ func TestWSDialerPrefersExplicitProxy(t *testing.T) {
 		t.Fatalf("显式代理应优先，实际 %v", u)
 	}
 }
+
+// 订阅被拒（error 事件带 arg）后应自动重试单条订阅，而不是等整条连接重连。
+func TestStreamTickersResubscribesRejected(t *testing.T) {
+	old := wsResubDelay
+	wsResubDelay = 20 * time.Millisecond
+	defer func() { wsResubDelay = old }()
+
+	var mu sync.Mutex
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			_, raw, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var msg struct {
+				ID   string              `json:"id"`
+				Args []map[string]string `json:"args"`
+			}
+			if json.Unmarshal(raw, &msg) != nil || len(msg.Args) == 0 {
+				continue
+			}
+			id := msg.Args[0]["instId"]
+			mu.Lock()
+			got = append(got, id)
+			n := len(got)
+			mu.Unlock()
+			if n == 1 {
+				// 第一次拒绝，并带上 arg 让客户端知道是哪一条。
+				_ = conn.WriteJSON(map[string]any{
+					"event": "error", "code": "60018", "msg": "rejected",
+					"arg": map[string]string{"channel": "tickers", "instId": id},
+				})
+				continue
+			}
+			_ = conn.WriteJSON(map[string]any{
+				"arg": map[string]string{"channel": "tickers", "instId": id},
+				"data": []map[string]string{{
+					"instType": "OPTION", "instId": id, "last": "1", "bidPx": "1", "askPx": "2", "ts": "1",
+				}},
+			})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient(WithWSURL("ws" + strings.TrimPrefix(srv.URL, "http")))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tick := make(chan OptionTicker, 1)
+	status := make(chan string, 4)
+	go func() {
+		_ = c.StreamTickers(ctx, []string{"BTC-USD-261113-75000-P"}, func(t OptionTicker) {
+			select {
+			case tick <- t:
+			default:
+			}
+		}, func(st WSStatus) {
+			if st.Err != "" {
+				select {
+				case status <- st.Err:
+				default:
+				}
+			}
+		})
+	}()
+	select {
+	case s := <-status:
+		if !strings.Contains(s, "重试订阅") {
+			t.Fatalf("状态应提示重试: %q", s)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("没有收到订阅错误状态")
+	}
+	select {
+	case t0 := <-tick:
+		if t0.InstID != "BTC-USD-261113-75000-P" {
+			t.Fatalf("unexpected ticker: %+v", t0)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("重试订阅后仍未收到行情")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) < 2 || got[0] != got[1] {
+		t.Fatalf("订阅序列 = %v，期望同一条被重试", got)
+	}
+}

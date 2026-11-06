@@ -7,12 +7,17 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -46,24 +51,40 @@ func main() {
 	positions := flag.Bool("positions", false, "查看持仓：风控快照 + 纸面单 + 平台单")
 	settle := flag.Bool("settle", false, "扫描到期纸面单并按当前现价结算（模拟口径）")
 	guardOnly := flag.Bool("guard", false, "只打印风控守卫状态")
+	resetPaper := flag.Bool("reset-paper", false, "清除 open 状态的纸面在持单（需 --yes；真实仓位不动）")
+	redeemQuote := flag.String("redeem-quote", "", "查询提前赎回报价（ordId；仅 live，展示赎回金额/是否亏损）")
+	redeemOrd := flag.String("redeem", "", "确认提前赎回（ordId；需 --yes；未给 --quote-id 时自动申请报价）")
+	quoteID := flag.String("quote-id", "", "--redeem 复用已有报价 ID（可选）")
+	yes := flag.Bool("yes", false, "确认破坏性操作（--reset-paper / --redeem）")
+	noLock := flag.Bool("no-lock", false, "允许多个进程共用同一数据目录（不推荐；会各持一份风控状态）")
 	storeDir := flag.String("store", "", "数据目录（默认 ~/.coinoption）")
 	limits := flag.String("limits", "", "风控上限覆盖 \"total,perOrder,concurrent,perDay\"（默认 5000,2000,5,10；仅测试/期权大名义需要）")
 
 	uly := flag.String("uly", "BTC-USDT", "标的（BTC-USDT | ETH-USDT | SOL-USDT）")
 	proxy := flag.String("proxy", os.Getenv("COINOPTION_PROXY"), "HTTP/SOCKS5 代理地址，空则直连；也可用环境变量 COINOPTION_PROXY")
 	egress := flag.Bool("egress", false, "查询经代理后的真实出口 IP（核对 OKX API Key IP 白名单；走同一代理链路）")
+	// ── 历史滚动回放 + 情景压力（公开日线，无需 Key）──
+	replay := flag.Bool("replay", false, "历史滚动回放 + 情景压力（合成 DCY 定价，验证门槛/风控数学）")
+	replayDays := flag.Int("days", 730, "--replay 回放天数（默认 2 年）")
+	replayCapital := flag.Float64("capital", 1000, "--replay 初始资金（USDT）")
+	replayTenor := flag.Int("tenor", 22, "--replay 期限（天）")
+	replayStrikes := flag.String("strikes", "0.90", "--replay 行权价/现价，逗号分隔（如 0.90,0.92）")
+	replayBetas := flag.String("betas", "1.0,0.99,0.98,0.95", "--replay DCY 收益系数 beta（1=平台不抽价差）")
+	replayDeltas := flag.String("deltas", "0.30,0.25,0.20", "--replay MaxAbsDelta 扫描")
+	replayOut := flag.String("out", "", "--replay JSON 报告输出路径")
 	apiKey := flag.String("key", os.Getenv("COINOPTION_API_KEY"), "API Key（环境变量 COINOPTION_API_KEY）")
 	secret := flag.String("secret", os.Getenv("COINOPTION_SECRET"), "API Secret（环境变量 COINOPTION_SECRET）")
 	passphrase := flag.String("passphrase", os.Getenv("COINOPTION_PASSPHRASE"), "API Passphrase（环境变量 COINOPTION_PASSPHRASE）")
 	webEnabled := flag.Bool("web", false, "启动 Web 看板（GET /；API：/api/decisions?uly=BTC-USDT&exp=2026-11-06）")
-	webAddr := flag.String("addr", ":8080", "Web 服务监听地址（--web 开启时生效）")
+	webAddr := flag.String("addr", "127.0.0.1:8080", "Web 服务监听地址（--web 开启时生效；默认仅本机，局域网/公网请显式改）")
 	webCode := flag.String("web-code", os.Getenv("COINOPTION_WEB_CODE"), "Web 授权码（整站访问控制；不传则读取 settings.json，首次自动生成并打印；也可用环境变量 COINOPTION_WEB_CODE）")
 	readOnly := flag.Bool("read-only", false, "Web 看板只读（不装配执行器、不自动交易）；默认开启交易，自动交易沿用 settings.json（默认关闭）")
 	wsEnabled := flag.Bool("ws", true, "启用 OKX WebSocket 实时行情（断线自动重连；--ws=false 回退 REST 轮询）")
 	flag.Parse()
 
 	switch {
-	case *positions || *settle || *guardOnly || *order != "":
+	case *positions || *settle || *guardOnly || *resetPaper || *order != "" ||
+		*redeemQuote != "" || *redeemOrd != "":
 		cli := cliExec{
 			mode: *mode, proxy: *proxy,
 			apiKey: *apiKey, secret: *secret, passphrase: *passphrase,
@@ -79,6 +100,16 @@ func main() {
 			err = cli.runSettle()
 		case *guardOnly:
 			err = cli.runGuard()
+		case *resetPaper:
+			if !*yes {
+				err = fmt.Errorf("--reset-paper 会删除 open 纸面在持单，请加 --yes 确认")
+			} else {
+				err = cli.runResetPaper()
+			}
+		case *redeemQuote != "":
+			err = cli.runRedeemQuote(*redeemQuote)
+		case *redeemOrd != "":
+			err = cli.runRedeem(*redeemOrd, *quoteID, *yes)
 		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "exec failed: %v\n", err)
@@ -88,6 +119,12 @@ func main() {
 	}
 
 	switch {
+	case *replay:
+		if err := runReplay(*uly, *proxy, *replayDays, *replayCapital, *replayTenor,
+			*replayStrikes, *replayBetas, *replayDeltas, *replayOut); err != nil {
+			fmt.Fprintf(os.Stderr, "replay failed: %v\n", err)
+			os.Exit(1)
+		}
 	case *egress:
 		if err := runEgress(*proxy); err != nil {
 			fmt.Fprintf(os.Stderr, "egress check failed: %v\n", err)
@@ -144,7 +181,6 @@ func main() {
 				fmt.Fprintln(os.Stderr, "⚠ --addr 监听所有网卡；建议改为 127.0.0.1:8080，避免局域网内被下单")
 			}
 		} else {
-			client = buildClient(*proxy, *apiKey, *secret, *passphrase, *demo)
 			var err error
 			st, err = store.New(*storeDir)
 			if err != nil {
@@ -152,26 +188,78 @@ func main() {
 				os.Exit(1)
 			}
 		}
+		// 只读看板不装配执行器、不下单，允许与 TUI 并存（否则「TUI 盯盘 + 浏览器看板」
+		// 这种最常见的只读组合会被锁死）。会写风控/订单的进程才抢独占锁。
+		if !*readOnly {
+			if lk, lerr := acquireStoreLock(st.Dir(), *noLock); lerr != nil {
+				fmt.Fprintf(os.Stderr, "❌ %v\n", lerr)
+				os.Exit(1)
+			} else if lk != nil {
+				defer lk.Close()
+			}
+		}
 		settings, err := st.LoadSettings()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[warn] 读取 settings.json 失败，使用默认值: %v\n", err)
 			settings = store.DefaultSettings()
 		}
+		// 只读看板没有 executor 装配的 client，需要在这里按
+		// 「启动参数/环境变量 → settings.json」的优先级建一个（供私有 DCY 接口用）。
+		if *readOnly {
+			key, secret, passphrase := resolveAPICreds(*apiKey, *secret, *passphrase, settings)
+			client = buildClient(*proxy, key, secret, passphrase, *demo)
+		}
+		// 启动参数/环境变量优先于 settings.json 中的 API 凭证；有它们时设置页
+		// 只做说明，不允许覆盖当前进程正在用的凭证。
+		apiExternal := strings.TrimSpace(*apiKey) != "" ||
+			strings.TrimSpace(*secret) != "" ||
+			strings.TrimSpace(*passphrase) != ""
 
 		fetcher := &market.Fetcher{C: client, UseWS: *wsEnabled}
+		if st != nil {
+			fetcher.IVHist = market.NewIVHistory(filepath.Join(st.Dir(), "iv_samples.jsonl"))
+		}
 		defer fetcher.Close()
-		opts := make([]web.ServerOption, 0, 8)
-		opts = append(opts, web.WithSettingsStore(st), web.WithAutoFailures(st))
+
+		// 启动即应用 settings.json：此前只覆盖了 4 个旧字段，策略层一直用
+		// DefaultParams（capital=5000），而 guard 用的是 settings 里的资金，
+		// 且页面 /api/guide 显示已配置阈值、决策却用默认值。统一走 ApplyTo。
+		startupParams := strategy.DefaultParams()
+		startupParams.MinOptionEdge = settings.MinOptionEdgePP / 100
+		startupParams.MinAbsEdge = settings.MinAbsEdgePct / 100
+		startupParams.MaxStrikeGapPct = settings.MaxStrikeGapPct
+		startupParams.AutoMinDiff = settings.MinDiffPct / 100
+		settings.ApplyTo(&startupParams)
+		if ex != nil {
+			if lim := ex.State().Limits.PerOrderUSDT; lim > 0 {
+				startupParams.CapitalCap = lim
+			}
+		}
+		fetcher.SetParams(startupParams)
+
+		opts := make([]web.ServerOption, 0, 11)
+		opts = append(opts,
+			web.WithSettingsStore(st),
+			web.WithAutoFailures(st),
+			web.WithAPIKeyOverride(apiExternal),
+			web.WithLimitsOverride(*limits != ""),
+			web.WithCredentialSetter(client),
+		)
 
 		// 授权码优先级：--web-code / COINOPTION_WEB_CODE > settings.json 摘要 > 随机生成。
 		switch {
 		case strings.TrimSpace(*webCode) != "":
 			code := strings.TrimSpace(*webCode)
 			opts = append(opts, web.WithAuthCode(code))
-			if h := web.HashCode(code); settings.WebAuthCodeHash != h {
-				settings.WebAuthCodeHash = h
-				if err := st.SaveSettings(settings); err != nil {
-					fmt.Fprintf(os.Stderr, "[warn] 授权码摘要保存失败: %v\n", err)
+			// 已存摘要能校验同一个码就沿用（避免每次启动重新派生）；否则升级为新摘要。
+			if !web.VerifyCodeHash(settings.WebAuthCodeHash, code) {
+				if spec, herr := web.NewCodeHash(code); herr != nil {
+					fmt.Fprintf(os.Stderr, "[warn] 授权码摘要生成失败: %v\n", herr)
+				} else {
+					settings.WebAuthCodeHash = spec
+					if err := st.SaveSettings(settings); err != nil {
+						fmt.Fprintf(os.Stderr, "[warn] 授权码摘要保存失败: %v\n", err)
+					}
 				}
 			}
 			fmt.Fprintln(os.Stderr, "🔑 Web 授权码：使用 --web-code / COINOPTION_WEB_CODE 指定的值")
@@ -184,7 +272,12 @@ func main() {
 				fmt.Fprintf(os.Stderr, "生成 Web 授权码失败: %v\n", gerr)
 				os.Exit(1)
 			}
-			settings.WebAuthCodeHash = web.HashCode(code)
+			spec, herr := web.NewCodeHash(code)
+			if herr != nil {
+				fmt.Fprintf(os.Stderr, "生成授权码摘要失败: %v\n", herr)
+				os.Exit(1)
+			}
+			settings.WebAuthCodeHash = spec
 			if err := st.SaveSettings(settings); err != nil {
 				fmt.Fprintf(os.Stderr, "[warn] 授权码摘要保存失败（下次启动会重新生成）: %v\n", err)
 			}
@@ -201,15 +294,7 @@ func main() {
 				_ = st.SaveSettings(settings)
 				fmt.Fprintln(os.Stderr, "⚠ 实盘启动：自动交易已强制关闭，需在 Web 设置页当次开启")
 			}
-			p := strategy.DefaultParams()
-			p.MinOptionEdge = settings.MinOptionEdgePP / 100
-			p.MinAbsEdge = settings.MinAbsEdgePct / 100
-			p.MaxStrikeGapPct = settings.MaxStrikeGapPct
-			p.AutoMinDiff = settings.MinDiffPct / 100
-			if lim := ex.State().Limits.PerOrderUSDT; lim > 0 {
-				p.CapitalCap = lim
-			}
-			opts = append(opts, web.WithTrader(ex), web.WithAutoTrade(autoDefault), web.WithAutoParams(p))
+			opts = append(opts, web.WithTrader(ex), web.WithAutoTrade(autoDefault), web.WithAutoParams(startupParams))
 		}
 		srv := web.New(fetcher, *uly, *webAddr, opts...)
 		tradeTxt := "只读"
@@ -228,7 +313,7 @@ func main() {
 			display = "0.0.0.0" + display
 		}
 		fmt.Printf("web 服务已启动: http://%s  （整站需授权码；GET / 看板 / GET /api/decisions / %s）\n", display, tradeTxt)
-		if err := srv.ListenAndServe(); err != nil {
+		if err := serveWeb(srv); err != nil {
 			fmt.Fprintf(os.Stderr, "web server failed: %v\n", err)
 			os.Exit(1)
 		}
@@ -244,6 +329,12 @@ func main() {
 			fmt.Fprintf(os.Stderr, "executor 装配失败: %v\n", err)
 			os.Exit(1)
 		}
+		if lk, lerr := acquireStoreLock(ex.Store().Dir(), *noLock); lerr != nil {
+			fmt.Fprintf(os.Stderr, "❌ %v\n", lerr)
+			os.Exit(1)
+		} else if lk != nil {
+			defer lk.Close()
+		}
 		if ex.Mode() == executor.ModeLive {
 			if msg, err := ex.SyncLiveGuard(); err != nil {
 				fmt.Fprintf(os.Stderr, "[warn] 平台仓位恢复失败: %v\n", err)
@@ -253,6 +344,9 @@ func main() {
 		}
 		client := buildClient(*proxy, *apiKey, *secret, *passphrase, *demo)
 		fetcher := &market.Fetcher{C: client, UseWS: *wsEnabled}
+		if ex != nil {
+			fetcher.IVHist = market.NewIVHistory(filepath.Join(ex.Store().Dir(), "iv_samples.jsonl"))
+		}
 		defer fetcher.Close()
 		run := ui.New(fetcher, ex, *uly)
 		p := tea.NewProgram(run, tea.WithAltScreen())
@@ -261,6 +355,47 @@ func main() {
 			os.Exit(1)
 		}
 	}
+}
+
+// serveWeb 启动 HTTP 服务并处理 SIGINT/SIGTERM：先停止接新连接、给在途请求
+// 最多 10s 收尾，而不是被 Ctrl-C 直接打断（正在提交的订单可能只写了一半审计）。
+func serveWeb(srv *http.Server) error {
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sig)
+
+	select {
+	case err := <-errCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case s := <-sig:
+		fmt.Fprintf(os.Stderr, "\n收到 %s，正在优雅退出（最多等 10s）…\n", s)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			_ = srv.Close()
+			return fmt.Errorf("优雅退出失败: %w", err)
+		}
+		fmt.Fprintln(os.Stderr, "已停止：不再接受新请求，在途请求已收尾。")
+		return nil
+	}
+}
+
+// acquireStoreLock 长驻进程/下单类命令的独占锁；失败时给出可操作提示。
+func acquireStoreLock(dir string, noLock bool) (*store.Lock, error) {
+	if noLock {
+		return nil, nil
+	}
+	lk, err := store.AcquireLock(dir)
+	if err != nil {
+		return nil, fmt.Errorf("%w\n   另一个 coinoption 进程正在使用同一份风控状态；确认要让两个进程并存请加 --no-lock", err)
+	}
+	return lk, nil
 }
 
 func runSmoke(uly, proxy, apiKey, secret, passphrase string, demo bool) error {

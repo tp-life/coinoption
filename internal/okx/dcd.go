@@ -101,9 +101,13 @@ func (c *Client) GetDCDProducts(baseCcy, quoteCcy, optType string) ([]DCDProduct
 
 // PostDCDQuote 阶段一：请求实时报价（quoteId 有有效期）。
 func (c *Client) PostDCDQuote(req DCDQuoteRequest) ([]DCDQuote, error) {
-	q, err := c.postDecode[DCDQuote](pathDCDQuote, req)
+	// 报价无副作用，可按幂等请求重试（5xx/超时重发不会造成重复申购）。
+	q, err := c.postDecodeIdem[DCDQuote](pathDCDQuote, req)
 	if err != nil {
 		return nil, err
+	}
+	if q == nil {
+		return nil, errNoData
 	}
 	return []DCDQuote{*q}, nil
 }
@@ -114,6 +118,9 @@ func (c *Client) PostDCDTrade(quoteID string) ([]DCDResult, error) {
 	r, err := c.postDecode[DCDResult](pathDCDTrade, body)
 	if err != nil {
 		return nil, err
+	}
+	if r == nil {
+		return nil, errNoData
 	}
 	return []DCDResult{*r}, nil
 }
@@ -168,4 +175,48 @@ type DCDOrder struct {
 	ExpTime         int64  `json:"expTime,string"`
 	CTime           int64  `json:"cTime,string"`
 	UTime           int64  `json:"uTime,string"`
+	// 提前赎回窗口（毫秒）；0 = 该产品/币对不支持提前赎回（BTC/ETH 币对）。
+	RedeemStartTime flexInt `json:"redeemStartTime"`
+	RedeemEndTime   flexInt `json:"redeemEndTime"`
+	SettleTime      flexInt `json:"settleTime"`
+}
+
+// DCDRedeemQuote 提前赎回报价（redeem-quote）。
+//
+// 赎回只能拿回**申购币种**，金额可能低于本金（亏损），下单前必须展示。
+// 费率/金额按平台返回为准；ValidUntil 为毫秒时间戳。
+type DCDRedeemQuote struct {
+	OrdID      string   `json:"ordId"`
+	QuoteID    string   `json:"quoteId"`
+	RedeemCcy  string   `json:"redeemCcy"`
+	RedeemSz   flexReal `json:"redeemSz"`
+	TermRate   flexReal `json:"termRate"`
+	ValidUntil flexInt  `json:"validUntil"`
+}
+
+// PostDCDRedeemQuote 申请提前赎回报价（10次/60s，无副作用，可安全重试）。
+func (c *Client) PostDCDRedeemQuote(ordID string) (*DCDRedeemQuote, error) {
+	body := map[string]string{"ordId": ordID}
+	q, err := c.postDecodeIdem[DCDRedeemQuote](pathDCDRedeemQuote, body)
+	if err != nil {
+		return nil, err
+	}
+	if q == nil {
+		return nil, errNoData
+	}
+	return q, nil
+}
+
+// PostDCDRedeem 确认提前赎回（2次/60s，写操作：不重试，结果不明返回
+// *AmbiguousError，调用方必须查订单状态而不是重发）。
+func (c *Client) PostDCDRedeem(ordID, quoteID string) ([]DCDResult, error) {
+	body := map[string]string{"ordId": ordID, "quoteId": quoteID}
+	r, err := c.postDecode[DCDResult](pathDCDRedeem, body)
+	if err != nil {
+		return nil, err
+	}
+	if r == nil {
+		return nil, errNoData
+	}
+	return []DCDResult{*r}, nil
 }

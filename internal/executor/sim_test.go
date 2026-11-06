@@ -24,8 +24,9 @@ func TestSettleDualCExercised(t *testing.T) {
 	if !r.Exercised || r.PrincipalCcy != "USDT" {
 		t.Fatalf("结算 79000≥76000 应行权交付 USDT: %+v", r)
 	}
-	if !nearly(r.PrincipalSz, 76000) || !nearly(r.YieldSz, 0.005) {
-		t.Fatalf("交付应 76000 USDT + 0.005 USDT: %+v", r)
+	// 被行权时收益也要按 strike 折成 USDT：1 BTC × 0.5% = 0.005 BTC → 380 USDT。
+	if !nearly(r.PrincipalSz, 76000) || !nearly(r.YieldSz, 380) {
+		t.Fatalf("交付应 76000 USDT + 380 USDT: %+v", r)
 	}
 }
 
@@ -127,8 +128,9 @@ func TestSettleDueEndToEnd(t *testing.T) {
 	e := &Executor{
 		guard: NewGuard(DefaultLimits()),
 		st:    st,
+		spot:  func(string) (float64, error) { return 79000, nil },
 	}
-	got, err := e.SettleDue(now, 79000)
+	got, err := e.SettleDue(now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,11 +140,16 @@ func TestSettleDueEndToEnd(t *testing.T) {
 	if got[0].ID != "sim-dcd-t1" || got[0].State != "settled" {
 		t.Fatalf("结算单不符: %+v", got[0])
 	}
-	if !nearly(got[0].YieldSz, 0.005) {
-		t.Fatalf("收益应 0.005: %+v", got[0])
+	// C 方向结算 79000 ≥ 76000 → 被行权：交付 76000 + 380 USDT，
+	// 相对投入 1 BTC（79000）亏 2620 USDT。
+	if !nearly(got[0].YieldSz, 380) {
+		t.Fatalf("行权收益应 380 USDT: %+v", got[0])
+	}
+	if !nearly(got[0].PnlUSDT, -2620) {
+		t.Fatalf("已实现盈亏应 -2620 USDT: %+v", got[0])
 	}
 	// 已结算单不重复结算。
-	_, err = e.SettleDue(now.Add(time.Hour), 79000)
+	_, err = e.SettleDue(now.Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,11 +159,89 @@ func TestSettleDueEndToEnd(t *testing.T) {
 func osCreateStore(dir string) (*store.Store, error) { return store.New(dir) }
 
 func newSimDCD(id string, optType rune, strike, absYield, amt float64, exp time.Time) store.SimOrder {
+	ccy, usdt := "BTC", amt*79000
+	if optType == 'P' {
+		ccy, usdt = "USDT", amt
+	}
 	return store.SimOrder{
 		ID: id, Kind: "dcd", Mode: string(ModeSimLocal),
 		ProductID: "BTC-USDT-TEST", OptType: optType,
 		Strike: strike, AbsYield: absYield,
-		Amt: amt, InvestCcy: "BTC", AmtUSDT: amt * 79000,
+		Amt: amt, InvestCcy: ccy, AmtUSDT: usdt,
 		ExpTime: exp, CreatedAt: time.Now(), State: "open",
+	}
+}
+
+// 结算必须按每笔订单自己的标的取价，且结算后释放风控敞口、写入 USDT 盈亏。
+func TestSettleDuePerUnderlyingAndRelease(t *testing.T) {
+	st, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	mk := func(id, product string, strike, amt float64) store.SimOrder {
+		return store.SimOrder{
+			ID: id, Kind: "dcd", Mode: string(ModeSimLocal), ProductID: product,
+			OptType: 'P', Strike: strike, AbsYield: 0.005,
+			Amt: amt, InvestCcy: "USDT", AmtUSDT: amt,
+			ExpTime: now.Add(-time.Hour), CreatedAt: now.Add(-48 * time.Hour),
+			State: "open",
+		}
+	}
+	if err := st.SaveSim(mk("btc", "BTC-USDT-TEST", 76000, 76000)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveSim(mk("eth", "ETH-USDT-TEST", 3000, 3000)); err != nil {
+		t.Fatal(err)
+	}
+	var asked []string
+	e := &Executor{
+		guard: NewGuard(DefaultLimits()),
+		st:    st,
+		spot: func(ccy string) (float64, error) {
+			asked = append(asked, ccy)
+			switch ccy {
+			case "BTC":
+				return 79000, nil
+			case "ETH":
+				return 3100, nil
+			}
+			return 0, nil
+		},
+	}
+	e.guard.Restore([]float64{76000, 3000}, 0) // 两笔在持敞口
+	got, err := e.SettleDue(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("应结算 2 笔，实际 %d", len(got))
+	}
+	if len(asked) != 2 {
+		t.Fatalf("应按标的分两次取价，实际 %v", asked)
+	}
+	// BTC: 76000×0.005 = 380 USDT；ETH: 3000×0.005 = 15 USDT。
+	if !nearly(got[0].PnlUSDT, 380) || !nearly(got[1].PnlUSDT, 15) {
+		t.Fatalf("盈亏不符: %+v", got)
+	}
+	if !nearly(got[0].SettlePx, 79000) || !nearly(got[1].SettlePx, 3100) {
+		t.Fatalf("结算价未按标的区分: %+v", got)
+	}
+	if g := e.guard.Snapshot(); g.OpenCount != 0 || g.ExposureUSDT != 0 {
+		t.Fatalf("结算后应释放敞口: %+v", g)
+	}
+}
+
+func TestNormalizeQuoteYield(t *testing.T) {
+	cases := []struct{ quoted, snap, want float64 }{
+		{0.017, 0.017, 0.017},   // 已是小数
+		{1.7, 0.017, 0.017},     // 百分数形态
+		{0.034, 0, 0.034},       // 无锚、已是小数
+		{0.0204, 0.017, 0.0204}, // 20% 以内偏差（如 0.0204 vs 0.017）不误判
+	}
+	for _, c := range cases {
+		if got := normalizeQuoteYield(c.quoted, c.snap); !nearly(got, c.want) {
+			t.Fatalf("normalizeQuoteYield(%v,%v)=%v，期望 %v", c.quoted, c.snap, got, c.want)
+		}
 	}
 }

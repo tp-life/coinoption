@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -150,6 +151,36 @@ func TestLimitsWithCapital(t *testing.T) {
 	}
 }
 
+// 覆盖值只改绝对上限，不动资金派生逻辑；0 表示保留派生值。
+func TestLimitsWithRiskOverrides(t *testing.T) {
+	l := DefaultLimits().WithCapital(1000).WithRiskOverrides(6000, 500)
+	if l.TotalExposureUSDT != 6000 || l.PerOrderUSDT != 500 {
+		t.Fatalf("覆盖值不符: %+v", l)
+	}
+	if got := DefaultLimits().WithCapital(1000).WithRiskOverrides(0, 0); got.TotalExposureUSDT != 1000 || got.PerOrderUSDT != 400 {
+		t.Fatalf("0 应保留派生值: %+v", got)
+	}
+}
+
+// 在持已超过总敞口上限时，错误信息要明确提示「调高上限或先减仓」。
+func TestGuardExposureOverLimitHint(t *testing.T) {
+	g := newTestGuard(Limits{TotalExposureUSDT: 1000, PerOrderUSDT: 400, MaxConcurrent: 5, MaxSessionsPerDay: 10})
+	g.RestoreAggregate(4994.51, 1)
+	err := g.Check(400)
+	if err == nil || !strings.Contains(err.Error(), "在持已超过总敞口上限") {
+		t.Fatalf("应带减仓/调高上限提示: %v", err)
+	}
+}
+
+// 覆盖总敞口后，已有 4994.51 在持 + 新单 400 应放行。
+func TestGuardRiskOverrideAllowsNewOrder(t *testing.T) {
+	g := newTestGuard(Limits{TotalExposureUSDT: 6000, PerOrderUSDT: 400, MaxConcurrent: 5, MaxSessionsPerDay: 10})
+	g.RestoreAggregate(4994.51, 1)
+	if err := g.Check(400); err != nil {
+		t.Fatalf("6000 上限下 4994.51+400 应放行: %v", err)
+	}
+}
+
 // 运行期改资金总额：上限立即生效，已占用的敞口不回收；
 // 新上限低于当前敞口时后续下单被拒（但在持订单不受影响）。
 func TestGuardSetLimitsRuntime(t *testing.T) {
@@ -170,5 +201,32 @@ func TestGuardSetLimitsRuntime(t *testing.T) {
 	var le *LimitError
 	if err == nil || !AsLimit(err, &le) || le.Field != "total_exposure" {
 		t.Fatalf("调低资金到低于敞口后应拒 total_exposure: %v", err)
+	}
+}
+
+// live 定时对账必须用平台数据「替换」而不是累加，否则到期后额度永不回收。
+func TestGuardResetOpenReplaces(t *testing.T) {
+	g := NewGuard(DefaultLimits())
+	g.Restore([]float64{100, 100}, 0)
+	if s := g.Snapshot(); s.OpenCount != 2 || !nearly(s.ExposureUSDT, 200) {
+		t.Fatalf("准备状态不符: %+v", s)
+	}
+	g.ResetOpen(50, 1)
+	if s := g.Snapshot(); s.OpenCount != 1 || !nearly(s.ExposureUSDT, 50) {
+		t.Fatalf("ResetOpen 应为替换: %+v", s)
+	}
+}
+
+// SetRiskCaps 只改组合风控上限，不动总敞口/单笔/并发。
+func TestSetRiskCaps(t *testing.T) {
+	g := NewGuard(DefaultLimits())
+	e := &Executor{guard: g}
+	e.SetRiskCaps(50, 0.25, 0.08)
+	lim := g.Snapshot().Limits
+	if !nearly(lim.DCDDeltaExposureUSDT, 50) || !nearly(lim.StressShockPct, 0.25) || !nearly(lim.StressLossPct, 0.08) {
+		t.Fatalf("风控上限未更新: %+v", lim)
+	}
+	if !nearly(lim.TotalExposureUSDT, 5000) || lim.MaxConcurrent != 5 {
+		t.Fatalf("不应改动其它上限: %+v", lim)
 	}
 }

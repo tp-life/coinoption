@@ -23,6 +23,13 @@ type Limits struct {
 	MaxConcurrent int `json:"maxConcurrent"`
 	// MaxSessionsPerDay 单日（UTC 自然日）提交成功次数上限（10）。
 	MaxSessionsPerDay int `json:"maxSessionsPerDay"`
+	// DCDDeltaExposureUSDT DCY 组合累计 |delta|×本金 上限（0 = 不启用）。
+	// 由 settings.CapitalUSDT × DcyDeltaExposurePct 派生。
+	DCDDeltaExposureUSDT float64 `json:"dcdDeltaExposureUsdt,omitempty"`
+	// StressShockPct / StressLossPct：现货下跌 shock 时的组合浮亏上限
+	// （StressLossPct 按 TotalExposureUSDT≈资金 的比例计）。
+	StressShockPct float64 `json:"stressShockPct,omitempty"`
+	StressLossPct  float64 `json:"stressLossPct,omitempty"`
 }
 
 // DefaultLimits plan §2.4 定稿。
@@ -32,6 +39,10 @@ func DefaultLimits() Limits {
 		PerOrderUSDT:      2000,
 		MaxConcurrent:     5,
 		MaxSessionsPerDay: 10,
+		// 组合风控默认值：delta 上限由 settings 派生（这里 0 = 未配置），
+		// 压力情景固定按 −30% / 10% 资金，避免"忘了配就不生效"。
+		StressShockPct: 0.30,
+		StressLossPct:  0.10,
 	}
 }
 
@@ -48,6 +59,19 @@ func (l Limits) WithCapital(capitalUSDT float64) Limits {
 		per = capitalUSDT
 	}
 	l.PerOrderUSDT = per
+	return l
+}
+
+// WithRiskOverrides 在派生值之上覆盖总敞口/单笔上限（0 = 保留派生值）。
+// 场景：策略资金只放 1000 试仓，但账户真实在持已有 5000，
+// 需要把「策略仓位」与「账户风险上限」分开设置。
+func (l Limits) WithRiskOverrides(totalExposureUSDT, perOrderUSDT float64) Limits {
+	if totalExposureUSDT > 0 {
+		l.TotalExposureUSDT = totalExposureUSDT
+	}
+	if perOrderUSDT > 0 {
+		l.PerOrderUSDT = perOrderUSDT
+	}
 	return l
 }
 
@@ -128,14 +152,53 @@ func (g *Guard) checkLocked(amtUSDT float64) error {
 		return &LimitError{Field: "per_day", Have: float64(g.dayCount), Lim: float64(g.lim.MaxSessionsPerDay)}
 	}
 	if g.exposureUSDT+amtUSDT > g.lim.TotalExposureUSDT {
+		details := fmt.Sprintf("在持 %.2f + 新单 %.2f", g.exposureUSDT, amtUSDT)
+		if g.exposureUSDT > g.lim.TotalExposureUSDT {
+			details += fmt.Sprintf("；在持已超过总敞口上限，请调到至少 %.2f（Web 设置页）或先减仓", g.exposureUSDT+amtUSDT)
+		}
 		return &LimitError{
 			Field:   "total_exposure",
 			Have:    g.exposureUSDT + amtUSDT,
 			Lim:     g.lim.TotalExposureUSDT,
-			Details: fmt.Sprintf("在持 %.2f + 新单 %.2f", g.exposureUSDT, amtUSDT),
+			Details: details,
 		}
 	}
 	return nil
+}
+
+// checkWarningsLocked 与 checkLocked 同源，但把**每一处**越限都转成提示
+// （手动下单用：只提示，不拦截）。
+func (g *Guard) checkWarningsLocked(amtUSDT float64) []string {
+	var out []string
+	if amtUSDT > g.lim.PerOrderUSDT {
+		out = append(out, fmt.Sprintf("单笔 %.2f 超过上限 %.2f USDT", amtUSDT, g.lim.PerOrderUSDT))
+	}
+	if g.openCount >= g.lim.MaxConcurrent {
+		out = append(out, fmt.Sprintf("在持 %d 笔已达并发上限 %d", g.openCount, g.lim.MaxConcurrent))
+	}
+	if g.dayCount >= g.lim.MaxSessionsPerDay {
+		out = append(out, fmt.Sprintf("今日已提交 %d 笔，达日笔数上限 %d", g.dayCount, g.lim.MaxSessionsPerDay))
+	}
+	if g.exposureUSDT+amtUSDT > g.lim.TotalExposureUSDT {
+		out = append(out, fmt.Sprintf("在持 %.2f + 新单 %.2f 超过总敞口上限 %.2f USDT",
+			g.exposureUSDT, amtUSDT, g.lim.TotalExposureUSDT))
+	}
+	return out
+}
+
+// ReserveLimitsAdvisory 手动下单专用：越限只返回提示，仍然占用额度并放行。
+// 占用语义与 ReserveLimits 完全一致（笔数/敞口按真实提交累加），保证
+// GuardState 不会因为「手动放行」而低估敞口。
+func (g *Guard) ReserveLimitsAdvisory(amtUSDT float64) []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	d := g.now().Format("2006-01-02")
+	g.rollDay(d)
+	warns := g.checkWarningsLocked(amtUSDT)
+	g.dayCount++
+	g.openCount++
+	g.exposureUSDT += amtUSDT
+	return warns
 }
 
 // Reserve 校验通过即占用额度；失败返回 *LimitError。
@@ -202,7 +265,7 @@ func (g *Guard) Snapshot() GuardState {
 	}
 }
 
-// RestoreAggregate 聚合恢复（live 平台仓位：总额 + 笔数）。
+// RestoreAggregate 聚合恢复（累加；仅用于启动时一次性恢复）。
 func (g *Guard) RestoreAggregate(exposureUSDT float64, openCount int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -212,11 +275,26 @@ func (g *Guard) RestoreAggregate(exposureUSDT float64, openCount int) {
 	g.openCount += openCount
 }
 
+// ResetOpen 用平台真实在持**替换**进程内聚合（live 定时对账用）。
+// 必须是替换而不是累加：到期/平仓后敞口要能自动回收，否则额度只增不减。
+func (g *Guard) ResetOpen(exposureUSDT float64, openCount int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if exposureUSDT < 0 {
+		exposureUSDT = 0
+	}
+	if openCount < 0 {
+		openCount = 0
+	}
+	g.exposureUSDT = exposureUSDT
+	g.openCount = openCount
+}
+
 // Restore 从落库数据恢复运行态（进程重启后风控不归零的关键）：
 //   - openAmounts：在持订单的敞口清单（纸面单 open 态）
 //   - dayCount：今日已提交次数（audit "submit" 事件当日汇总）
 //
-// live 模式的平台真实仓位由 executor.SyncLiveGuard 在启动时另行聚合恢复（RestoreAggregate）。
+// live 模式的平台真实仓位由 executor.SyncLiveGuard 启动及定时整体替换（ResetOpen）。
 func (g *Guard) Restore(openAmountsUSDT []float64, dayCount int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()

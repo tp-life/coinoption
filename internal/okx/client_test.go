@@ -101,7 +101,7 @@ func TestRetryOnRateLimitCodeForPost(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(t, srv.URL)
-	if _, err := c.request(context.Background(), http.MethodPost, "/trade/order", []byte(`{}`)); err != nil {
+	if _, err := c.request(context.Background(), http.MethodPost, "/trade/order", []byte(`{}`), false); err != nil {
 		t.Fatalf("50011 应可重试: %v", err)
 	}
 	if got := atomic.LoadInt32(&calls); got != 3 {
@@ -118,7 +118,7 @@ func TestNoRetryAmbiguousBusinessCodeOnPost(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(t, srv.URL)
-	_, err := c.request(context.Background(), http.MethodPost, "/trade/order", []byte(`{}`))
+	_, err := c.request(context.Background(), http.MethodPost, "/trade/order", []byte(`{}`), false)
 	if err == nil {
 		t.Fatal("POST 50004（可能已成单）不应重试成功")
 	}
@@ -139,7 +139,7 @@ func TestRetryTransientCodeOnGet(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(t, srv.URL)
-	raw, err := c.request(context.Background(), http.MethodGet, "/market/ticker", nil)
+	raw, err := c.request(context.Background(), http.MethodGet, "/market/ticker", nil, true)
 	if err != nil {
 		t.Fatalf("GET 50013 应重试: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestRetryExhaustedOnPersistent5xx(t *testing.T) {
 	defer srv.Close()
 
 	c := testClient(t, srv.URL)
-	_, err := c.request(context.Background(), http.MethodGet, "/x", nil)
+	_, err := c.request(context.Background(), http.MethodGet, "/x", nil, true)
 	if err == nil || !contains(err.Error(), "retry exhausted") {
 		t.Fatalf("应返回重试耗尽错误: %v", err)
 	}
@@ -272,7 +272,7 @@ func TestInvalidProxyShortCircuits(t *testing.T) {
 
 	c := NewClient(WithBaseURL(srv.URL), WithProxy("1.2.3.4:7890"))
 	c.retryBase = time.Millisecond
-	_, err := c.request(context.Background(), http.MethodGet, "/x", nil)
+	_, err := c.request(context.Background(), http.MethodGet, "/x", nil, true)
 	if err == nil || !contains(err.Error(), "代理配置错误") {
 		t.Fatalf("无效代理应短路报错，得到: %v", err)
 	}
@@ -323,5 +323,113 @@ func TestDCDRequestsArePaced(t *testing.T) {
 	}
 	if d := time.Since(start); d > 75*time.Millisecond {
 		t.Fatalf("公开行情被 DCD 节流误伤，耗时 %v", d)
+	}
+}
+
+// 运行期替换 API 凭证（Web 设置页）：下一次请求就用新 Key 签名，清空后回到公开请求。
+func TestSetAuthRuntime(t *testing.T) {
+	var mu sync.Mutex
+	var keys, passes, signs []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		keys = append(keys, r.Header.Get("OK-ACCESS-KEY"))
+		passes = append(passes, r.Header.Get("OK-ACCESS-PASSPHRASE"))
+		signs = append(signs, r.Header.Get("OK-ACCESS-SIGN"))
+		mu.Unlock()
+		io.WriteString(w, jsonCode("0", `[]`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(WithBaseURL(srv.URL))
+	fetch := func() {
+		if _, err := c.GetSpotTicker("BTC-USDT"); err != nil {
+			t.Fatalf("spot: %v", err)
+		}
+	}
+	fetch() // 无凭证：不带签名头
+	c.SetAuth("key-1", "sec-1", "pass-1")
+	if !c.HasAuth() {
+		t.Fatal("SetAuth 后 HasAuth 应为 true")
+	}
+	fetch()
+	c.SetAuth("key-2", "sec-2", "pass-2")
+	fetch()
+	c.SetAuth("", "", "")
+	if c.HasAuth() {
+		t.Fatal("清空凭证后 HasAuth 应为 false")
+	}
+	fetch()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(keys) != 4 {
+		t.Fatalf("请求数 = %d，期望 4", len(keys))
+	}
+	if keys[0] != "" || signs[0] != "" {
+		t.Fatalf("无凭证不应签名: key=%q sign=%q", keys[0], signs[0])
+	}
+	if keys[1] != "key-1" || passes[1] != "pass-1" || signs[1] == "" {
+		t.Fatalf("第一次 SetAuth 未生效: key=%q pass=%q sign=%q", keys[1], passes[1], signs[1])
+	}
+	if keys[2] != "key-2" || passes[2] != "pass-2" {
+		t.Fatalf("第二次 SetAuth 未生效: key=%q pass=%q", keys[2], passes[2])
+	}
+	if keys[3] != "" || signs[3] != "" {
+		t.Fatalf("清空后不应再签名: key=%q sign=%q", keys[3], signs[3])
+	}
+}
+
+// 回归：写请求在传输层失败（服务端可能已受理）时绝不能重发。
+// 之前 retryDelay 的默认分支会把超时/连接重置也重试 3 次 → 重复下单。
+func TestWriteTransportErrorNotRetried(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			atomic.AddInt32(&calls, 1)
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("no hijacker")
+			}
+			conn, _, _ := hj.Hijack()
+			_ = conn.Close()
+			return
+		}
+		_, _ = io.WriteString(w, jsonCode("0", `[]`))
+	}))
+	defer srv.Close()
+
+	c := testClient(t, srv.URL)
+	_, err := c.request(context.Background(), http.MethodPost, "/api/v5/trade/order", []byte(`{}`), false)
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Fatalf("写请求被重发 %d 次（应为 1 次）", n)
+	}
+	if !IsAmbiguous(err) {
+		t.Fatalf("写请求传输失败应标记为结果未知，得到: %v", err)
+	}
+}
+
+// 回归：data:[] 不能再被 *q 解引用 panic。
+func TestDCDEmptyDataReturnsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, jsonCode("0", `[]`))
+	}))
+	defer srv.Close()
+	c := testClient(t, srv.URL)
+	c.dcdGap = 0
+	if _, err := c.PostDCDQuote(DCDQuoteRequest{ProductID: "x"}); err == nil {
+		t.Fatal("空 data 应返回错误，不能 panic / 返回零值报价")
+	}
+	if _, err := c.PostDCDTrade("q1"); err == nil {
+		t.Fatal("空 data 应返回错误，不能返回空回执")
+	}
+}
+
+// 回归：data:{} 不能伪造出零值对象（否则 OrdID="" 会被当成下单成功）。
+func TestZeroObjectDecodeRejected(t *testing.T) {
+	if _, err := wrapKeys[DCDProduct](json.RawMessage(`{}`), nil, "products"); err == nil {
+		t.Fatal("空对象应返回解码错误")
+	}
+	if _, err := wrapKeys[DCDProduct](json.RawMessage(`null`), nil, "products"); err == nil {
+		t.Fatal("null 应返回解码错误")
 	}
 }

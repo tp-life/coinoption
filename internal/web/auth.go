@@ -2,13 +2,17 @@ package web
 
 import (
 	"crypto/hmac"
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,10 +38,94 @@ const (
 // codeAlphabet 去掉易混淆的 I/O/0/1，便于人工抄写。
 const codeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
-// HashCode 授权码 → SHA-256 十六进制摘要（settings.json 只存这个值）。
+// 授权码摘要：PBKDF2-HMAC-SHA256 + 随机盐 + 21 万次迭代。
+//
+// 旧版是裸 SHA-256（无盐、可 GPU 秒破）。settings.json 里仍可能存着旧格式，
+// VerifyCodeHash 兼容读取，登录成功后 main 会顺手升级成新格式。
+const (
+	authKDFIter = 210_000
+	authSaltLen = 16
+	authHashLen = 32
+)
+
+// HashCode 旧版 SHA-256 摘要（仅用于兼容历史 settings.json / 测试）。
+// Deprecated: 新代码用 NewCodeHash / VerifyCodeHash。
 func HashCode(code string) string {
 	sum := sha256.Sum256([]byte(strings.TrimSpace(code)))
 	return hex.EncodeToString(sum[:])
+}
+
+// NewCodeHash 生成带随机盐的 PBKDF2 摘要串：
+//
+//	pbkdf2-sha256$<iter>$<salt-b64>$<hash-b64>
+func NewCodeHash(code string) (string, error) {
+	salt := make([]byte, authSaltLen)
+	if _, err := rand.Read(salt); err != nil {
+		return "", fmt.Errorf("生成盐: %w", err)
+	}
+	key, err := pbkdf2.Key(sha256.New, strings.TrimSpace(code), salt, authKDFIter, authHashLen)
+	if err != nil {
+		return "", fmt.Errorf("派生授权码摘要: %w", err)
+	}
+	enc := base64.RawStdEncoding
+	return fmt.Sprintf("pbkdf2-sha256$%d$%s$%s", authKDFIter, enc.EncodeToString(salt), enc.EncodeToString(key)), nil
+}
+
+// parseCodeHash 解析持久化摘要；兼容 PBKDF2 串与旧版 64 位十六进制 SHA-256。
+func parseCodeHash(spec string) (iter int, salt, want []byte, ok bool) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return 0, nil, nil, false
+	}
+	if strings.HasPrefix(spec, "pbkdf2-sha256$") {
+		parts := strings.Split(spec, "$")
+		if len(parts) != 4 {
+			return 0, nil, nil, false
+		}
+		n, err := strconv.Atoi(parts[1])
+		if err != nil || n < 10_000 || n > 2_000_000 {
+			return 0, nil, nil, false
+		}
+		enc := base64.RawStdEncoding
+		salt, err = enc.DecodeString(parts[2])
+		if err != nil || len(salt) < 8 {
+			return 0, nil, nil, false
+		}
+		want, err = enc.DecodeString(parts[3])
+		if err != nil || len(want) < 16 {
+			return 0, nil, nil, false
+		}
+		return n, salt, want, true
+	}
+	b, err := hex.DecodeString(spec)
+	if err != nil || len(b) != 32 {
+		return 0, nil, nil, false
+	}
+	return 0, nil, b, true
+}
+
+// VerifyCodeHash 校验授权码；任何解析失败都返回 false（不会因为坏摘要而放行）。
+func VerifyCodeHash(spec, code string) bool {
+	iter, salt, want, ok := parseCodeHash(spec)
+	if !ok {
+		return false
+	}
+	code = strings.TrimSpace(code)
+	if iter == 0 { // 旧版：SHA-256(授权码) == want
+		sum := sha256.Sum256([]byte(code))
+		return hmac.Equal(sum[:], want)
+	}
+	got, err := pbkdf2.Key(sha256.New, code, salt, iter, len(want))
+	if err != nil {
+		return false
+	}
+	return subtle.ConstantTimeCompare(got, want) == 1
+}
+
+// ValidCodeHash 判断持久化的摘要串格式是否可识别（含旧版 SHA-256）。
+func ValidCodeHash(spec string) bool {
+	_, _, _, ok := parseCodeHash(spec)
+	return ok
 }
 
 // GenerateAuthCode 生成 8 位随机授权码（无易混淆字符）。
@@ -56,7 +144,7 @@ func GenerateAuthCode() (string, error) {
 // authenticator 会话与失败限速状态（进程内；重启后需重新登录）。
 type authenticator struct {
 	mu       sync.Mutex
-	hash     [32]byte
+	spec     string // PBKDF2 摘要串或旧版 SHA-256 十六进制；空 = 谁都不能登录
 	sessions map[string]time.Time
 	fails    map[string][]time.Time
 	now      func() time.Time
@@ -71,24 +159,24 @@ func newAuthenticator() *authenticator {
 }
 
 // setHash 更新授权码摘要并清空全部会话（改码后旧会话立即失效）。
-func (a *authenticator) setHash(hashHex string) error {
-	b, err := hex.DecodeString(strings.TrimSpace(hashHex))
-	if err != nil || len(b) != 32 {
-		return fmt.Errorf("授权码摘要需为 64 位十六进制")
+func (a *authenticator) setHash(spec string) error {
+	spec = strings.TrimSpace(spec)
+	if !ValidCodeHash(spec) {
+		return fmt.Errorf("授权码摘要格式不可识别（需 PBKDF2 串或 64 位十六进制）")
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	copy(a.hash[:], b)
+	a.spec = spec
 	a.sessions = map[string]time.Time{}
 	return nil
 }
 
-// check 常数时间比较；未设置授权码时恒为 false（不会误放行）。
+// check PBKDF2/旧摘要校验；未设置授权码时恒为 false（不会误放行）。
 func (a *authenticator) check(code string) bool {
-	sum := sha256.Sum256([]byte(strings.TrimSpace(code)))
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	return hmac.Equal(sum[:], a.hash[:])
+	spec := a.spec
+	a.mu.Unlock()
+	return VerifyCodeHash(spec, code)
 }
 
 func (a *authenticator) newSession() (string, time.Time) {
@@ -258,6 +346,9 @@ func (a *authenticator) handleLogin(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteStrictMode,
 		Expires:  exp,
 		MaxAge:   int(time.Until(exp).Seconds()),
+		// HTTPS/反代下加 Secure；本地 http://127.0.0.1 仍可用（否则开发时
+		// 浏览器不会保存 cookie）。监听 0.0.0.0 时请务必走 TLS/反代。
+		Secure: r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https"),
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

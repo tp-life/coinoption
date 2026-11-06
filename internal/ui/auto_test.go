@@ -48,7 +48,8 @@ func TestTUIAutoSizesOptionByContractValue(t *testing.T) {
 	}
 }
 
-// 多个可执行候选时按差% 降序挑最优，而不是按展示顺序取第一条。
+// 多个可执行候选时按“本次动作的 edge”降序挑最优：
+// 卖期权看 Diff；申购 DCY 看 −Diff（越负越好），不能按裸 Diff 降序。
 func TestTUIAutoPicksLargestEdge(t *testing.T) {
 	app, _ := bootApp(t)
 	snap := buildTestSnap()
@@ -62,13 +63,15 @@ func TestTUIAutoPicksLargestEdge(t *testing.T) {
 			Days: 10, ExpTime: time.Now().Add(10 * 24 * time.Hour),
 		}}
 	}
-	snap.Decisions = []strategy.Decision{mk("A", 0.01), mk("B", 0.15)}
+	// A：DCY 领先 15pp（Diff=-0.15，最优）；B：期权领先 1pp（Diff=+0.01，最差）。
+	// 裸 Diff 降序会选 B；正确排序必须选 A。
+	snap.Decisions = []strategy.Decision{mk("A", -0.15), mk("B", 0.01)}
 	app.snapRaw = snap
 	app.snap = snap
 
 	d, note := app.autoCandidate()
-	if d == nil || d.product.ProductID != "B" {
-		t.Fatalf("应选差%% 最大的 B，实际 %+v（note=%q）", d, note)
+	if d == nil || d.product.ProductID != "A" {
+		t.Fatalf("应选 DCY 领先最多的 A（Diff=-0.15），实际 %+v（note=%q）", d, note)
 	}
 }
 

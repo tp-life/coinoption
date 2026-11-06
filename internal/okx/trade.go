@@ -19,6 +19,9 @@ type OptionOrderReq struct {
 	Sz         string `json:"sz"`                   // 张数
 	Px         string `json:"px"`                   // 限价（币本位=BTC；_UM=USD）
 	ReduceOnly bool   `json:"reduceOnly,omitempty"` // 平仓用
+	// ClOrdID 客户端订单号（可选，用于超时后对账/去重）。OKX 要求 ≤32 位
+	// 字母数字，本仓库用 "co" + 纳秒时间戳。
+	ClOrdID string `json:"clOrdId,omitempty"`
 }
 
 // TradeOrderResp 下单回执 data[0]（sCode 非零 = 该单业务失败）。

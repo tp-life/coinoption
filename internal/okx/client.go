@@ -38,16 +38,18 @@ const (
 
 // Client OKX REST 客户端。
 type Client struct {
+	credMu     sync.RWMutex // 保护 apiKey/secret/passphrase（Web 设置页可在运行期更新）
 	apiKey     string
 	secret     string
 	passphrase string
 	flag       string // FlagLive | FlagDemo
 
 	baseURL   string
-	http      *http.Client
-	proxyErr  error    // 代理配置非法（请求一律短路报错，不静默直连）
-	proxyURL  *url.URL // WS Dialer 复用同一代理链路
-	wsURL     string   // 覆盖 WebSocket 公共行情地址（测试/特殊网络）
+	http      *http.Client // 读请求（5s）
+	httpWrite *http.Client // 写请求（15s：下单需要更长的响应窗口）
+	proxyErr  error        // 代理配置非法（请求一律短路报错，不静默直连）
+	proxyURL  *url.URL     // WS Dialer 复用同一代理链路
+	wsURL     string       // 覆盖 WebSocket 公共行情地址（测试/特殊网络）
 	limiter   *rate.Limiter
 	retryBase time.Duration // 重试退避基数（测试可调小）
 
@@ -69,9 +71,12 @@ func NewClient(opts ...Option) *Client {
 		flag:    FlagLive,
 		baseURL: DefaultBaseURL,
 		http: &http.Client{
-			// OKX 建议交易类超时留足；公开行情 5s 足够
+			// 公开行情 5s 足够
 			Timeout: 5 * time.Second,
 		},
+		// 交易类超时留足：5s 在拥堵/代理抖动时容易把「已受理」误判成失败，
+		// 再叠加自动重试就会重复下单。写请求单独用 15s。
+		httpWrite: &http.Client{Timeout: 15 * time.Second},
 		// 公开行情速率上限 20 req/2s，统一取 10 rps、burst 10 留余量
 		limiter:   rate.NewLimiter(rate.Limit(10), 10),
 		retryBase: 400 * time.Millisecond,
@@ -88,9 +93,29 @@ type Option func(*Client)
 
 // WithAuth 配置 API Key（私有接口必需）。
 func WithAuth(key, secret, passphrase string) Option {
-	return func(c *Client) {
-		c.apiKey, c.secret, c.passphrase = key, secret, passphrase
-	}
+	return func(c *Client) { c.SetAuth(key, secret, passphrase) }
+}
+
+// SetAuth 运行期替换 API 凭证（Web 设置页保存后立即生效）。
+// 传空串会关闭签名（公开接口仍可用，私有接口返回未授权）。
+// 注意：切换账号前应确认没有在持订单，风控敞口不会随账号切换重新计算。
+func (c *Client) SetAuth(key, secret, passphrase string) {
+	c.credMu.Lock()
+	c.apiKey, c.secret, c.passphrase = key, secret, passphrase
+	c.credMu.Unlock()
+}
+
+// authSnapshot 一次取齐三项，避免签名时读到半更新状态。
+func (c *Client) authSnapshot() (key, secret, passphrase string) {
+	c.credMu.RLock()
+	defer c.credMu.RUnlock()
+	return c.apiKey, c.secret, c.passphrase
+}
+
+// HasAuth 当前是否配置了完整凭证（TUI/诊断展示用）。
+func (c *Client) HasAuth() bool {
+	key, secret, passphrase := c.authSnapshot()
+	return key != "" && secret != "" && passphrase != ""
 }
 
 // WithDemo 切到模拟盘（REST 同端点 + 头部标识）。
@@ -259,6 +284,28 @@ func (e *HTTPError) Retryable() bool {
 	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
 }
 
+// AmbiguousError 写请求「结果未知」：请求可能已经被交易所受理，但客户端
+// 没拿到可信回执（超时 / 连接重置 / 5xx / 响应解码失败）。
+//
+// 调用方**不得**自动重试，也不应立即释放风控敞口——必须先按订单号/持仓
+// 对账，确认未成交后再释放。这是防重复下单的最后一道语义保护。
+type AmbiguousError struct {
+	Op  string // 动作，如 "option_order" / "dcd_trade"
+	Err error
+}
+
+func (e *AmbiguousError) Error() string {
+	return fmt.Sprintf("%s 结果未知（可能已成交，禁止自动重试，请人工对账）: %v", e.Op, e.Err)
+}
+
+func (e *AmbiguousError) Unwrap() error { return e.Err }
+
+// IsAmbiguous 判断错误是否为「写请求结果未知」。
+func IsAmbiguous(err error) bool {
+	var ae *AmbiguousError
+	return errors.As(err, &ae)
+}
+
 // flexReal / flexInt 兼容两种 JSON 数值形态：
 // 金融产品端点数值为字符串（"annualizedYield":"0.242"），交易端点可能为裸数字。
 type flexReal float64
@@ -328,26 +375,33 @@ func (c *Client) get(ctx context.Context, path string, query url.Values) (json.R
 		// 便于 timestamp+method+path 的签名可复现。
 		path = path + "?" + query.Encode()
 	}
-	return c.request(ctx, http.MethodGet, path, nil)
+	return c.request(ctx, http.MethodGet, path, nil, true)
 }
 
 // doJSON 发起签名 POST（JSON body）。data 字段返回原始 JSON。
-func (c *Client) doJSON(ctx context.Context, method, path string, body any) (json.RawMessage, error) {
+//
+// idempotent=false 表示写操作：只有「确定请求未被处理」的错误才允许重试，
+// 其余一律返回 *AmbiguousError；调用方不得再自动重试。
+func (c *Client) doJSON(ctx context.Context, method, path string, body any, idempotent bool) (json.RawMessage, error) {
 	bb, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal body: %w", err)
 	}
-	return c.request(ctx, method, path, bb)
+	return c.request(ctx, method, path, bb, idempotent)
 }
 
 // request 单次请求核心：签名、限速、重试、解析。
 //
-// 重试策略（M4 硬化）：
-//   - 网络错误 / 429 / 5xx：指数退避（400ms 起，带抖动，429 优先用 Retry-After），最多 2 次
-//   - 业务码 50011（限速）：请求未被处理，任何方法均可重试
-//   - 其余业务码：GET 的瞬时故障（50001/50026/50013/50004/50005）可重试；
-//     POST 一律不重试，避免「下单其实已成功、重试再下一单」的重复成交
-func (c *Client) request(ctx context.Context, method, path string, body []byte) (json.RawMessage, error) {
+// 重试策略：
+//   - 读请求（idempotent=true）：网络错误 / 429 / 5xx 指数退避（400ms 起，
+//     带抖动，429 优先用 Retry-After），最多 2 次；GET 的瞬时业务码可重试。
+//   - 写请求（idempotent=false）：只有 50011（限速，官方语义=请求未处理）
+//     重试；超时/连接重置/5xx/解码失败一律不重试，包成 *AmbiguousError
+//     交给调用方对账（宁可少做一笔，也不能重复下单）。
+//
+// 说明：此前实现把「POST 一律不重试」写在注释里，但传输层错误会落到默认
+// 分支被重试 3 次——交易所已受理 + 客户端超时 = 重复下单。
+func (c *Client) request(ctx context.Context, method, path string, body []byte, idempotent bool) (json.RawMessage, error) {
 	const maxAttempts = 3
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -358,14 +412,17 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte) 
 			return nil, fmt.Errorf("rate limiter: %w", err)
 		}
 
-		raw, err := c.doOnce(ctx, method, path, body)
+		raw, err := c.doOnce(ctx, method, path, body, idempotent)
 		if err == nil {
 			return raw, nil
 		}
 		lastErr = err
 
-		delay, retry := c.retryDelay(method, err, attempt)
+		delay, retry := c.retryDelay(method, err, attempt, idempotent)
 		if !retry {
+			if !idempotent && ambiguousWriteFailure(err) {
+				return nil, &AmbiguousError{Op: method + " " + path, Err: err}
+			}
 			return nil, err
 		}
 		if attempt == maxAttempts {
@@ -377,7 +434,25 @@ func (c *Client) request(ctx context.Context, method, path string, body []byte) 
 		case <-time.After(delay):
 		}
 	}
+	if !idempotent {
+		return nil, &AmbiguousError{Op: method + " " + path, Err: fmt.Errorf("重试次数用尽: %w", lastErr)}
+	}
 	return nil, fmt.Errorf("retry exhausted: %w", lastErr)
+}
+
+// ambiguousWriteFailure 判断写请求失败是否可能「已在服务端生效」。
+// 业务错误码（含 50011）由交易所明确拒绝 → 安全；纯 HTTP 4xx 也视为拒绝；
+// 5xx/429、传输层错误（超时/断开）与响应解码失败都可能是「已受理但没读到」。
+func ambiguousWriteFailure(err error) bool {
+	var apiErr *APIError
+	if asAPIError(err, &apiErr) {
+		return false
+	}
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode >= 500
+	}
+	return true
 }
 
 // isDCDPath 判断是否双币赢（金融产品）端点，这些端点按 User ID 限速 1 req/s。
@@ -423,13 +498,29 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 }
 
 // retryDelay 返回是否重试与本次退避时长。
-func (c *Client) retryDelay(method string, err error, attempt int) (time.Duration, bool) {
+//
+// idempotent=false（写请求）时只允许 50011：OKX 明确表示该请求未被处理。
+// 其余错误一律不重试，由上层按「结果未知」对账。
+func (c *Client) retryDelay(method string, err error, attempt int, idempotent bool) (time.Duration, bool) {
 	var apiErr *APIError
 	if asAPIError(err, &apiErr) {
-		if !retryableBusinessCode(method, apiErr.Code) {
+		// 50011 对读写都安全（请求未进入撮合/申购）。
+		if apiErr.Code == "50011" {
+			return c.backoff(attempt, 0), true
+		}
+		// 幂等 POST（如报价）按读请求的瞬时错误处理；写请求仍只看 50011。
+		effMethod := method
+		if idempotent {
+			effMethod = http.MethodGet
+		}
+		if !retryableBusinessCode(effMethod, apiErr.Code) {
 			return 0, false
 		}
 		return c.backoff(attempt, 0), true
+	}
+
+	if !idempotent {
+		return 0, false
 	}
 
 	var httpErr *HTTPError
@@ -439,7 +530,7 @@ func (c *Client) retryDelay(method string, err error, attempt int) (time.Duratio
 		}
 		return c.backoff(attempt, httpErr.RetryAfter), true
 	}
-	// 传输层错误（超时/连接重置/代理断流）可重试。
+	// 读请求的传输层错误（超时/连接重置/代理断流）可重试。
 	return c.backoff(attempt, 0), true
 }
 
@@ -509,8 +600,8 @@ func asAPIError(err error, target **APIError) bool {
 	return false
 }
 
-// doOnce 不含重试的单次执行。
-func (c *Client) doOnce(ctx context.Context, method, path string, body []byte) (json.RawMessage, error) {
+// doOnce 不含重试的单次执行。idempotent=false 使用写请求 client（更长超时）。
+func (c *Client) doOnce(ctx context.Context, method, path string, body []byte, idempotent bool) (json.RawMessage, error) {
 	// 代理配置非法 → 请求短路报错（绝不静默直连打私有接口）
 	if c.proxyErr != nil {
 		return nil, fmt.Errorf("代理配置错误: %w", c.proxyErr)
@@ -526,20 +617,26 @@ func (c *Client) doOnce(ctx context.Context, method, path string, body []byte) (
 		req.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	}
 
-	// 已配置密钥则签名（公开接口签名头可省略但带上无害）
-	if c.apiKey != "" {
+	// 已配置密钥则签名（公开接口签名头可省略但带上无害）。
+	// 凭证可在运行期被 Web 设置页替换，统一从锁保护的快照读取。
+	apiKey, secret, passphrase := c.authSnapshot()
+	if apiKey != "" && secret != "" && passphrase != "" {
 		ts := isoTimestamp(time.Now())
-		sign := sign(c.secret, ts, method, path, string(body))
-		req.Header.Set("OK-ACCESS-KEY", c.apiKey)
+		sign := sign(secret, ts, method, path, string(body))
+		req.Header.Set("OK-ACCESS-KEY", apiKey)
 		req.Header.Set("OK-ACCESS-SIGN", sign)
 		req.Header.Set("OK-ACCESS-TIMESTAMP", ts)
-		req.Header.Set("OK-ACCESS-PASSPHRASE", c.passphrase)
+		req.Header.Set("OK-ACCESS-PASSPHRASE", passphrase)
 	}
 	if c.flag == FlagDemo {
 		req.Header.Set(DemoHeader, "1")
 	}
 
-	httpResp, err := c.http.Do(req)
+	hc := c.http
+	if !idempotent && c.httpWrite != nil {
+		hc = c.httpWrite
+	}
+	httpResp, err := hc.Do(req)
 	if err != nil {
 		return nil, err
 	}

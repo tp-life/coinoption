@@ -22,7 +22,32 @@ type PositionsView struct {
 }
 
 // Positions 组装视图（尽力而为：平台取数失败不阻塞纸面数据）。
+//
+// 5 秒缓存 + 单飞：Web 弹窗会被反复打开/多标签轮询，而 live 下每次要打
+// 两个限速接口（DCY 历史 1/s、期权仓位），不缓存很容易撞 50011。
+// 下单/结算/赎回后调用 invalidatePositions 立即失效。
 func (e *Executor) Positions() (PositionsView, error) {
+	e.posMu.Lock()
+	if !e.posAt.IsZero() && time.Since(e.posAt) < 5*time.Second {
+		v := e.posVal
+		e.posMu.Unlock()
+		return v, nil
+	}
+	e.posMu.Unlock()
+
+	// 不持锁做网络 I/O：positionsUncached 会触发到期结算，而结算又要
+	// invalidatePositions（同一把锁）——持锁就会自锁。
+	v, err := e.positionsUncached()
+	if err == nil {
+		e.posMu.Lock()
+		e.posAt, e.posVal = time.Now(), v
+		e.posMu.Unlock()
+	}
+	return v, err
+}
+
+func (e *Executor) positionsUncached() (PositionsView, error) {
+	e.SettleDueQuiet() // 先落地已到期纸面单，保证持仓/风控与页面一致
 	v := PositionsView{
 		GeneratedAt: time.Now(),
 		Mode:        e.mode,
@@ -82,8 +107,13 @@ func (v PositionsView) Lines() []string {
 		}
 		switch o.State {
 		case "settled":
-			tail = fmt.Sprintf("→ 交付 %.6f %s，损益 %.6f %s（结算价 %.0f）",
-				o.SettleSz, o.SettleCcy, o.YieldSz, o.YieldCcy, o.SettlePx)
+			// 损益统一用 PnlUSDT（含本金汇兑损益）；SettleSz/YieldSz 只是交付量，
+			// 被行权时把 YieldSz 当损益会显示成「赚了收益」。
+			tail = fmt.Sprintf("→ 交付 %.6f %s（结算价 %.0f），已实现损益 %+.2f USDT",
+				o.SettleSz, o.SettleCcy, o.SettlePx, o.PnlUSDT)
+			if o.YieldSz != 0 {
+				tail += fmt.Sprintf("，结算收益 %.6f %s", o.YieldSz, o.YieldCcy)
+			}
 		default:
 			tail = fmt.Sprintf("→ 开单 %s，到期 %s",
 				o.CreatedAt.Format("01-02 15:04"), o.ExpTime.Format("2006-01-02"))
@@ -124,25 +154,32 @@ func (v PositionsView) Print() {
 
 // ─── live 侧守卫恢复 ─────────────────────────────────────────────
 
-// SyncLiveGuard 从平台现有仓位恢复风控敞口（live 模式启动时调用）：
+// SyncLiveGuard 用平台现有仓位**替换**进程内风控敞口（live 启动 + 定时对账）：
 //   - DCY 在持订单：notional（投资币种）→ USDT
 //   - 期权空头：|pos| × ctVal × 现货
 //
-// 已在纸面单恢复过的模式（sim-*）不调用。幂等性：应在进程启动时调用一次。
+// 幂等：每次都用平台数据整体替换，而不是累加；这样到期/平仓后敞口能自动
+// 释放（此前只在启动时累加一次，持仓到期后额度永远不回收，最终所有新单
+// 都被 total_exposure 拒绝）。任一来源取数失败时不改动现有敞口。
 func (e *Executor) SyncLiveGuard() (string, error) {
 	if e.mode != ModeLive || e.client == nil {
 		return "非 live 模式，跳过平台恢复", nil
 	}
 	var notes []string
+	dcdOK, optOK := true, true
 
 	// 1) DCY 在持（order-history state 过滤在本地做：平台 state 枚举随时间演进）
 	var dcdUSDT float64
 	dcdCount := 0
 	if dcds, err := e.client.GetDCDOrderHistory("", "", "", "", 100); err != nil {
+		dcdOK = false
 		notes = append(notes, "DCY 订单不可得: "+err.Error())
 	} else {
 		for _, d := range dcds {
-			if d.State != "" && d.State != "open" {
+			// 只有明确「已结算/已赎回/已撤销/失败」才排除；未知 state 视为在持
+			//（避免漏计导致敞口低估、重复申购）。
+			switch strings.ToLower(strings.TrimSpace(d.State)) {
+			case "settled", "redeemed", "canceled", "cancelled", "failed":
 				continue
 			}
 			amt := parseFloatz(d.NotionalSz)
@@ -163,6 +200,7 @@ func (e *Executor) SyncLiveGuard() (string, error) {
 	var optUSDT float64
 	optCount := 0
 	if pos, err := e.client.GetOptionPositions(); err != nil {
+		optOK = false
 		notes = append(notes, "期权仓位不可得: "+err.Error())
 	} else {
 		for _, p := range pos {
@@ -194,8 +232,10 @@ func (e *Executor) SyncLiveGuard() (string, error) {
 		}
 	}
 
-	// 直接用聚合值恢复（明细已聚合，只关心总额与笔数）。
-	e.guard.RestoreAggregate(dcdUSDT+optUSDT, dcdCount+optCount)
+	// 两个来源都成功才整体替换；否则保持现有敞口（宁高勿低）。
+	if dcdOK && optOK {
+		e.guard.ResetOpen(dcdUSDT+optUSDT, dcdCount+optCount)
+	}
 
 	msg := fmt.Sprintf("平台恢复：DCY %d 笔=%.2f USDT，期权空头 %d 笔=%.2f USDT",
 		dcdCount, dcdUSDT, optCount, optUSDT)
@@ -204,6 +244,14 @@ func (e *Executor) SyncLiveGuard() (string, error) {
 	}
 	_ = e.st.Audit(store.AuditEvent{Event: "restore", Mode: string(e.mode), Detail: msg})
 	return msg, nil
+}
+
+// RecordAudit 写入一条审计事件（Web 的自动交易开关/风控操作留痕）。
+func (e *Executor) RecordAudit(ev store.AuditEvent) error {
+	if ev.Mode == "" {
+		ev.Mode = string(e.mode)
+	}
+	return e.st.Audit(ev)
 }
 
 // Audit 最近 n 条审计事件（TUI 日志页；最新在前）。

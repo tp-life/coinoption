@@ -5,6 +5,9 @@ package market
 
 import (
 	"fmt"
+	"math"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,9 +29,27 @@ type Snapshot struct {
 	DCYAvailable bool                      `json:"dcyAvailable"`
 	Warn         string                    `json:"warn"` // 非致命提示（如 DCY 需 Key 的 401/500）
 
+	// RV30 标的入场波动率（小数）= max(EWMA, 主窗口 RV)；0 = 数据缺失，
+	// v1 策略会跳过所有候选。RV30Raw 为纯 30d 值，便于对照/回放。
+	RV30    float64 `json:"rv30"`
+	RV30Raw float64 `json:"rv30Raw,omitempty"`
+	RV7     float64 `json:"rv7,omitempty"`
+	RVEWMA  float64 `json:"rvEwma,omitempty"`
+	RVPct   float64 `json:"rvPct,omitempty"` // RV 历史分位（0~100；-1=样本不足）
+	RVWarn  string  `json:"rvWarn,omitempty"`
+	// IVNow 期权链 PUT 买盘 IV 中位数；IVPct 为其历史分位（-1=样本不足）。
+	IVNow   float64 `json:"ivNow,omitempty"`
+	IVPct   float64 `json:"ivPct,omitempty"`
+	Greeks  bool    `json:"greeks,omitempty"` // 是否拿到了 opt-summary Delta
+	GreeksW string  `json:"greeksWarn,omitempty"`
 	// WebSocket 实时行情状态（REST 模式为零值/空）。
 	WSConnected bool   `json:"wsConnected"`
 	WSStatus    string `json:"wsStatus,omitempty"` // connecting/live/degraded/reconnecting
+	// 数据源最近一次**成功**更新时间：用于判断「报价是否过期」。
+	// 注意 At 只是快照重组时间，不代表 DCY/现货数据是新的（WS 每 500ms
+	// 重组一次，会把几分钟前的 DCY 报价显示成「刚刚更新」）。
+	SpotAt time.Time `json:"spotAt,omitempty"`
+	DcdAt  time.Time `json:"dcdAt,omitempty"`
 }
 
 // Fetch 同步拉取一轮并用 strategy 引擎决策（默认参数）。
@@ -38,13 +59,23 @@ func Fetch(c *okx.Client, dcyUly string) (*Snapshot, error) {
 
 // FetchWith 指定策略参数拉取（Settings 页调参后使用）。
 func FetchWith(c *okx.Client, dcyUly string, p strategy.Params) (*Snapshot, error) {
+	return fetchWith(c, dcyUly, p, nil)
+}
+
+// FetchWithIV 同 FetchWith，额外记录 IV 分位样本（需要落盘路径时使用）。
+func FetchWithIV(c *okx.Client, dcyUly string, p strategy.Params, ivh *IVHistory) (*Snapshot, error) {
+	return fetchWith(c, dcyUly, p, ivh)
+}
+
+func fetchWith(c *okx.Client, dcyUly string, p strategy.Params, ivh *IVHistory) (*Snapshot, error) {
 	parts := strings.Split(dcyUly, "-")
 	base := parts[0]
+	now := time.Now()
 
 	// 1. 期权链：优先拉父链 BTC-USD（OKX 的 instruments 响应实测已包含
 	// _UM 合约）。若父链行情里没有 U 本位合约，再单独补拉 BTC-USD_UM，
 	// 保证用户对照 OKX 列表时不缺档位；按 instId 去重避免重复行。
-	snapshot := &Snapshot{At: time.Now(), Uly: dcyUly}
+	snapshot := &Snapshot{At: now, Uly: dcyUly}
 	parentChain := base + "-USD"
 	var chainWarns []string
 	instruments, err := c.GetOptionInstruments(parentChain)
@@ -88,13 +119,35 @@ func FetchWith(c *okx.Client, dcyUly string, p strategy.Params) (*Snapshot, erro
 	}
 	if len(spots) > 0 {
 		snapshot.SpotPrice = parseFloat(spots[0].Last)
+		snapshot.SpotAt = time.Now()
 	}
 	spotMap := map[string]float64{base: snapshot.SpotPrice}
+
+	// 2b. 入场波动率（v1 绝对 EV 的基准）：EWMA 与 30d 取高者，另附 RV 分位。
+	// 失败不阻塞快照，但会让所有决策变成 rv_missing；通过 RVWarn/Warn 明确
+	// 告诉用户「为什么没交易」。
+	est, rvWarn := fetchVol(c, dcyUly, p.RVWindowDays)
+	snapshot.RV30, snapshot.RV30Raw = est.Entry, est.RV30
+	snapshot.RV7, snapshot.RVEWMA, snapshot.RVPct = est.RV7, est.EWMA, est.Pct
+	snapshot.RVWarn = rvWarn
+
+	// 2c. 期权 Greeks（opt-summary）：用平台 Delta 取代「IV 反解」，拿不到就
+	// 静默回退（DecideDCY 自己会从 bidIV 反解）。
+	greeks, gwarn := fetchGreeks(c, parentChain, umChain)
+	snapshot.Greeks = len(greeks) > 0
+	snapshot.GreeksW = gwarn
+	// 2d. 期权链 PUT 买盘 IV 中位数 → IV 历史分位（样品不足时 pct=-1）。
+	snapshot.IVNow = medianPutIV(tickers, now, p.TenorMinDays, p.TenorMaxDays)
+	if ivh != nil && snapshot.IVNow > 0 {
+		snapshot.IVPct = ivh.Observe(now, base, snapshot.IVNow)
+	} else {
+		snapshot.IVPct = -1
+	}
 
 	// 3. 期权行情（合并链）
 	snapshot.OptionCount = len(tickers)
 
-	snapshot.OptionRows = strategy.RankOptions(instruments, tickers, spotMap, time.Now())
+	snapshot.OptionRows = strategy.RankOptions(instruments, tickers, spotMap, now)
 
 	// 4. DCY 产品（尽力而为；无 Key/模拟盘下 401/500 → 降级为纯期权观察）
 	// sfp/dcd 限速 1 req/s（User ID 级）由 okx.Client 统一节流（含重试），
@@ -111,12 +164,18 @@ func FetchWith(c *okx.Client, dcyUly string, p strategy.Params) (*Snapshot, erro
 	}
 	snapshot.DcdCount = len(dcds)
 	if len(dcds) > 0 {
+		snapshot.DcdAt = time.Now()
 		snapshot.DCYAvailable = true
 		snapshot.Products = make(map[string]okx.DCDProduct, len(dcds))
-		for _, p := range dcds {
-			snapshot.Products[p.ProductID] = p
+		for _, prod := range dcds {
+			snapshot.Products[prod.ProductID] = prod
 		}
-		snapshot.Decisions = strategy.Build(dcds, instruments, tickers, spotMap, time.Now(), p)
+		if p.StrategyMode == "legacy" {
+			snapshot.Decisions = strategy.Build(dcds, instruments, tickers, spotMap, now, p)
+		} else {
+			snapshot.Decisions = strategy.BuildDCYEx(dcds, instruments, tickers, spotMap,
+				snapshot.RV30, now, p, greeks, snapshot.IVPct)
+		}
 		if len(warns) > 0 {
 			partial := "DCY 部分刷新失败（该方向暂无数据）: " + strings.Join(warns, "; ")
 			if snapshot.Warn != "" {
@@ -137,7 +196,121 @@ func FetchWith(c *okx.Client, dcyUly string, p strategy.Params) (*Snapshot, erro
 	// 期权榜保持全链路完整展示（卖方有效方向 + 有买盘），不再按「DCY 已对齐
 	// 合约」裁剪——那样整条链只剩 DCY 产品匹配的最近几个档位，用户对照
 	// OKX 实际列表时看不到 70000/74000 等档位。需要收敛视图用「到期 + 方向」筛选。
+	if snapshot.RVWarn != "" {
+		if snapshot.Warn != "" {
+			snapshot.Warn += "; "
+		}
+		snapshot.Warn += snapshot.RVWarn
+	}
+	if snapshot.GreeksW != "" {
+		if snapshot.Warn != "" {
+			snapshot.Warn += "; "
+		}
+		snapshot.Warn += snapshot.GreeksW
+	}
 	return snapshot, nil
+}
+
+// fetchVol 拉日线并估计入场波动率（EWMA × 主窗口的保守组合）。
+// 失败返回零值 + 原因，由调用方写进 Warn；决策层看到 RV30=0 会给
+// rv_missing，不会盲卖。
+func fetchVol(c *okx.Client, instID string, window int) (strategy.VolEstimate, string) {
+	if window <= 0 {
+		window = 30
+	}
+	// 需要 90d 窗口 + 150 个滚动 RV 样本（分位）→ 多取一些；上限 300。
+	limit := window + 150
+	if limit < 200 {
+		limit = 200
+	}
+	cs, err := c.GetCandles(instID, "1D", limit)
+	if err != nil {
+		return strategy.VolEstimate{}, "RV 拉取失败: " + shortErr(err)
+	}
+	closes := make([]float64, 0, len(cs))
+	for _, x := range cs {
+		if x.Confirm && x.Close > 0 {
+			closes = append(closes, x.Close)
+		}
+	}
+	est := strategy.EstimateVolWindow(closes, window)
+	if est.Entry <= 0 {
+		return est, "RV 计算失败: 收盘价样本不足（" + strconv.Itoa(len(closes)) + " 根）"
+	}
+	return est, ""
+}
+
+// fetchGreeks 拉期权链的 Delta（/public/opt-summary），返回 instId → |delta|。
+// 两条链（币本位 BTC-USD / U 本位 BTC-USD_UM）都尝试，任一成功即可用。
+func fetchGreeks(c *okx.Client, chains ...string) (map[string]float64, string) {
+	out := make(map[string]float64, 128)
+	var lastErr string
+	ok := 0
+	for _, uly := range chains {
+		if uly == "" {
+			continue
+		}
+		rows, err := c.GetOptSummary(uly)
+		if err != nil {
+			lastErr = uly + ": " + shortErr(err)
+			continue
+		}
+		ok++
+		for _, r := range rows {
+			v, perr := strconv.ParseFloat(strings.TrimSpace(r.Delta), 64)
+			if perr != nil || v == 0 {
+				continue
+			}
+			out[r.InstID] = math.Abs(v)
+		}
+	}
+	if ok == 0 && lastErr != "" {
+		return nil, "opt-summary 不可用（Delta 退回 IV 反解）: " + lastErr
+	}
+	return out, ""
+}
+
+// medianPutIV 期权链 PUT 买盘 IV 的中位数（限定期限窗口）。
+// 作为「当前市场 IV」的横截面代理：比单张 DCY 的隐含 IV 稳定，也不依赖
+// 双币赢是否有在售产品。
+func medianPutIV(tickers []okx.OptionTicker, now time.Time, minDays, maxDays float64) float64 {
+	if minDays <= 0 {
+		minDays = 10
+	}
+	if maxDays <= 0 {
+		maxDays = 30
+	}
+	vals := make([]float64, 0, len(tickers))
+	for _, t := range tickers {
+		if strings.ToUpper(strings.TrimSpace(t.OptType)) != "P" {
+			continue
+		}
+		ms, err := strconv.ParseInt(strings.TrimSpace(t.ExpTime), 10, 64)
+		if err != nil || ms <= 0 {
+			continue
+		}
+		days := time.UnixMilli(ms).Sub(now).Hours() / 24
+		if days < minDays || days > maxDays {
+			continue
+		}
+		v, err := strconv.ParseFloat(strings.TrimSpace(t.BidIV), 64)
+		if err != nil || v <= 0 {
+			continue
+		}
+		if v > 3 { // 个别接口返回百分数
+			v /= 100
+		}
+		vals = append(vals, v)
+	}
+	if len(vals) == 0 {
+		return 0
+	}
+	sort.Float64s(vals)
+	n := len(vals)
+	if n%2 == 1 {
+		return vals[n/2]
+	}
+	return (vals[n/2-1] + vals[n/2]) / 2
 }
 
 // Filter 组合筛选条件（零值 = 全量）。

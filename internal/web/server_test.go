@@ -14,6 +14,7 @@ import (
 	"github.com/tp/coinoption/internal/executor"
 	"github.com/tp/coinoption/internal/market"
 	"github.com/tp/coinoption/internal/okx"
+	"github.com/tp/coinoption/internal/store"
 	"github.com/tp/coinoption/internal/strategy"
 )
 
@@ -118,10 +119,129 @@ func TestIndexPageContainsControls(t *testing.T) {
 		"coinoption.prefs.v1", "window.localStorage",
 		// 详情区指标
 		"DECIDE", "POLICY CHECK", "对照链", "期权合约",
+		// 策略说明：常驻目标价提示 + 说明弹窗
+		"目标价 = OKX 挂出的 DCY 行权价", `id="strategyMore"`, `id="guideNav"`,
+		`id="guideModal"`, `id="guideBody"`, "目标价怎么选",
+		// 本轮最优目标价
+		"本轮最优目标价", `id="bestBar"`, `id="bestPrice"`, `id="bestJump"`,
+		// 设置页：资金与绝对风控上限分离
+		`id="setCapital"`, `id="setTotalExposure"`, `id="setPerOrder"`,
+		// 期权手动下单：每张名义 + 单张权利金
+		"每张名义", "卖 1 张约收权利金", `卖出张数（每张`,
+		// 纸面模式提示（避免把 sim 纸面在持当成真实仓位）
+		"sim-local 纸面模式", "sim_orders.jsonl",
+		// 持仓弹窗
+		`id="positionsNav"`, `id="positionsModal"`, `id="posBody"`, "/api/positions",
 	} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("首页缺少 %q", want)
 		}
+	}
+}
+
+func TestAPIGuideTargetPriceSection(t *testing.T) {
+	ts := newTestServer(t, &fakeFetcher{snap: testSnap()})
+	code, body := get(t, ts.URL+"/api/guide")
+	if code != http.StatusOK {
+		t.Fatalf("GET /api/guide = %d: %s", code, body)
+	}
+	var g strategy.Guide
+	if err := json.Unmarshal(body, &g); err != nil {
+		t.Fatalf("解析策略说明失败: %v\n%s", err, body)
+	}
+	var target *strategy.GuideSection
+	for i := range g.Sections {
+		if g.Sections[i].Key == "target" {
+			target = &g.Sections[i]
+			break
+		}
+	}
+	if target == nil {
+		t.Fatalf("缺少 target 段落: %+v", g.Sections)
+	}
+	joined := strings.Join(target.Lines, "\n") + target.Note
+	for _, want := range []string{"目标价", "OKX", "Delta", "score"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("目标价段落缺少 %q: %s", want, joined)
+		}
+	}
+}
+
+func TestAPIGuideUsesCurrentSettings(t *testing.T) {
+	st := store.DefaultSettings()
+	st.TenorMinDays = 7
+	st.TenorMaxDays = 14
+	st.MaxAbsDelta = 0.22
+	fs := &fakeSettingsStore{st: st, init: true}
+	ts := httptest.NewServer(New(&fakeFetcher{snap: testSnap()}, "BTC-USDT", "", WithSettingsStore(fs)).Handler)
+	t.Cleanup(ts.Close)
+	code, body := get(t, ts.URL+"/api/guide")
+	if code != http.StatusOK {
+		t.Fatalf("GET /api/guide = %d: %s", code, body)
+	}
+	var g strategy.Guide
+	if err := json.Unmarshal(body, &g); err != nil {
+		t.Fatalf("解析策略说明失败: %v", err)
+	}
+	var all []string
+	for _, s := range g.Sections {
+		all = append(all, s.Lines...)
+	}
+	joined := strings.Join(all, "\n")
+	for _, want := range []string{"7–14", "0.22"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("策略说明未使用当前 settings（缺 %q）:\n%s", want, joined)
+		}
+	}
+}
+
+func TestAPIGuideMethodNotAllowed(t *testing.T) {
+	ts := newTestServer(t, &fakeFetcher{snap: testSnap()})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/guide", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /api/guide = %d, want 405", resp.StatusCode)
+	}
+}
+
+// /api/positions 返回与 CLI/TUI 同一份持仓文本（含风控快照与 [SIM] 纸面单）。
+func TestAPIPositions(t *testing.T) {
+	ts := newTradeServerOpts(t, &fakeFetcher{snap: testSnap()},
+		WithTrader(&fakeTrader{mode: executor.ModeSimLocal}))
+	code, body := get(t, ts.URL+"/api/positions")
+	if code != http.StatusOK {
+		t.Fatalf("/api/positions = %d: %s", code, body)
+	}
+	var j struct {
+		Mode  string              `json:"mode"`
+		Guard executor.GuardState `json:"guard"`
+		Lines []string            `json:"lines"`
+	}
+	if err := json.Unmarshal(body, &j); err != nil {
+		t.Fatalf("decode: %v (%s)", err, body)
+	}
+	text := strings.Join(j.Lines, "\n")
+	if j.Mode != string(executor.ModeSimLocal) || !strings.Contains(text, "模式 sim-local") {
+		t.Fatalf("持仓模式/头部不符: %+v\n%s", j, text)
+	}
+	if !strings.Contains(text, "[SIM] 纸面单") {
+		t.Fatalf("持仓文本缺少纸面单段: %s", text)
+	}
+}
+
+// 只读看板没有 executor 时明确提示改用命令行，而不是返回空持仓。
+func TestAPIPositionsReadOnly(t *testing.T) {
+	ts := newTestServer(t, &fakeFetcher{snap: testSnap()})
+	code, body := get(t, ts.URL+"/api/positions")
+	if code != http.StatusNotImplemented {
+		t.Fatalf("只读 /api/positions = %d: %s", code, body)
+	}
+	if !strings.Contains(string(body), "--positions") {
+		t.Fatalf("应提示用命令行查看: %s", body)
 	}
 }
 
@@ -176,6 +296,45 @@ func TestAPIDecisionsCamelCaseKeys(t *testing.T) {
 	}
 	if !d.Row.ExpTime.Equal(time.Date(2026, 11, 6, 8, 0, 0, 0, time.UTC)) {
 		t.Fatalf("expTime = %v", d.Row.ExpTime)
+	}
+}
+
+func TestAPIDecisionsBestPicksHighestScore(t *testing.T) {
+	s := testSnap()
+	s.Decisions = []strategy.Decision{
+		{
+			Row:          strategy.MatchRow{ProductID: "low", OptType: 'P', Strike: 72000, InvestCcy: "USDT", Days: 10},
+			Action:       strategy.ActionSubscribeDual,
+			ReasonCode:   strategy.ReasonDCYOK,
+			Score:        0.01,
+			Delta:        0.20,
+			SuggestedAmt: 100,
+		},
+		{
+			Row:          strategy.MatchRow{ProductID: "best", OptType: 'P', Strike: 75000, InvestCcy: "USDT", Days: 10},
+			Action:       strategy.ActionSubscribeDual,
+			ReasonCode:   strategy.ReasonDCYOK,
+			Score:        0.03,
+			Delta:        0.22,
+			SuggestedAmt: 100,
+		},
+	}
+	ts := newTestServer(t, &fakeFetcher{snap: s})
+	code, body := get(t, ts.URL+"/api/decisions")
+	if code != http.StatusOK {
+		t.Fatalf("API = %d: %s", code, body)
+	}
+	var j struct {
+		Best *strategy.Decision `json:"best"`
+	}
+	if err := json.Unmarshal(body, &j); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if j.Best == nil {
+		t.Fatal("缺少 best 字段")
+	}
+	if j.Best.Row.ProductID != "best" || j.Best.Row.Strike != 75000 || j.Best.Score != 0.03 {
+		t.Fatalf("best = %+v，应选 score 最高的 75000", j.Best)
 	}
 }
 
@@ -338,16 +497,18 @@ func (f fetcherFunc) FetchSnapshot(uly string) (*market.Snapshot, error) { retur
 // ─── Web 手动下单 ───────────────────────────────────────────────
 
 type fakeTrader struct {
-	mode     executor.Mode
-	optCalls int
-	dcdCalls int
-	lastInst string
-	lastSz   float64
-	lastProd string
-	lastAmt  float64
-	minAPR   float64
-	fail     error
-	limits   executor.Limits
+	mode          executor.Mode
+	optCalls      int
+	dcdCalls      int
+	lastInst      string
+	lastSz        float64
+	lastProd      string
+	lastAmt       float64
+	minAPR        float64
+	fail          error
+	limits        executor.Limits
+	advisoryCalls int
+	warnings      []string
 }
 
 func (f *fakeTrader) Mode() executor.Mode { return f.mode }
@@ -367,6 +528,9 @@ func (f *fakeTrader) State() executor.GuardState {
 func (f *fakeTrader) SetCapital(capitalUSDT float64) {
 	f.limits = f.currentLimits().WithCapital(capitalUSDT)
 }
+func (f *fakeTrader) SetRiskLimits(totalExposureUSDT, perOrderUSDT float64) {
+	f.limits = f.currentLimits().WithRiskOverrides(totalExposureUSDT, perOrderUSDT)
+}
 func (f *fakeTrader) SubmitOption(instID string, sz, limPx float64) (executor.Outcome, error) {
 	f.optCalls++
 	f.lastInst = instID
@@ -383,6 +547,20 @@ func (f *fakeTrader) SubmitOption(instID string, sz, limPx float64) (executor.Ou
 func (f *fakeTrader) SubmitOptionChecked(instID string, sz, limPx, minAPR float64) (executor.Outcome, error) {
 	f.minAPR = minAPR
 	return f.SubmitOption(instID, sz, limPx)
+}
+
+func (f *fakeTrader) SubmitDCDAdvisory(p okx.DCDProduct, amt float64) (executor.Outcome, error) {
+	f.advisoryCalls++
+	out, err := f.SubmitDCD(p, amt)
+	out.Warnings = append(out.Warnings, f.warnings...)
+	return out, err
+}
+
+func (f *fakeTrader) SubmitOptionAdvisory(instID string, sz, limPx float64) (executor.Outcome, error) {
+	f.advisoryCalls++
+	out, err := f.SubmitOption(instID, sz, limPx)
+	out.Warnings = append(out.Warnings, f.warnings...)
+	return out, err
 }
 
 func (f *fakeTrader) SubmitDCD(p okx.DCDProduct, amt float64) (executor.Outcome, error) {
@@ -478,6 +656,29 @@ func TestAPIOrderOptionRejectsNonDecision(t *testing.T) {
 	}
 	if tr.optCalls != 0 {
 		t.Fatalf("不应调用 executor，实际 %d 次", tr.optCalls)
+	}
+}
+
+// 手动下单走 advisory（越限只提示），并把 Warnings 透传给前端。
+func TestAPIOrderUsesAdvisoryAndReturnsWarnings(t *testing.T) {
+	tr := &fakeTrader{mode: executor.ModeSimLocal, warnings: []string{"单笔 500.00 超过上限 100.00 USDT"}}
+	ts := newTradeServer(t, &fakeFetcher{snap: testSnap()}, tr)
+	code, body := postJSON(t, ts.URL+"/api/order/dcd",
+		`{"uly":"BTC-USDT","productId":"BTC-USDT-261113-78000-P","amt":500}`)
+	if code != http.StatusOK {
+		t.Fatalf("手动单应放行 %d: %s", code, body)
+	}
+	if tr.advisoryCalls != 1 {
+		t.Fatalf("应调用 advisory 入口，实际 %d", tr.advisoryCalls)
+	}
+	var j struct {
+		Warnings []string `json:"warnings"`
+	}
+	if err := json.Unmarshal(body, &j); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(j.Warnings) != 1 || !strings.Contains(j.Warnings[0], "超过上限") {
+		t.Fatalf("回执缺少 warnings: %s", body)
 	}
 }
 
@@ -651,5 +852,42 @@ func TestAPIOrderDCDManualUnaligned(t *testing.T) {
 	}
 	if tr.dcdCalls != 1 || tr.lastProd != "BTC-USDT-261113-78000-P" {
 		t.Fatalf("应调用 DCD 下单: calls=%d prod=%s", tr.dcdCalls, tr.lastProd)
+	}
+}
+
+// 实盘开启自动交易必须带服务端二次确认；裸 POST 不能直接放行。
+func TestLiveAutoEnableRequiresConfirm(t *testing.T) {
+	tr := &fakeTrader{mode: executor.ModeLive}
+	ts := httptest.NewServer(New(&fakeFetcher{snap: testSnap()}, "BTC-USDT", "",
+		WithTrader(tr), WithAutoTrade(false)).Handler)
+	defer ts.Close()
+
+	code, body := postJSON(t, ts.URL+"/api/auto", `{"enabled":true}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("实盘无 confirmLive 应 400，实际 %d: %s", code, body)
+	}
+	code, body = postJSON(t, ts.URL+"/api/auto", `{"enabled":true,"confirmLive":true}`)
+	if code != http.StatusOK {
+		t.Fatalf("带 confirmLive 应 200，实际 %d: %s", code, body)
+	}
+}
+
+// --limits 显式指定时，保存设置不得用资金派生值覆盖风控上限。
+func TestApplySettingsRespectsLimitsOverride(t *testing.T) {
+	tr := &fakeTrader{mode: executor.ModeSimLocal}
+	c := &cachedFetcher{f: &fakeFetcher{snap: testSnap()}, entries: map[string]cacheEntry{}}
+	settings := store.DefaultSettings()
+	settings.CapitalUSDT = 1000
+
+	// 无 override：SetCapital 生效（单笔 = 1000×40% = 400）。
+	applySettings(serverConfig{trader: tr}, c, settings)
+	if per := tr.currentLimits().PerOrderUSDT; per != 400 {
+		t.Fatalf("未覆盖时应按资金派生单笔 400，实际 %v", per)
+	}
+	// 有 override：保持原上限不变。
+	before := tr.currentLimits()
+	applySettings(serverConfig{trader: tr, limitsOverride: true}, c, settings)
+	if after := tr.currentLimits(); after != before {
+		t.Fatalf("--limits 覆盖时不应改动上限: before=%+v after=%+v", before, after)
 	}
 }

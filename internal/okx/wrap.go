@@ -1,8 +1,10 @@
 package okx
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"reflect"
 )
 
 // wrap 把 json.RawMessage 解包到目标类型。
@@ -19,6 +21,13 @@ func wrap[T any](raw json.RawMessage, err error) ([]T, error) {
 func wrapKeys[T any](raw json.RawMessage, err error, keys ...string) ([]T, error) {
 	if err != nil {
 		return nil, err
+	}
+	// JSON null / 空 body 不能被当成「空列表」：前者多为接口异常（鉴权失败、
+	// 产品下架、字段改名），后者是 bug。当成空列表会让「没有持仓」和
+	// 「查询失败」不可区分，进而重复下单。
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, fmt.Errorf("decode %T: 服务端 data 为 null/空", *new(T))
 	}
 
 	// 形态 1：data 即数组
@@ -39,10 +48,16 @@ func wrapKeys[T any](raw json.RawMessage, err error, keys ...string) ([]T, error
 		}
 	}
 
-	// 形态 3：data 是单对象本身
+	// 形态 3：data 是单对象本身。json.Unmarshal 对任意对象都会成功（未知
+	// 字段被忽略），所以必须拒绝「解析出来是零值」的情况——否则 wrapper
+	// 字段改名 / data:{} 会伪造出一个 ProductID=""、OrdID="" 的假对象，
+	// 让上层误以为「下单成功 / 没有持仓」。
 	var single T
 	if serr := json.Unmarshal(raw, &single); serr == nil {
-		return []T{single}, nil
+		if v := reflect.ValueOf(single); v.Kind() != reflect.Struct || !v.IsZero() {
+			return []T{single}, nil
+		}
+		return nil, fmt.Errorf("decode %T: data 结构不匹配（解析为零值对象）: %s", single, truncate(string(raw), 200))
 	}
 
 	return nil, fmt.Errorf("decode %T: 无法识别的 data 形态: %s", arr, truncate(string(raw), 200))
@@ -66,15 +81,27 @@ func decode[T any](raw json.RawMessage, err error) (*T, error) {
 }
 
 // postDecodeKeys POST + keys 解包（取 data[0]；空数组返回 nil）。
+//
+// 默认按**非幂等写请求**处理：只有 50011 会重试，其余失败可能已成交，
+// 返回 *AmbiguousError。查询类 POST（如 DCY 报价）请用 postDecodeIdem。
 func (c *Client) postDecodeKeys[T any](path string, body any, keys ...string) (*T, error) {
-	raw, err := c.doJSON(ctx(), "POST", path, body)
+	raw, err := c.doJSON(ctx(), "POST", path, body, false)
 	if err != nil {
 		return nil, err
 	}
 	return decodeKeys[T](raw, nil, keys...)
 }
 
-// postDecode POST + 单对象解包（data[0]，取不到对象返回 nil）。
+// postDecode POST + 单对象解包（data[0]，取不到对象返回 nil）。非幂等。
 func (c *Client) postDecode[T any](path string, body any) (*T, error) {
 	return c.postDecodeKeys[T](path, body)
+}
+
+// postDecodeIdem 幂等 POST（无副作用，可安全重试），用于报价类接口。
+func (c *Client) postDecodeIdem[T any](path string, body any) (*T, error) {
+	raw, err := c.doJSON(ctx(), "POST", path, body, true)
+	if err != nil {
+		return nil, err
+	}
+	return decodeKeys[T](raw, nil)
 }

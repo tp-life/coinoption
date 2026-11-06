@@ -12,8 +12,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/tp/coinoption/internal/strategy"
 )
 
 // SimOrder 一笔纸面订单（DCY 申购 / 期权卖单 的本地模拟）。
@@ -39,10 +43,14 @@ type SimOrder struct {
 	SettlePx  float64   `json:"settlePx,omitempty"`
 	SettleSz  float64   `json:"settleSz,omitempty"`  // 本金/损失交付量
 	SettleCcy string    `json:"settleCcy,omitempty"` // 交付币种（与交付量成对）
-	YieldSz   float64   `json:"yieldSz,omitempty"`   // 收益量
+	YieldSz   float64   `json:"yieldSz,omitempty"`   // 收益量（期权为「权利金 − 行权损耗」净额）
 	YieldCcy  string    `json:"yieldCcy,omitempty"`
-	SimOrdID  string    `json:"simOrdId,omitempty"` // OKX Demo 回单 ordId（sim-okx 期权）
-	Note      string    `json:"note,omitempty"`
+	// PnlUSDT 已实现盈亏（统一 USDT 口径，含本金汇兑损益）。
+	// 旧字段 SettleSz/YieldSz 只描述交付量，不能直接当 P&L（被行权时本金
+	// 从 USDT 变成 BTC 的浮亏不在其中）。
+	PnlUSDT  float64 `json:"pnlUsdt,omitempty"`
+	SimOrdID string  `json:"simOrdId,omitempty"` // OKX Demo 回单 ordId（sim-okx 期权）
+	Note     string  `json:"note,omitempty"`
 }
 
 // Order 真实订单回执（live / sim-okx Demo）。
@@ -65,6 +73,7 @@ type AuditEvent struct {
 	Subject string    `json:"subject"` // product/instId
 	Reason  string    `json:"reason,omitempty"`
 	AmtUSDT float64   `json:"amtUsdt,omitempty"`
+	PnlUSDT float64   `json:"pnlUsdt,omitempty"` // 已实现盈亏（结算事件用）
 	Mode    string    `json:"mode"`
 	Detail  string    `json:"detail,omitempty"`
 }
@@ -78,13 +87,11 @@ type Store struct {
 // New 创建（必要时 mkdir -p）。
 // dir 为空 → $HOME/.coinoption。
 func New(dir string) (*Store, error) {
-	if dir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, fmt.Errorf("user home: %w", err)
-		}
-		dir = filepath.Join(home, ".coinoption")
+	resolved, err := ResolveDir(dir)
+	if err != nil {
+		return nil, err
 	}
+	dir = resolved
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir %s: %w", dir, err)
 	}
@@ -149,6 +156,33 @@ func (s *Store) SaveSim(o SimOrder) error {
 }
 
 func (s *Store) LoadSim() ([]SimOrder, error) { return readAll[SimOrder](s.path("sim_orders.jsonl")) }
+
+// ClearOpenSim 删除所有 open 状态的纸面单（保留已结算历史），返回删除数。
+// 用于 sim 测试重置 / 切换 live 前清理历史纸面仓位；不触碰真实平台仓位。
+func (s *Store) ClearOpenSim() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := readAll[SimOrder](s.path("sim_orders.jsonl"))
+	if err != nil {
+		return 0, err
+	}
+	kept := make([]SimOrder, 0, len(rows))
+	removed := 0
+	for _, o := range rows {
+		if o.State == "open" {
+			removed++
+			continue
+		}
+		kept = append(kept, o)
+	}
+	if removed == 0 {
+		return 0, nil
+	}
+	if err := rewriteAll(s.path("sim_orders.jsonl"), kept, SimOrder{}); err != nil {
+		return 0, err
+	}
+	return removed, nil
+}
 
 // SaveOrder / LoadOrders ── 真实订单回执（orders）。
 func (s *Store) SaveOrder(o Order) error {
@@ -325,22 +359,71 @@ func normalizeState(st string) string { return st }
 // 必须在当次会话的 Settings 页重新确认开启（防止重启后无声自动下单）。
 //
 // 资金总额（CapitalUSDT）与自动交易差%门槛（MinDiffPct）由 Web 设置页修改，
-// TUI 与 Web 共用同一份 settings.json；Web 授权码只保存哈希（WebAuthCodeHash）。
+// TUI 与 Web 共用同一份 settings.json；Web 授权码只保存哈希（WebAuthCodeHash），
+// API Key/Secret/Passphrase 可由 Web 设置页写入（明文，文件权限 0600）。
 type Settings struct {
 	MinOptionEdgePP float64 `json:"minOptionEdgePp"` // 期权须高出 DCY 的百分点（20 = 20pp）
 	MinAbsEdgePct   float64 `json:"minAbsEdgePct"`   // 单笔绝对收益差下限（%，0.5 = 0.5%）
 	MaxStrikeGapPct float64 `json:"maxStrikeGapPct"` // 行权价相对现价最大偏差（%）
 	AutoTrade       bool    `json:"autoTrade"`
-	// CapitalUSDT 资金总额（USDT）：风控总敞口上限，单笔上限按 40% 派生。
+	// CapitalUSDT 资金总额（USDT）：策略仓位与默认风控上限的基准。
 	// ≤0 → 回落默认 5000（保持旧行为：总敞口 5000 / 单笔 2000）。
 	CapitalUSDT float64 `json:"capitalUsdt"`
+	// TotalExposureUSDT / PerOrderUSDT 风控绝对上限覆盖（0 = 按 CapitalUSDT 派生）。
+	// 用于「策略只拿 1000 试仓，但账户已有 5000 在持」的场景：
+	// 资金总额仍然决定策略单笔/总本金，风险上限单独按账户真实承受力设置。
+	TotalExposureUSDT float64 `json:"totalExposureUsdt,omitempty"`
+	PerOrderUSDT      float64 `json:"perOrderUsdt,omitempty"`
 	// MinDiffPct 自动交易最低差%（年化、绝对值；0 = 不设门槛）。
 	// 期权卖出要求「期权APR − DCY APR」达标；DCY 申购要求反方向差值达标，
 	// 避免自动交易在两条腿几乎无差异时来回下单。只影响自动执行，不影响推荐动作。
 	MinDiffPct float64 `json:"minDiffPct"`
-	// WebAuthCodeHash Web 授权码的 SHA-256 十六进制摘要（不落明文）。
+
+	// ── v1 稳定策略（DCY-only）参数；旧字段保留兼容，但不再参与 v1 决策 ──
+	StrategyMode       string  `json:"strategyMode,omitempty"` // "dcy_only"（默认）
+	TenorMinDays       float64 `json:"tenorMinDays,omitempty"`
+	TenorMaxDays       float64 `json:"tenorMaxDays,omitempty"`
+	MinDaysToExpiry    float64 `json:"minDaysToExpiry,omitempty"`
+	MaxExpiryGapHours  float64 `json:"maxExpiryGapHours,omitempty"`
+	MaxAbsDelta        float64 `json:"maxAbsDelta,omitempty"`
+	MinIvRvSpread      float64 `json:"minIvRvSpread,omitempty"`
+	FairVolBuffer      float64 `json:"fairVolBuffer,omitempty"`
+	MinPremiumOverFair float64 `json:"minPremiumOverFair,omitempty"`
+	MinAbsYieldPct     float64 `json:"minAbsYieldPct,omitempty"`
+	MinAPRPct          float64 `json:"minAprPct,omitempty"` // 本金年化地板（v2 资金 hurdle 的兜底）
+	// v2 资金口径：
+	//   CashAPRPct          现金/无风险年化（机会成本）
+	//   MinCapitalExcessPct 资金口径相对现金的超额年化下限
+	//   StressShockPct      压力情景跌幅（%）
+	//   StressMaxLossPct    压力浮亏 / 资金上限（%）
+	//   AllowNegativeEdge   允许 DCY 劣于期权（默认 false）
+	CashAPRPct           float64 `json:"cashAprPct,omitempty"`
+	MinCapitalExcessPct  float64 `json:"minCapitalExcessPct,omitempty"`
+	StressShockPct       float64 `json:"stressShockPct,omitempty"`
+	StressMaxLossPct     float64 `json:"stressMaxLossPct,omitempty"`
+	AllowNegativeEdge    bool    `json:"allowNegativeEdge,omitempty"`
+	MinEdgeRatio         float64 `json:"minEdgeRatio,omitempty"`
+	MinEdgeAbs           float64 `json:"minEdgeAbs,omitempty"`
+	MaxSpreadPct         float64 `json:"maxSpreadPct,omitempty"`
+	DcyMaxPrincipalPct   float64 `json:"dcyMaxPrincipalPct,omitempty"`
+	DcyMaxPrincipalUSDT  float64 `json:"dcyMaxPrincipalUsdt,omitempty"`
+	DcyTotalPrincipalPct float64 `json:"dcyTotalPrincipalPct,omitempty"`
+	DcyDeltaExposurePct  float64 `json:"dcyDeltaExposurePct,omitempty"`
+	MaxConcurrent        int     `json:"maxConcurrent,omitempty"`
+	DailyLossPct         float64 `json:"dailyLossPct,omitempty"`
+	RVWindowDays         int     `json:"rvWindowDays,omitempty"`
+	// MinIVPercentilePct 入场 IV 历史分位下限（0~100；0 = 关闭）。
+	// 需要先积累样本（market.IVHistory 每小时一条），否则不生效。
+	MinIVPercentilePct float64 `json:"minIvPercentilePct,omitempty"`
+	// WebAuthCodeHash Web 授权码摘要（PBKDF2-SHA256；兼容旧版 SHA-256 十六进制）。
 	// 空 = 未启用 Web 授权；遗忘时用 --web-code 重置，或删除 settings.json 重新生成。
 	WebAuthCodeHash string `json:"webAuthCodeHash,omitempty"`
+	// API 凭证（Web 设置页维护，落盘 settings.json 0600）。
+	// 启动参数/环境变量优先；三项必须齐全才会被使用，设置页只回显掩码 Key
+	// 与「是否配置」，绝不会把 Secret/Passphrase 回传给浏览器。
+	APIKey        string `json:"apiKey,omitempty"`
+	APISecret     string `json:"apiSecret,omitempty"`
+	APIPassphrase string `json:"apiPassphrase,omitempty"`
 	// 界面筛选记忆（TUI 退出后重启恢复）：方向 "" | "C" | "P"；
 	// 结算本位 "" | "B"（币本位）| "U"（U本位）。
 	// 只影响展示筛选，不影响策略/下单。
@@ -360,7 +443,121 @@ func DefaultSettings() Settings {
 		AutoTrade:       false,
 		CapitalUSDT:     5000,
 		MinDiffPct:      0,
+
+		StrategyMode:         "dcy_only",
+		TenorMinDays:         10,
+		TenorMaxDays:         30,
+		MinDaysToExpiry:      3,
+		MaxExpiryGapHours:    12,
+		MaxAbsDelta:          0.30,
+		MinIvRvSpread:        0.05,
+		FairVolBuffer:        1.10,
+		MinPremiumOverFair:   1.05,
+		MinAbsYieldPct:       0.5,
+		MinAPRPct:            12,
+		CashAPRPct:           4,
+		MinCapitalExcessPct:  4,
+		StressShockPct:       30,
+		StressMaxLossPct:     10,
+		MinEdgeRatio:         0.10,
+		MinEdgeAbs:           0.0005,
+		MaxSpreadPct:         0.15,
+		DcyMaxPrincipalPct:   0.10,
+		DcyMaxPrincipalUSDT:  100,
+		DcyTotalPrincipalPct: 0.30,
+		DcyDeltaExposurePct:  0.05,
+		MaxConcurrent:        3,
+		DailyLossPct:         0.03,
+		RVWindowDays:         30,
 	}
+}
+
+// ApplyTo 把 v1 参数映射到 strategy.Params；零值保留策略默认，避免旧
+// settings.json / 手改文件把阈值覆盖成 0（0 在策略层通常表示“不设门槛”）。
+func (s Settings) ApplyTo(p *strategy.Params) {
+	if p == nil {
+		return
+	}
+	if s.CapitalUSDT > 0 {
+		p.CapitalUSDT = s.CapitalUSDT
+	}
+	if s.StrategyMode != "" {
+		p.StrategyMode = s.StrategyMode
+	}
+	if s.TenorMinDays > 0 {
+		p.TenorMinDays = s.TenorMinDays
+	}
+	if s.TenorMaxDays > 0 {
+		p.TenorMaxDays = s.TenorMaxDays
+	}
+	if s.MinDaysToExpiry > 0 {
+		p.MinDaysToExpiry = s.MinDaysToExpiry
+	}
+	if s.MaxExpiryGapHours > 0 {
+		p.MaxExpiryGapHours = s.MaxExpiryGapHours
+	}
+	if s.MaxAbsDelta > 0 {
+		p.MaxAbsDelta = s.MaxAbsDelta
+	}
+	if s.MinIvRvSpread > 0 {
+		p.MinIvRvSpread = s.MinIvRvSpread
+	}
+	if s.FairVolBuffer > 0 {
+		p.FairVolBuffer = s.FairVolBuffer
+	}
+	if s.MinPremiumOverFair > 0 {
+		p.MinPremiumOverFair = s.MinPremiumOverFair
+	}
+	if s.MinAbsYieldPct > 0 {
+		p.MinAbsYield = s.MinAbsYieldPct / 100
+	}
+	if s.MinAPRPct > 0 {
+		p.MinAPR = s.MinAPRPct / 100
+	}
+	if s.CashAPRPct > 0 {
+		p.CashAPR = s.CashAPRPct / 100
+	}
+	if s.MinCapitalExcessPct > 0 {
+		p.MinCapitalExcessAPR = s.MinCapitalExcessPct / 100
+	}
+	p.AllowNegativeEdge = s.AllowNegativeEdge
+	if s.MinEdgeRatio > 0 {
+		p.MinEdgeRatio = s.MinEdgeRatio
+	}
+	if s.MinEdgeAbs > 0 {
+		p.MinEdgeAbs = s.MinEdgeAbs
+	}
+	if s.MaxSpreadPct > 0 {
+		p.MaxSpreadPct = s.MaxSpreadPct
+	}
+	if s.DcyMaxPrincipalPct > 0 {
+		p.DcyMaxPrincipalPct = s.DcyMaxPrincipalPct
+	}
+	if s.DcyMaxPrincipalUSDT > 0 {
+		p.DcyMaxPrincipalUSDT = s.DcyMaxPrincipalUSDT
+	}
+	if s.DcyTotalPrincipalPct > 0 {
+		p.DcyTotalPrincipalPct = s.DcyTotalPrincipalPct
+	}
+	if s.DcyDeltaExposurePct > 0 {
+		p.DcyDeltaExposurePct = s.DcyDeltaExposurePct
+	}
+	if s.StressShockPct > 0 {
+		p.StressShockPct = s.StressShockPct / 100
+	}
+	if s.StressMaxLossPct > 0 {
+		p.StressMaxLossPct = s.StressMaxLossPct / 100
+	}
+	if s.MaxConcurrent > 0 {
+		p.MaxConcurrent = s.MaxConcurrent
+	}
+	if s.DailyLossPct > 0 {
+		p.DailyLossPct = s.DailyLossPct
+	}
+	if s.RVWindowDays > 0 {
+		p.RVWindowDays = s.RVWindowDays
+	}
+	p.MinIVPercentile = s.MinIVPercentilePct
 }
 
 // LoadSettings 读取配置；文件不存在或字段缺失时回落到默认值（不报错）。
@@ -386,9 +583,24 @@ func (s *Store) LoadSettings() (Settings, error) {
 	if out.MaxStrikeGapPct <= 0 {
 		out.MaxStrikeGapPct = 0.5
 	}
-	// 资金总额决定总敞口上限；非法值回落 5000，避免手改文件把风控改成 0/负数。
+	// 资金总额决定默认风控上限；非法值回落 5000，避免手改文件把风控改成 0/负数。
 	if out.CapitalUSDT <= 0 {
 		out.CapitalUSDT = 5000
+	}
+	// 风控绝对上限覆盖：0 = 按资金总额派生；负值/超限视为未设置。
+	// 单笔不得超过总敞口，否则任何新单都必然被拒。
+	if out.TotalExposureUSDT < 0 || out.TotalExposureUSDT > 1e9 {
+		out.TotalExposureUSDT = 0
+	}
+	if out.PerOrderUSDT < 0 || out.PerOrderUSDT > 1e9 {
+		out.PerOrderUSDT = 0
+	}
+	if out.TotalExposureUSDT > 0 && out.PerOrderUSDT > out.TotalExposureUSDT {
+		out.PerOrderUSDT = out.TotalExposureUSDT
+	}
+	// 未设总敞口覆盖时，单笔不能超过资金派生出的总敞口；坏值直接回落派生值。
+	if out.TotalExposureUSDT == 0 && out.PerOrderUSDT > out.CapitalUSDT {
+		out.PerOrderUSDT = 0
 	}
 	if out.MinDiffPct < 0 {
 		out.MinDiffPct = 0
@@ -396,11 +608,95 @@ func (s *Store) LoadSettings() (Settings, error) {
 	if out.MinDiffPct > 1000 {
 		out.MinDiffPct = 1000 // 1000pp 已是极端值，防止手滑写出天文数字
 	}
-	// 授权码哈希必须是 64 位十六进制；写坏则视为未启用（启动时会重新生成并打印）。
-	if out.WebAuthCodeHash != "" {
-		if b, err := hex.DecodeString(out.WebAuthCodeHash); err != nil || len(b) != 32 {
-			out.WebAuthCodeHash = ""
-		}
+	// v1 参数：手改文件写 0/负数时回落到默认，避免把风控改成“全放行”。
+	def := DefaultSettings()
+	if out.StrategyMode != "legacy" && out.StrategyMode != "dcy_only" {
+		out.StrategyMode = def.StrategyMode
+	}
+	if out.TenorMinDays <= 0 {
+		out.TenorMinDays = def.TenorMinDays
+	}
+	if out.TenorMaxDays <= 0 {
+		out.TenorMaxDays = def.TenorMaxDays
+	}
+	if out.MinDaysToExpiry <= 0 {
+		out.MinDaysToExpiry = def.MinDaysToExpiry
+	}
+	if out.MaxExpiryGapHours <= 0 {
+		out.MaxExpiryGapHours = def.MaxExpiryGapHours
+	}
+	if out.MaxAbsDelta <= 0 {
+		out.MaxAbsDelta = def.MaxAbsDelta
+	}
+	if out.MinIvRvSpread <= 0 {
+		out.MinIvRvSpread = def.MinIvRvSpread
+	}
+	if out.FairVolBuffer <= 0 {
+		out.FairVolBuffer = def.FairVolBuffer
+	}
+	if out.MinPremiumOverFair <= 0 {
+		out.MinPremiumOverFair = def.MinPremiumOverFair
+	}
+	if out.MinAbsYieldPct <= 0 {
+		out.MinAbsYieldPct = def.MinAbsYieldPct
+	}
+	if out.MinAPRPct <= 0 {
+		out.MinAPRPct = def.MinAPRPct
+	}
+	if out.CashAPRPct <= 0 || out.CashAPRPct > 50 {
+		out.CashAPRPct = def.CashAPRPct
+	}
+	if out.MinCapitalExcessPct <= 0 || out.MinCapitalExcessPct > 100 {
+		out.MinCapitalExcessPct = def.MinCapitalExcessPct
+	}
+	if out.StressShockPct <= 0 || out.StressShockPct > 90 {
+		out.StressShockPct = def.StressShockPct
+	}
+	if out.StressMaxLossPct <= 0 || out.StressMaxLossPct > 100 {
+		out.StressMaxLossPct = def.StressMaxLossPct
+	}
+	if out.MinEdgeRatio <= 0 {
+		out.MinEdgeRatio = def.MinEdgeRatio
+	}
+	if out.MinEdgeAbs <= 0 {
+		out.MinEdgeAbs = def.MinEdgeAbs
+	}
+	if out.MaxSpreadPct <= 0 {
+		out.MaxSpreadPct = def.MaxSpreadPct
+	}
+	if out.DcyMaxPrincipalPct <= 0 {
+		out.DcyMaxPrincipalPct = def.DcyMaxPrincipalPct
+	}
+	if out.DcyMaxPrincipalUSDT <= 0 {
+		out.DcyMaxPrincipalUSDT = def.DcyMaxPrincipalUSDT
+	}
+	if out.DcyTotalPrincipalPct <= 0 {
+		out.DcyTotalPrincipalPct = def.DcyTotalPrincipalPct
+	}
+	if out.DcyDeltaExposurePct <= 0 {
+		out.DcyDeltaExposurePct = def.DcyDeltaExposurePct
+	}
+	if out.MaxConcurrent <= 0 {
+		out.MaxConcurrent = def.MaxConcurrent
+	}
+	if out.DailyLossPct <= 0 {
+		out.DailyLossPct = def.DailyLossPct
+	}
+	if out.RVWindowDays <= 0 {
+		out.RVWindowDays = def.RVWindowDays
+	}
+	if out.MinIVPercentilePct < 0 || out.MinIVPercentilePct > 100 {
+		out.MinIVPercentilePct = 0
+	}
+	// 授权码摘要：PBKDF2 串或旧版 64 位十六进制；写坏则视为未启用
+	//（启动时会重新生成并打印）。这里只做格式判断，不引入 web 包依赖。
+	if out.WebAuthCodeHash != "" && !validAuthHash(out.WebAuthCodeHash) {
+		out.WebAuthCodeHash = ""
+	}
+	// API 凭证三项必须齐全；残缺配置直接清空，避免半套密钥被拿去签名。
+	out.APIKey = strings.TrimSpace(out.APIKey)
+	if out.APIKey == "" || out.APISecret == "" || out.APIPassphrase == "" {
+		out.APIKey, out.APISecret, out.APIPassphrase = "", "", ""
 	}
 	// 筛选记忆只认合法枚举值，手改文件写坏则回落「全部」。
 	switch out.SideFilter {
@@ -420,6 +716,24 @@ func (s *Store) LoadSettings() (Settings, error) {
 		out.SortBy = ""
 	}
 	return out, nil
+}
+
+// validAuthHash 判断授权码摘要格式：PBKDF2 串（pbkdf2-sha256$iter$salt$hash）
+// 或旧版 64 位十六进制 SHA-256。
+func validAuthHash(spec string) bool {
+	spec = strings.TrimSpace(spec)
+	if strings.HasPrefix(spec, "pbkdf2-sha256$") {
+		parts := strings.Split(spec, "$")
+		if len(parts) != 4 {
+			return false
+		}
+		if _, err := strconv.Atoi(parts[1]); err != nil {
+			return false
+		}
+		return parts[2] != "" && parts[3] != ""
+	}
+	b, err := hex.DecodeString(spec)
+	return err == nil && len(b) == 32
 }
 
 // SaveSettings 覆盖写配置（临时文件 + rename，避免半截文件）。

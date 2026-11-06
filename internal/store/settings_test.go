@@ -81,3 +81,36 @@ func TestSettingsSortByRoundTripAndValidation(t *testing.T) {
 		t.Fatalf("非法排序键应回落默认顺序，实际 %q", got.SortBy)
 	}
 }
+
+// API 凭证必须三项齐全；往返保存，残缺/手改坏配置要安全清空。
+func TestSettingsAPICredentials(t *testing.T) {
+	s, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	v := DefaultSettings()
+	v.APIKey, v.APISecret, v.APIPassphrase = "key-1234", "secret-xyz", "pass-phrase"
+	if err := s.SaveSettings(v); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+	got, err := s.LoadSettings()
+	if err != nil {
+		t.Fatalf("LoadSettings: %v", err)
+	}
+	if got.APIKey != "key-1234" || got.APISecret != "secret-xyz" || got.APIPassphrase != "pass-phrase" {
+		t.Fatalf("API 凭证往返不符: %+v", got)
+	}
+
+	// 只写一半（模拟手改 settings.json）：三项一起清空，绝不拿半套密钥签名。
+	v.APISecret = ""
+	if err := s.SaveSettings(v); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+	got, err = s.LoadSettings()
+	if err != nil {
+		t.Fatalf("LoadSettings: %v", err)
+	}
+	if got.APIKey != "" || got.APISecret != "" || got.APIPassphrase != "" {
+		t.Fatalf("残缺 API 凭证应清空: %+v", got)
+	}
+}

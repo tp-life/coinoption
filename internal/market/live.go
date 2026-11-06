@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,7 +44,20 @@ type Live struct {
 	dirty       bool
 	chainWarn   []string
 	dcyWarn     string
-	dcdFails    int // 连续失败的 DCY 刷新轮数（用于快速重试退避）
+	rv30        float64
+	rv30Raw     float64
+	rv7         float64
+	rvEwma      float64
+	rvPct       float64
+	rvWarn      string
+	greeks      map[string]float64
+	greeksWarn  string
+	ivNow       float64
+	ivPct       float64
+	ivh         *IVHistory
+	spotAt      time.Time // 现货最近一次成功更新时间
+	dcdAt       time.Time // DCY 最近一次「两个方向都成功」的更新时间
+	dcdFails    int       // 连续失败的 DCY 刷新轮数（用于快速重试退避）
 	wsConnected bool
 	wsStatus    string
 	wsErr       string // 最近一次 WS 断线/握手错误（展示给用户，便于定位代理问题）
@@ -111,6 +125,11 @@ func (l *Live) bootstrap() error {
 		return fmt.Errorf("现货行情为空: %s", l.uly)
 	}
 	dcds := l.fetchDCD()
+	l.mu.Lock()
+	rvWindow := l.p.RVWindowDays
+	l.mu.Unlock()
+	est, rvWarn := fetchVol(l.c, l.uly, rvWindow)
+	greeks, gwarn := fetchGreeks(l.c, l.parent, l.um)
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -118,7 +137,11 @@ func (l *Live) bootstrap() error {
 	l.instByID = indexInstruments(ins)
 	l.tickers = indexTickers(tks)
 	l.spot = spots[0]
+	l.spotAt = time.Now()
 	l.applyDCDLocked(dcds)
+	l.rv30, l.rv30Raw, l.rv7, l.rvEwma, l.rvPct = est.Entry, est.RV30, est.RV7, est.EWMA, est.Pct
+	l.rvWarn = rvWarn
+	l.greeks, l.greeksWarn = greeks, gwarn
 	l.chainWarn = append(iwarns, twarns...)
 	l.snap = l.buildLocked()
 	l.lastBuild = time.Now()
@@ -177,6 +200,16 @@ func (l *Live) buildLocked() *Snapshot {
 		Uly:         l.uly,
 		OptionUly:   l.parent,
 		OptionCount: len(tickers),
+		RV30:        l.rv30,
+		RV30Raw:     l.rv30Raw,
+		RV7:         l.rv7,
+		RVEWMA:      l.rvEwma,
+		RVPct:       l.rvPct,
+		RVWarn:      l.rvWarn,
+		Greeks:      len(l.greeks) > 0,
+		GreeksW:     l.greeksWarn,
+		SpotAt:      l.spotAt,
+		DcdAt:       l.dcdAt,
 		WSConnected: l.wsConnected,
 		WSStatus:    l.wsStatus,
 	}
@@ -188,17 +221,35 @@ func (l *Live) buildLocked() *Snapshot {
 	}
 	spotMap := map[string]float64{l.base: snap.SpotPrice}
 	snap.OptionRows = strategy.RankOptions(l.instruments, tickers, spotMap, now)
+	// 市场 IV 代理 + 历史分位（采样按小时限速，分位有缓存，500ms 重组不重复排序）。
+	l.ivNow = medianPutIV(tickers, now, l.p.TenorMinDays, l.p.TenorMaxDays)
+	l.ivPct = -1
+	if l.ivh != nil && l.ivNow > 0 {
+		l.ivPct = l.ivh.Observe(now, l.uly, l.ivNow)
+	}
+	snap.IVNow, snap.IVPct = l.ivNow, l.ivPct
 
 	snap.DcdCount = len(l.dcds)
 	if len(l.dcds) > 0 {
 		snap.DCYAvailable = true
 		snap.Products = l.products
-		snap.Decisions = strategy.Build(l.dcds, l.instruments, tickers, spotMap, now, l.p)
+		if l.p.StrategyMode == "legacy" {
+			snap.Decisions = strategy.Build(l.dcds, l.instruments, tickers, spotMap, now, l.p)
+		} else {
+			snap.Decisions = strategy.BuildDCYEx(l.dcds, l.instruments, tickers, spotMap,
+				l.rv30, now, l.p, l.greeks, l.ivPct)
+		}
 	}
 	var warns []string
 	warns = append(warns, l.chainWarn...)
 	if l.dcyWarn != "" {
 		warns = append(warns, l.dcyWarn)
+	}
+	if l.rvWarn != "" {
+		warns = append(warns, l.rvWarn)
+	}
+	if l.greeksWarn != "" {
+		warns = append(warns, l.greeksWarn)
 	}
 	// WS 断线时把原因带给用户：此前只显示「WS 重连中」，无法判断是代理没
 	// 生效、证书问题还是服务端拒绝，排查全靠猜。
@@ -216,6 +267,12 @@ func (l *Live) refreshLoop(ctx context.Context) {
 	defer slow.Stop()
 	inst := time.NewTicker(5 * time.Minute)
 	defer inst.Stop()
+	// RV 不需要秒级：5 分钟足够；失败也保留上次值，只在 Warn 里提示。
+	rvTick := time.NewTicker(5 * time.Minute)
+	defer rvTick.Stop()
+	// Greeks 同理：Delta 随现价缓慢变化，5 分钟一次足够。
+	greekTick := time.NewTicker(5 * time.Minute)
+	defer greekTick.Stop()
 	// DCY 单独计时：成功 30s 一轮，失败后 5s/10s/20s 快速重试，
 	// 避免首轮失败后整块决策表空等半分钟。
 	dcd := time.NewTimer(l.nextDCDDelay())
@@ -228,6 +285,10 @@ func (l *Live) refreshLoop(ctx context.Context) {
 			l.refreshREST()
 		case <-inst.C:
 			l.refreshInstruments(ctx)
+		case <-rvTick.C:
+			l.refreshRV()
+		case <-greekTick.C:
+			l.refreshGreeks()
 		case <-dcd.C:
 			l.refreshDCD()
 			dcd.Reset(l.nextDCDDelay())
@@ -283,18 +344,26 @@ func (l *Live) refreshREST() {
 			}
 		}
 		old := l.tickers[t.InstID]
+		// 旧快照不能覆盖更新的 WS tick（REST 兜底是 0.5-1s 前的数据）。
+		if old.TS != "" && !tsNotOlder(t.TS, old.TS) {
+			continue
+		}
 		old.InstID = t.InstID
 		old.Last = t.Last
 		old.BidPx = t.BidPx
 		old.AskPx = t.AskPx
 		old.BidSz = t.BidSz
 		old.AskSz = t.AskSz
+		old.BidIV = t.BidIV
+		old.AskIV = t.AskIV
+		old.MarkIV = t.MarkIV
 		old.MarkPx = t.MarkPx
 		old.TS = t.TS
 		l.tickers[t.InstID] = old
 	}
-	if len(spots) > 0 && spots[0].Last != "" {
+	if len(spots) > 0 && spots[0].Last != "" && (l.spot.TS == "" || tsNotOlder(spots[0].TS, l.spot.TS)) {
 		l.spot = spots[0]
+		l.spotAt = time.Now()
 	}
 	l.chainWarn = warns
 	l.dirty = true
@@ -307,6 +376,36 @@ func (l *Live) refreshDCD() {
 	l.applyDCDLocked(res)
 	l.dirty = true
 }
+
+// refreshRV 更新 30d 已实现波动率；失败时保留上一次有效值，只更新告警。
+func (l *Live) refreshRV() {
+	l.mu.Lock()
+	window := l.p.RVWindowDays
+	l.mu.Unlock()
+	est, warn := fetchVol(l.c, l.uly, window)
+	l.mu.Lock()
+	if est.Entry > 0 {
+		l.rv30, l.rv30Raw, l.rv7, l.rvEwma, l.rvPct = est.Entry, est.RV30, est.RV7, est.EWMA, est.Pct
+	}
+	l.rvWarn = warn
+	l.dirty = true
+	l.mu.Unlock()
+}
+
+// refreshGreeks 刷新 opt-summary Delta（5 分钟一次，失败保留上次）。
+func (l *Live) refreshGreeks() {
+	greeks, warn := fetchGreeks(l.c, l.parent, l.um)
+	l.mu.Lock()
+	if len(greeks) > 0 {
+		l.greeks = greeks
+	}
+	l.greeksWarn = warn
+	l.dirty = true
+	l.mu.Unlock()
+}
+
+// SetIVHistory 注入 IV 采样器（Fetcher 构造后调用，早于 Start）。
+func (l *Live) SetIVHistory(h *IVHistory) { l.ivh = h }
 
 // dcdResult 单个方向（C/P）的拉取结果；err 非空表示该方向本轮失败。
 type dcdResult struct {
@@ -346,6 +445,7 @@ func (l *Live) applyDCDLocked(res map[string]dcdResult) {
 	}
 	switch {
 	case len(failDirs) == 0:
+		l.dcdAt = time.Now() // 只有两个方向都成功才算「报价新鲜」
 		l.dcyWarn = ""
 	case len(l.dcds) > 0:
 		l.dcyWarn = "DCY 部分刷新失败，沿用上次数据 → [" + strings.Join(failDirs, "; ") + "]"
@@ -381,6 +481,9 @@ func (l *Live) onTicker(t okx.OptionTicker) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if t.InstID == l.uly || strings.EqualFold(t.InstType, "SPOT") {
+		if l.spot.TS != "" && !tsNotOlder(t.TS, l.spot.TS) {
+			return
+		}
 		l.spot.InstID = t.InstID
 		if t.Last != "" {
 			l.spot.Last = t.Last
@@ -388,6 +491,7 @@ func (l *Live) onTicker(t okx.OptionTicker) {
 		l.spot.BidPx = t.BidPx
 		l.spot.AskPx = t.AskPx
 		l.spot.TS = t.TS
+		l.spotAt = time.Now()
 		l.dirty = true
 		return
 	}
@@ -397,12 +501,20 @@ func (l *Live) onTicker(t okx.OptionTicker) {
 		}
 	}
 	old := l.tickers[t.InstID]
+	// 迟到的旧 tick（重连前 / REST 兜底）不能覆盖更新数据。
+	if old.TS != "" && !tsNotOlder(t.TS, old.TS) {
+		return
+	}
 	old.InstID = t.InstID
 	old.Last = t.Last
 	old.BidPx = t.BidPx
 	old.AskPx = t.AskPx
 	old.BidSz = t.BidSz
 	old.AskSz = t.AskSz
+	old.BidIV = t.BidIV
+	old.AskIV = t.AskIV
+	old.MarkIV = t.MarkIV
+	old.MarkPx = t.MarkPx
 	old.TS = t.TS
 	l.tickers[t.InstID] = old
 	if l.wsConnected && l.wsStatus == "degraded" {
@@ -563,4 +675,18 @@ func instSignature(ins []okx.Instrument) string {
 	}
 	sort.Strings(ids)
 	return strings.Join(ids, ",")
+}
+
+// tsNotOlder 判断 newTS 是否不早于 oldTS（毫秒时间戳字符串）。
+// 空值/解析失败视为「不早于」——不能因为缺时间戳就丢弃数据。
+func tsNotOlder(newTS, oldTS string) bool {
+	if newTS == "" {
+		return true
+	}
+	n, err1 := strconv.ParseInt(newTS, 10, 64)
+	o, err2 := strconv.ParseInt(oldTS, 10, 64)
+	if err1 != nil || err2 != nil {
+		return true
+	}
+	return n >= o
 }

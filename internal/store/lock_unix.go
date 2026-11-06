@@ -1,0 +1,16 @@
+//go:build unix
+
+package store
+
+import (
+	"os"
+	"syscall"
+)
+
+func flockExclusive(f *os.File) error {
+	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+}
+
+func funlock(f *os.File) error {
+	return syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+}

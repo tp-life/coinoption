@@ -9,6 +9,20 @@ import (
 	"github.com/tp/coinoption/internal/okx"
 )
 
+// 期权链行必须带合约乘数，Web/TUI 手动下单才能标注「每张多少钱」。
+func TestRankOptionsCarriesCtVal(t *testing.T) {
+	ins := []okx.Instrument{goldenInstrument("BTC-USD-260327-54500-P", "P")}
+	ins[0].CtMult = "0.01" // 1 张 = 0.01 BTC
+	ticks := []okx.OptionTicker{{InstID: ins[0].InstID, BidPx: "0.02"}}
+	rows := RankOptions(ins, ticks, map[string]float64{"BTC": 54400}, goldenNow)
+	if len(rows) != 1 {
+		t.Fatalf("rows=%d", len(rows))
+	}
+	if math.Abs(rows[0].CtVal-0.01) > 1e-12 || rows[0].CtValCcy != "BTC" {
+		t.Fatalf("CtVal 未传递: %+v", rows[0])
+	}
+}
+
 // 回归（2026-11 用户反馈）：期权榜保留卖方有效档，实值档过滤掉
 // （卖 PUT 行权价 > 现价 / 卖 CALL 行权价 < 现价，超 ±0.5% 容差）；
 // 保留的档位按行权价升序，与 OKX 期权链一致。

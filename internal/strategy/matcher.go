@@ -58,6 +58,16 @@ func buildOptQuotes(instruments []okx.Instrument, tickers []okx.OptionTicker, re
 			MarkPx:  t.MarkPx,
 			LastPx:  t.Last,
 		}
+		if v, err := strconv.ParseFloat(strings.TrimSpace(t.BidSz), 64); err == nil {
+			q.BidSz = v
+		}
+		if v, err := strconv.ParseFloat(strings.TrimSpace(t.BidIV), 64); err == nil {
+			// OKX 个别接口返回百分数（50.5）而非小数（0.505）；>3 视为百分数。
+			if v > 3 {
+				v /= 100
+			}
+			q.BidIV = v
+		}
 		if ins, has := insByID[t.InstID]; has {
 			if v, err := strconv.ParseFloat(ins.CtVal, 64); err == nil {
 				q.CtVal = v
@@ -99,6 +109,13 @@ func buildOptQuotes(instruments []okx.Instrument, tickers []okx.OptionTicker, re
 //  4. 到期日：同日优先（UTC 结算，但 DCY 与期权的结算时刻可能不同），否则 ±1 天窗口内最近
 func Match(dcds []okx.DCDProduct, instruments []okx.Instrument, tickers []okx.OptionTicker,
 	spot map[string]float64, now time.Time) []MatchRow {
+	return MatchWithGreeks(dcds, instruments, tickers, spot, now, nil)
+}
+
+// MatchWithGreeks 同 Match；greeks 为 instId → |delta|（来自 /public/opt-summary）。
+// 有了真实 Greeks 后，DecideDCY 不再用「IV 反解 Delta」的近似值。
+func MatchWithGreeks(dcds []okx.DCDProduct, instruments []okx.Instrument, tickers []okx.OptionTicker,
+	spot map[string]float64, now time.Time, greeks map[string]float64) []MatchRow {
 
 	// 候选包含无买盘档位：优先选「有买盘且最近」的可成交档；若该到期日
 	// 全部没有买盘，仍建立展示层对齐（OptMatched=true，但不产生动作），
@@ -107,23 +124,30 @@ func Match(dcds []okx.DCDProduct, instruments []okx.Instrument, tickers []okx.Op
 	rows := make([]MatchRow, 0, len(dcds))
 
 	for _, d := range dcds {
+		// 脏数据（optType 为空/未知）直接跳过：rune(d.OptType[0]) 会 panic，
+		// 而这条路径在 WS 刷新 goroutine 里，panic 会带崩整个进程。
+		optType, ok := ParseOptType(d.OptType)
+		if !ok {
+			continue
+		}
 		exp := time.UnixMilli(int64(d.ExpTime)).UTC()
 		base := d.BaseCcy
 		spotPrice := spot[base]
 
 		days := exp.Sub(now).Hours() / 24
 		row := MatchRow{
-			ProductID:  d.ProductID,
-			Uly:        d.Uly,
-			OptType:    rune(d.OptType[0]),
-			Strike:     float64(d.Strike),
-			InvestCcy:  d.NotionalCcy,
-			DcyMinSize: float64(d.MinSize),
-			DcyMaxSize: float64(d.MaxSize),
-			ExpTime:    exp,
-			Days:       days,
-			Spot:       spotPrice,
-			DcyAPR:     NormalizeYield(float64(d.AnnualizedYield), float64(d.AbsYield), days),
+			ProductID:   d.ProductID,
+			Uly:         d.Uly,
+			OptType:     optType,
+			Strike:      float64(d.Strike),
+			InvestCcy:   d.NotionalCcy,
+			DcyMinSize:  float64(d.MinSize),
+			DcyMaxSize:  float64(d.MaxSize),
+			ExpTime:     exp,
+			Days:        days,
+			Spot:        spotPrice,
+			DcyAPR:      NormalizeYield(float64(d.AnnualizedYield), float64(d.AbsYield), days),
+			DcyAbsYield: float64(d.AbsYield),
 		}
 		if row.Days < 0 || row.DcyAPR <= 0 {
 			rows = append(rows, row) // 已到期/无报价产品不参与决策
@@ -181,6 +205,10 @@ func Match(dcds []okx.DCDProduct, instruments []okx.Instrument, tickers []okx.Op
 			if foundAny {
 				row.OptMatched = true
 				row.OptInstID = bestAny.q.InstID
+				row.OptDelta = greeks[bestAny.q.InstID]
+				row.OptBidSz = bestAny.q.BidSz
+				row.OptBidIV = bestAny.q.BidIV
+				row.OptExpTime = bestAny.q.Expiry
 				row.OptSettleCcy = bestAny.q.SettleCcy
 				row.StrikeErrPct = strikeGapPct(bestAny.q.Strike, float64(d.Strike), spotPrice)
 				row.OptCtVal = bestAny.q.CtVal
@@ -196,6 +224,12 @@ func Match(dcds []okx.DCDProduct, instruments []okx.Instrument, tickers []okx.Op
 			row.OptMatched = true
 			row.OptExact = true
 			row.OptInstID = best.q.InstID
+			row.OptDelta = greeks[best.q.InstID]
+			row.OptBidPx = best.q.BidPx
+			row.OptAskPx = best.q.AskPx
+			row.OptBidSz = best.q.BidSz
+			row.OptBidIV = best.q.BidIV
+			row.OptExpTime = best.q.Expiry
 			row.OptSettleCcy = best.q.SettleCcy
 			row.StrikeErrPct = strikeGapPct(best.q.Strike, float64(d.Strike), spotPrice)
 			row.OptCtVal = best.q.CtVal
@@ -205,8 +239,13 @@ func Match(dcds []okx.DCDProduct, instruments []okx.Instrument, tickers []okx.Op
 		row.OptMatched = true
 		row.OptExact = true
 		row.OptInstID = best.q.InstID
+		row.OptDelta = greeks[best.q.InstID]
 		row.OptAPR = aprOpt
 		row.OptBidPx = best.q.BidPx
+		row.OptAskPx = best.q.AskPx
+		row.OptBidSz = best.q.BidSz
+		row.OptBidIV = best.q.BidIV
+		row.OptExpTime = best.q.Expiry
 		row.OptSettleCcy = best.q.SettleCcy
 		row.StrikeErrPct = strikeGapPct(best.q.Strike, float64(d.Strike), spotPrice)
 		row.OptCtVal = best.q.CtVal

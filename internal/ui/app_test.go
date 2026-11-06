@@ -64,6 +64,14 @@ func (f *fakeExec) SubmitOption(instID string, sz, lim float64) (executor.Outcom
 func (f *fakeExec) SubmitOptionChecked(instID string, sz, lim, minAPR float64) (executor.Outcome, error) {
 	return f.SubmitOption(instID, sz, lim)
 }
+func (f *fakeExec) SubmitDCDAdvisory(p okx.DCDProduct, amt float64) (executor.Outcome, error) {
+	return f.SubmitDCD(p, amt)
+}
+
+func (f *fakeExec) SubmitOptionAdvisory(instID string, sz, lim float64) (executor.Outcome, error) {
+	return f.SubmitOption(instID, sz, lim)
+}
+
 func (f *fakeExec) SubmitDCD(p okx.DCDProduct, amt float64) (executor.Outcome, error) {
 	f.dcdCalls++
 	f.lastDCD = p
@@ -122,6 +130,7 @@ func buildTestSnap() *market.Snapshot {
 				InvestCcy: "USDT", DcyAPR: 0.3, OptAPR: 0.6, Diff: 0.3,
 				Days: 10, ExpTime: now.Add(10 * 24 * time.Hour),
 				OptMatched: optMatched, OptInstID: "BTC-USD-261106-80000-C",
+				OptBidPx: "1200", OptAskPx: "1250",
 			},
 		}
 	}
@@ -281,6 +290,40 @@ func TestTUIPositionsView(t *testing.T) {
 	app = m.(App)
 	if app.view != viewTable {
 		t.Fatal("再按 p 应回到决策视图")
+	}
+}
+
+func TestTUIBestLine(t *testing.T) {
+	app, _ := bootApp(t)
+	if !strings.Contains(app.View(), "本轮策略空仓") {
+		t.Fatalf("没有 dcy_ok 时应显示空仓:\n%s", app.View())
+	}
+	app.snap.Decisions[1].ReasonCode = strategy.ReasonDCYOK
+	app.snap.Decisions[1].Score = 0.02
+	app.snap.Decisions[1].Delta = 0.20
+	v := app.View()
+	if !strings.Contains(v, "本轮最优目标价 80000 USDT") || !strings.Contains(v, "score 0.0200") {
+		t.Fatalf("最优目标价行缺失:\n%s", v)
+	}
+}
+
+func TestTUIGuideViewTargetPrice(t *testing.T) {
+	app, _ := bootApp(t)
+	m, _ := app.Update(key('?'))
+	app = m.(App)
+	if app.view != viewGuide {
+		t.Fatal("? 应切到策略说明视图")
+	}
+	v := app.View()
+	for _, want := range []string{"策略说明", "目标价怎么选", "OKX", "Delta", "score"} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("策略说明缺少 %q:\n%s", want, v)
+		}
+	}
+	m, _ = app.Update(esc())
+	app = m.(App)
+	if app.view != viewTable {
+		t.Fatal("Esc 应从策略说明回到决策视图")
 	}
 }
 
@@ -1058,6 +1101,84 @@ func TestTUIUnalignedRowAllowsManualDCD(t *testing.T) {
 	}
 	if !strings.Contains(app.draft.label, "未对齐") {
 		t.Fatalf("手动申购应标注未对齐: %q", app.draft.label)
+	}
+}
+
+func TestTUIManualSkipsStrategyForRejectedRow(t *testing.T) {
+	app, _ := bootApp(t)
+	snap := buildTestSnap()
+	// 策略拒绝（yield_too_low）不阻止手动申购 / 卖出；只要有产品/买盘即可。
+	snap.Decisions[1].Action = strategy.ActionNone
+	snap.Decisions[1].ReasonCode = strategy.ReasonYieldTooLow
+	snap.Decisions[1].Row.OptMatched = true
+	snap.Decisions[1].Row.OptBidPx = "1200"
+	snap.Decisions[1].Row.OptInstID = "BTC-USD-261113-80000-P"
+	m, _ := app.Update(snapMsg{snap: snap})
+	app = m.(App)
+	m, _ = app.Update(down())
+	app = m.(App)
+
+	m, _ = app.Update(key('d'))
+	app = m.(App)
+	if !app.inputMode || app.draft == nil || app.draft.kind != "dcd" {
+		t.Fatalf("策略拒绝后仍应允许手动申购: input=%v draft=%+v", app.inputMode, app.draft)
+	}
+	if !strings.Contains(app.draft.label, "跳过策略") {
+		t.Fatalf("手动申购应标注跳过策略: %q", app.draft.label)
+	}
+	m, _ = app.Update(esc())
+	app = m.(App)
+
+	m, _ = app.Update(key('o'))
+	app = m.(App)
+	if !app.inputMode || app.draft == nil || app.draft.kind != "option" {
+		t.Fatalf("策略拒绝后仍应允许手动卖出有买盘的期权: input=%v draft=%+v", app.inputMode, app.draft)
+	}
+	if !strings.Contains(app.draft.label, "跳过策略") {
+		t.Fatalf("手动卖出应标注跳过策略: %q", app.draft.label)
+	}
+}
+
+func TestTUIOptionChainManualSell(t *testing.T) {
+	app, _ := bootApp(t)
+	snap := buildTestSnap()
+	snap.OptionRows = []strategy.OptionRow{{
+		InstID: "BTC-USD-261106-80000-C", OptType: 'C', Strike: 80000,
+		Expiry: time.Now().Add(10 * 24 * time.Hour), Days: 10,
+		BidPx: "1200", APRValid: true, OptAPR: 0.5, SettleCcy: "BTC", SpotPx: 79500,
+		CtVal: 0.01, CtValCcy: "BTC",
+	}}
+	m, _ := app.Update(snapMsg{snap: snap})
+	app = m.(App)
+	m, _ = app.Update(key('2'))
+	app = m.(App)
+	m, _ = app.Update(key('o'))
+	app = m.(App)
+	if !app.inputMode || app.draft == nil || app.draft.kind != "option" {
+		t.Fatalf("期权链有买盘的行应允许手动卖出: input=%v draft=%+v", app.inputMode, app.draft)
+	}
+	if app.draft.instID != "BTC-USD-261106-80000-C" {
+		t.Fatalf("手动卖出合约不符: %+v", app.draft)
+	}
+	if hint := app.inputHint(); !strings.Contains(hint, "1 张 = 0.01 BTC") {
+		t.Fatalf("手动卖出应标注每张金额: %q", hint)
+	}
+}
+
+// 期权手动下单必须标注「每张多少钱」：名义敞口 + 单张权利金。
+func TestTUIOptionPerContractText(t *testing.T) {
+	app, _ := bootApp(t)
+	d := &orderDraft{kind: "option", ctVal: 0.01, bid: 0.0012, settle: "BTC", base: "BTC"}
+	got := app.optionUnitText(d)
+	if !strings.Contains(got, "1 张 = 0.01 BTC ≈ 795.00 USDT") {
+		t.Fatalf("缺少单张名义: %q", got)
+	}
+	if !strings.Contains(got, "卖 1 张约收 0.95 USDT") {
+		t.Fatalf("缺少单张权利金: %q", got)
+	}
+	d.ctVal = 0
+	if got := app.optionUnitText(d); !strings.Contains(got, "每张金额未知") {
+		t.Fatalf("缺乘数时应明确提示: %q", got)
 	}
 }
 

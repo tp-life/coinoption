@@ -47,6 +47,8 @@ type OptQuote struct {
 	Strike    float64
 	Expiry    time.Time
 	BidPx     string
+	BidSz     float64 // 买盘张数（ticker.bidSz）
+	BidIV     float64 // 买盘隐含波动率（小数；ticker.bidVol）
 	AskPx     string
 	MarkPx    string
 	LastPx    string  // 最新成交价（无盘口时仍可能非空，用于展示）

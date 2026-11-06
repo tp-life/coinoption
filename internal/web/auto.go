@@ -47,10 +47,17 @@ type autoEngine struct {
 	marketFailReason string
 	marketFailAt     time.Time
 
+	// lastLiveSync live 平台仓位对账时间（5 分钟一次）。
+	lastLiveSync time.Time
+
 	params  strategy.Params
 	trader  Trader
 	fetcher *cachedFetcher
 	uly     string
+
+	// submitMu 手动/自动共用的提交锁：两边同时下单会绕过「同产品只做一次」
+	// 和 check-then-submit 的原子性（此前 orderMu 只包住手动 handler）。
+	submitMu *sync.Mutex
 }
 
 type autoOrder struct {
@@ -77,6 +84,7 @@ func newAutoEngine(trader Trader, f *cachedFetcher, uly string, p strategy.Param
 		trader:   trader,
 		fetcher:  f,
 		uly:      uly,
+		submitMu: &sync.Mutex{},
 	}
 	if len(failStores) > 0 {
 		eng.failStore = failStores[0]
@@ -91,7 +99,17 @@ func newAutoEngine(trader Trader, f *cachedFetcher, uly string, p strategy.Param
 		}
 	}
 	// 重启后从「未平仓头寸」播种去重表，避免对同一产品/合约再自动下一单。
-	if pos, err := trader.Positions(); err == nil {
+	//
+	// 这里必须 fail-closed：读取持仓失败时不能当成「没有持仓」继续自动交易，
+	// 否则重启后可能对已有产品再下一单。live 模式也不看纸面单——纸面历史
+	// 不是真实仓位，拿它播种会让自动执行永久跳过这些产品。
+	pos, err := trader.Positions()
+	if err != nil {
+		eng.enabled = false
+		eng.note = "自动执行未启动：读取持仓失败（避免重复下单）→ " + err.Error()
+		return eng
+	}
+	if trader.Mode() != executor.ModeLive {
 		for _, o := range pos.Sim {
 			if o.State != "open" {
 				continue
@@ -102,16 +120,42 @@ func newAutoEngine(trader Trader, f *cachedFetcher, uly string, p strategy.Param
 				eng.done["dcd|"+o.ProductID] = true
 			}
 		}
-		for _, d := range pos.LiveDCD {
-			if d.State == "" || d.State == "open" {
-				eng.done["dcd|"+d.ProductID] = true
-			}
+	}
+	// 平台 DCY：只有明确「已结算/已赎回/已撤销」才不算在持；未知 state 一律
+	// 视为在持（宁可少做一笔，也不重复申购）。
+	for _, d := range pos.LiveDCD {
+		switch d.State {
+		case "settled", "redeemed", "canceled", "cancelled":
+			continue
 		}
-		for _, p := range pos.LiveOptions {
-			eng.done["opt|"+p.InstID] = true
-		}
+		eng.done["dcd|"+d.ProductID] = true
+	}
+	for _, p := range pos.LiveOptions {
+		eng.done["opt|"+p.InstID] = true
 	}
 	return eng
+}
+
+// SubmitMu 手动下单与自动执行共用的提交锁。
+func (e *autoEngine) SubmitMu() *sync.Mutex { return e.submitMu }
+
+// MarkDone 手动下单成功后登记去重，避免自动执行对同一产品再下一单。
+func (e *autoEngine) MarkDone(kind, ref string) {
+	if kind == "" || ref == "" {
+		return
+	}
+	key := kind + "|" + ref
+	e.mu.Lock()
+	e.done[key] = true
+	e.mu.Unlock()
+}
+
+// unmarkDone 仅用于「明确失败（未成交）」时释放预占，允许冷却后重试；
+// 结果未知（可能已成交）必须保持占用。
+func (e *autoEngine) unmarkDone(key string) {
+	e.mu.Lock()
+	delete(e.done, key)
+	e.mu.Unlock()
 }
 
 func (e *autoEngine) Status() (enabled bool, note string, count int) {
@@ -160,7 +204,24 @@ func (e *autoEngine) step() {
 	for k := range e.done {
 		done[k] = true
 	}
+	// 参数快照：candidate 在锁外运行，不能直接读 e.params（设置页保存会并发写，
+	// 是真实的数据竞争，且一次决策可能混用新旧风控参数）。
+	p := e.params
 	e.mu.Unlock()
+
+	// 到期纸面单先落地：否则敞口只增不减，自动执行会被「额度已用尽」永久卡住。
+	if s, ok := e.trader.(interface{ SettleDueQuiet() }); ok {
+		s.SettleDueQuiet()
+	}
+	// live：定期用平台真实仓位整体替换敞口（到期/平仓后额度自动回收）。
+	if e.trader.Mode() == executor.ModeLive && time.Since(e.lastLiveSync) >= 5*time.Minute {
+		e.lastLiveSync = time.Now()
+		if s, ok := e.trader.(interface{ SyncLiveGuard() (string, error) }); ok {
+			if _, err := s.SyncLiveGuard(); err != nil {
+				e.recordFailure("live", "guard", err.Error(), "")
+			}
+		}
+	}
 
 	snap, err := e.fetcher.snapshot(e.uly)
 	if err != nil {
@@ -168,7 +229,7 @@ func (e *autoEngine) step() {
 		e.setNote("自动等待：行情失败 " + err.Error())
 		return
 	}
-	order, note := e.candidate(snap, done)
+	order, note := e.candidate(snap, done, p)
 
 	e.mu.Lock()
 	if !e.enabled || time.Since(e.last) < e.cooldown {
@@ -180,10 +241,21 @@ func (e *autoEngine) step() {
 		e.mu.Unlock()
 		return
 	}
+	if e.done[order.key] { // 另一条路径（手动/上一轮）已占用
+		e.note = "自动跳过：该产品已提交过"
+		e.mu.Unlock()
+		return
+	}
+	// 先占坑再提交：结果未知时保持占用，避免超时后 60s 重复下单。
+	e.done[order.key] = true
 	e.last = time.Now()
 	e.note = "自动提交：" + order.label
+	submitMu := e.submitMu
 	e.mu.Unlock()
 
+	if submitMu != nil {
+		submitMu.Lock()
+	}
 	var out executor.Outcome
 	var err2 error
 	if order.kind == "option" {
@@ -191,13 +263,19 @@ func (e *autoEngine) step() {
 	} else {
 		out, err2 = e.trader.SubmitDCD(order.product, order.amt)
 	}
+	if submitMu != nil {
+		submitMu.Unlock()
+	}
 	if err2 != nil {
+		// 只有「明确未成交」才释放预占、允许冷却后重试；结果未知必须保持占用。
+		if !okx.IsAmbiguous(err2) {
+			e.unmarkDone(order.key)
+		}
 		e.recordFailure(order.kind, order.ref(), err2.Error(), order.label)
 		e.setNote("自动失败：" + err2.Error())
 		return
 	}
 	e.mu.Lock()
-	e.done[order.key] = true
 	e.count++
 	e.note = "✓ " + out.Detail
 	e.mu.Unlock()
@@ -261,15 +339,67 @@ func (e *autoEngine) Failures() []store.AutoFailure {
 	return out
 }
 
+// candidateEdge 本次动作真正依赖的 edge（年化小数）：
+// 卖期权看 Diff，申购 DCY 看反方向（DCY APR − 期权 APR）。
+// 排序与“差值比例”门槛必须用同一个方向，否则 DCY 会挑到最差候选。
+func candidateEdge(d strategy.Decision) float64 {
+	if d.Action == strategy.ActionSubscribeDual {
+		return -d.Row.Diff
+	}
+	return d.Row.Diff
+}
+
+// candidateScore v1 用 Score（单位 Delta 的绝对 EV）；旧决策没有 Score 时
+// 回落到按动作方向的 edge，保证兼容。
+func candidateScore(d strategy.Decision) float64 {
+	if d.Score > 0 {
+		return d.Score
+	}
+	return candidateEdge(d)
+}
+
 // candidate 与 TUI autoCandidate 同一套筛选。done 为去重表快照。
-func (e *autoEngine) candidate(snap *market.Snapshot, done map[string]bool) (*autoOrder, string) {
+func (e *autoEngine) candidate(snap *market.Snapshot, done map[string]bool, p strategy.Params) (*autoOrder, string) {
 	g := e.trader.State()
-	if g.DayRemaining <= 0 || g.OpenCount >= g.Limits.MaxConcurrent {
+	maxConc := g.Limits.MaxConcurrent
+	if p.StrategyMode != "legacy" && p.MaxConcurrent > 0 {
+		maxConc = p.MaxConcurrent
+	}
+	if g.DayRemaining <= 0 || g.OpenCount >= maxConc {
 		return nil, "自动跳过：并发或日笔数已达上限"
 	}
 	remaining := math.Min(g.Limits.PerOrderUSDT, g.RemainingUSDT)
 	if remaining <= 0 {
 		return nil, "自动跳过：单笔/总敞口额度已用尽"
+	}
+	// 当日已实现亏损暂停（STRATEGY.md §4.9 / 设置页说明都有承诺）：
+	// 读不到盈亏时按「暂停」处理——宁可不做，也不能在亏损未知时继续下单。
+	if p.DailyLossPct > 0 && p.CapitalUSDT > 0 {
+		reporter, ok := e.trader.(interface {
+			RealizedPnLToday(time.Time) (float64, error)
+		})
+		if ok { // 生产 *Executor 均实现；测试替身可跳过
+			pnl, err := reporter.RealizedPnLToday(time.Now().UTC())
+			if err != nil {
+				return nil, "自动暂停：读取当日已实现盈亏失败 → " + err.Error()
+			}
+			if limit := -p.DailyLossPct * p.CapitalUSDT; pnl <= limit {
+				return nil, fmt.Sprintf("自动暂停：当日已实现亏损 %.2f USDT 已达上限 %.2f USDT",
+					-pnl, -limit)
+			}
+		}
+	}
+	// 行情新鲜度：At 只是重组时间，DCY/现货可能已很久没更新（WS 断线时
+	// 尤其危险）。DcdAt/SpotAt 为零表示旧数据源或测试未提供，跳过检查。
+	if !snap.DcdAt.IsZero() && p.MaxDcyQuoteAge > 0 {
+		if age := time.Since(snap.DcdAt); age > time.Duration(p.MaxDcyQuoteAge*float64(time.Second)) {
+			return nil, fmt.Sprintf("自动跳过：DCY 报价已过期 %.0fs（上限 %.0fs）", age.Seconds(), p.MaxDcyQuoteAge)
+		}
+	}
+	if !snap.SpotAt.IsZero() {
+		if age := time.Since(snap.SpotAt); age > 60*time.Second {
+			return nil, fmt.Sprintf("自动跳过：现货行情已过期 %.0fs（上限 60s）", age.Seconds())
+		}
 	}
 	spot := snap.SpotPrice
 
@@ -279,20 +409,19 @@ func (e *autoEngine) candidate(snap *market.Snapshot, done map[string]bool) (*au
 			cands = append(cands, d)
 		}
 	}
-	sort.SliceStable(cands, func(i, j int) bool { return cands[i].Row.Diff > cands[j].Row.Diff })
+	// v1 先按 Score（风险调整后 EV）降序；旧决策没有 Score 时按动作方向 edge。
+	// 旧实现统一按 Diff 降序，会把 DCY 里“最不划算”的候选排在前面，第一个
+	// 合格就返回；minDiffPct>0 时表现为“永远挑刚好过线的那个”。
+	sort.SliceStable(cands, func(i, j int) bool { return candidateScore(cands[i]) > candidateScore(cands[j]) })
 
 	skippedMismatch := false
 	skippedDiff := false
-	minDiff := e.params.AutoMinDiff
+	minDiff := p.AutoMinDiff
 	for _, d := range cands {
 		// 差值比例门槛：只对「这次动作真正依赖的那条腿」生效。
 		// 卖期权看 Diff；申购 DCY 看反方向（DCY APR − 期权 APR）。
 		if minDiff > 0 {
-			edge := d.Row.Diff
-			if d.Action == strategy.ActionSubscribeDual {
-				edge = -d.Row.Diff
-			}
-			if edge < minDiff {
+			if candidateEdge(d) < minDiff {
 				skippedDiff = true
 				continue
 			}
@@ -319,7 +448,7 @@ func (e *autoEngine) candidate(snap *market.Snapshot, done map[string]bool) (*au
 			return &autoOrder{
 				key: key, kind: "option", instID: d.Row.OptInstID,
 				sz: sz, ctVal: d.Row.OptCtVal,
-				minAPR: d.Row.DcyAPR + e.params.MinOptionEdge,
+				minAPR: d.Row.DcyAPR + p.MinOptionEdge,
 				label: fmt.Sprintf("卖出 %s %s %.0f 张（期权 APR %.1f%% vs DCY %.1f%%，差 %.1fpp）",
 					strategy.OptTypeName(d.Row.OptType), d.Row.OptInstID, sz,
 					d.Row.OptAPR*100, d.Row.DcyAPR*100, d.Row.Diff*100),
@@ -336,6 +465,23 @@ func (e *autoEngine) candidate(snap *market.Snapshot, done map[string]bool) (*au
 			amt := d.SuggestedAmt
 			if amt <= 0 {
 				amt = remaining
+			}
+			// v1 本金/Delta/总敞口上限（SuggestedAmt 已含单笔与 Delta 上限，
+			// 这里再按运行时的资金/在持敞口复核，避免手动改设置后超额）。
+			// legacy 模式保留旧行为，方便回滚。
+			if p.StrategyMode != "legacy" {
+				if cap := p.DcyMaxPrincipalUSDT; cap > 0 {
+					amt = math.Min(amt, cap)
+				}
+				if p.CapitalUSDT > 0 && p.DcyMaxPrincipalPct > 0 {
+					amt = math.Min(amt, p.CapitalUSDT*p.DcyMaxPrincipalPct)
+				}
+				if d.Delta > 0 && p.CapitalUSDT > 0 && p.DcyDeltaExposurePct > 0 {
+					amt = math.Min(amt, p.CapitalUSDT*p.DcyDeltaExposurePct/math.Max(d.Delta, 0.05))
+				}
+				if p.CapitalUSDT > 0 && p.DcyTotalPrincipalPct > 0 {
+					amt = math.Min(amt, p.CapitalUSDT*p.DcyTotalPrincipalPct-g.ExposureUSDT)
+				}
 			}
 			if prod.NotionalCcy == "USDT" {
 				amt = math.Min(amt, remaining)

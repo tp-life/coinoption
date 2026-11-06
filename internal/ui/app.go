@@ -58,7 +58,10 @@ type Executor interface {
 	Mode() executor.Mode
 	SubmitOption(instID string, sz, limPx float64) (executor.Outcome, error)
 	SubmitOptionChecked(instID string, sz, limPx, minAPR float64) (executor.Outcome, error)
+	// 手动下单：风控上限只提示，不拦截。
+	SubmitOptionAdvisory(instID string, sz, limPx float64) (executor.Outcome, error)
 	SubmitDCD(p okx.DCDProduct, amt float64) (executor.Outcome, error)
+	SubmitDCDAdvisory(p okx.DCDProduct, amt float64) (executor.Outcome, error)
 	Positions() (executor.PositionsView, error)
 	Audit(n int) ([]store.AuditEvent, error)
 	LoadSettings() (store.Settings, error)
@@ -82,6 +85,7 @@ const (
 	viewPositions
 	viewAudit
 	viewSettings
+	viewGuide
 )
 
 type rowKind int
@@ -129,6 +133,9 @@ type orderDraft struct {
 	instID  string
 	sz      float64
 	ctVal   float64 // 期权每张标的数量（ctVal×ctMult；0 = 未知，按 1 张 1 币兜底）
+	bid     float64 // 期权买一价（权利金，原币种）
+	settle  string  // 期权结算本位（BTC | USDT）
+	base    string  // 标的币种（BTC）
 	minAPR  float64 // 自动单：成交前要求的最低卖方 APR（0 = 不复核）
 	product okx.DCDProduct
 	amt     float64
@@ -200,6 +207,9 @@ type App struct {
 	autoFails     []store.AutoFailure
 	marketFailKey string
 	marketFailAt  time.Time
+
+	settleAt   time.Time // 上次结算到期纸面单的时间（30s 节流）
+	liveSyncAt time.Time // 上次 live 平台仓位对账时间（5min 节流）
 }
 
 // New 创建 TUI 应用（executor 可为 nil → 只读推荐模式）。
@@ -226,6 +236,7 @@ func New(f Fetcher, exec Executor, uly string) App {
 	p.MinAbsEdge = st.MinAbsEdgePct / 100
 	p.MaxStrikeGapPct = st.MaxStrikeGapPct
 	p.AutoMinDiff = st.MinDiffPct / 100
+	st.ApplyTo(&p)
 	if exec != nil {
 		// 建议金额跟随 executor 单笔上限，避免默认值天生超限。
 		if lim := exec.State().Limits.PerOrderUSDT; lim > 0 {
@@ -295,10 +306,25 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case viewAudit:
 			cmds = append(cmds, fetchAuditCmd(a, 200))
 		}
+		// 每 30s 异步结算一次到期纸面单（释放敞口），不阻塞 UI。
+		if a.exec != nil && time.Since(a.settleAt) >= 30*time.Second {
+			a.settleAt = time.Now()
+			cmds = append(cmds, settleDueCmd(a.exec))
+		}
+		// live：5 分钟一次平台仓位对账，避免到期仓位永久占用敞口。
+		if a.exec != nil && a.exec.Mode() == executor.ModeLive && time.Since(a.liveSyncAt) >= 5*time.Minute {
+			a.liveSyncAt = time.Now()
+			cmds = append(cmds, syncLiveGuardCmd(a.exec))
+		}
 		return a, tea.Batch(cmds...)
 
 	case snapMsg:
 		a.loading = false
+		// 切标的时有旧请求在途：迟到的旧标的快照不能覆盖当前表，否则
+		// 自动执行会基于 BTC 快照在「已切到 ETH」后继续下 BTC 单。
+		if msg.err == nil && msg.snap != nil && msg.snap.Uly != "" && a.uly != "" && msg.snap.Uly != a.uly {
+			return a, nil
+		}
 		var failCmd tea.Cmd
 		if msg.err != nil {
 			// 保留上次成功快照：短暂网络抖动不清空决策表。
@@ -321,8 +347,9 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if a.autoOn && a.exec != nil && msg.err == nil {
 			if d, note := a.autoCandidate(); d != nil {
-				// 先不写 autoDone：提交失败时不能占坑，否则这一轮机会直接丢掉。
-				// 冷却时间从提交时刻开始算，失败后 ≥60s 才会重试。
+				// 先占坑再提交：结果未知（超时/断连）时订单可能已成交，必须
+				// 保持去重；只有明确失败才在回执里释放。
+				a.autoDone[d.key()] = true
 				a.autoSince = time.Now()
 				a.autoNote = "自动提交：" + d.label
 				a.flash = "⚙ " + a.autoNote
@@ -336,8 +363,16 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case orderResultMsg:
 		if msg.err != nil {
-			a.flash = "✗ " + msg.err.Error()
+			mode := "read-only"
+			if a.exec != nil {
+				mode = string(a.exec.Mode())
+			}
+			a.flash = "✗ [" + mode + "] " + msg.err.Error()
 			a.flashIsErr = true
+			// 明确失败（未成交）才释放预占，允许冷却后重试；结果未知保持占坑。
+			if msg.key != "" && !okx.IsAmbiguous(msg.err) {
+				delete(a.autoDone, msg.key)
+			}
 			// 自动策略提交失败：记录原因（手动单失败只 flash，不进失败记录）。
 			if msg.auto && a.exec != nil {
 				if f, ok := a.noteAutoFailure(msg.kind, autoRefOfKey(msg.key), msg.err.Error(), msg.label); ok {
@@ -346,13 +381,16 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		} else {
 			a.flash = "✓ " + msg.out.Detail
+			if len(msg.out.Warnings) > 0 {
+				a.flash += "｜提示：" + strings.Join(msg.out.Warnings, "；")
+			}
 			a.flashIsErr = false
 			if msg.auto {
-				// 只有成功回执才计入自动执行次数并写入去重表；失败允许冷却后重试。
 				a.autoCount++
-				if msg.key != "" {
-					a.autoDone[msg.key] = true
-				}
+			}
+			// 成功回执（无论手动/自动）都登记去重：手动单也要阻止自动重复下单。
+			if msg.key != "" {
+				a.autoDone[msg.key] = true
 			}
 			if a.exec != nil {
 				a.guard = a.exec.State()
@@ -477,7 +515,28 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return a, nil
 		}
-		// 4) Settings 页键位（o/d 等下单键在该页禁用）
+		// 4) 策略说明页键位（目标价选择 / 风控 / reason code）
+		if a.view == viewGuide {
+			switch msg.String() {
+			case "1", "esc", "?":
+				a.view = viewTable
+				a.scroll = 0
+				return a.rebuildTable(), nil
+			case "q", "ctrl+c":
+				return a, tea.Quit
+			case "r":
+				a.loading = true
+				return a, fetchCmd(a)
+			case "up", "k":
+				if a.scroll > 0 {
+					a.scroll--
+				}
+			case "down", "j":
+				a.scroll++
+			}
+			return a, nil
+		}
+		// 5) Settings 页键位（o/d 等下单键在该页禁用）
 		if a.view == viewSettings {
 			switch msg.String() {
 			case "a":
@@ -486,6 +545,11 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return a.adjustThreshold(5)
 			case "[":
 				return a.adjustThreshold(-5)
+			case "?":
+				a.view = viewGuide
+				a.scroll = 0
+				a.flash = ""
+				return a, nil
 			case "1", "esc":
 				a.view = viewTable
 				return a.rebuildTable(), nil
@@ -503,7 +567,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return a, nil
 		}
-		// 5) 全局键
+		// 6) 全局键
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return a, tea.Quit
@@ -564,6 +628,12 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			a.scroll = 0
 			a.flash = ""
 			return a, nil
+		case "?":
+			// 策略说明：目标价（DCY 行权价）怎么选、硬门槛、资金上限。
+			a.view = viewGuide
+			a.scroll = 0
+			a.flash = ""
+			return a, nil
 		case "1":
 			a.view = viewTable
 			a.scroll = 0
@@ -599,7 +669,7 @@ func (a App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // View 渲染。
 func (a App) View() string {
 	title := titleStyle.Render("◈ coinoption") + "  " + a.modeChip() +
-		hintStyle.Render("  1 决策 / 2 期权链 / 3 持仓 / 4 日志 / 5 设置 · q 退出")
+		hintStyle.Render("  1 决策 / 2 期权链 / 3 持仓 / 4 日志 / 5 设置 / ? 策略 · q 退出")
 
 	header := a.headerLine()
 	bar := a.filterBar()
@@ -612,6 +682,8 @@ func (a App) View() string {
 		body = a.auditView()
 	case a.view == viewSettings:
 		body = a.settingsView()
+	case a.view == viewGuide:
+		body = a.guideView()
 	case a.snap == nil:
 		body = a.placeholder()
 	default:
@@ -627,9 +699,10 @@ func (a App) View() string {
 	out := title + "\n" + header
 	if (a.view == viewTable || a.view == viewChain) && a.snap != nil {
 		out += "\n" + a.legendLine()
+		out += "\n" + a.bestLine()
 	}
 	if a.view == viewChain {
-		out += "\n" + hintStyle.Render(" 期权链参考视图：完整卖方有效链（实值档已过滤）· ←DCY = 该档有对应双币赢 · 下单请按 1 回决策页")
+		out += "\n" + hintStyle.Render(" 期权链视图：完整卖方有效链（实值档已过滤）· ←DCY = 该档有对应双币赢 · 有买盘可按 o 手动卖出（跳过策略）")
 	}
 	if bar != "" {
 		out += "\n" + bar
@@ -697,7 +770,7 @@ func (a App) detailLine() string {
 			parts = append(parts, "→ "+r.OptInstID)
 		}
 		parts = append(parts, fmt.Sprintf("%s · 到期 %s", tradeDesc(d), strategy.FormatExpTime(r.ExpTime)))
-		parts = append(parts, fmt.Sprintf("行权 %.0f · 偏差 %+.2f%%", r.Strike, r.StrikeErrPct))
+		parts = append(parts, fmt.Sprintf("目标价 %.0f · 偏差 %+.2f%%", r.Strike, r.StrikeErrPct))
 		parts = append(parts, toStrikeCell(r.OptType, r.Strike, a.snap.SpotPrice))
 		if a.snap.SpotPrice > 0 {
 			parts = append(parts, fmt.Sprintf("现价 %.0f · 距现价 %+.0f（%+.2f%%）",
@@ -711,7 +784,32 @@ func (a App) detailLine() string {
 		if d.Action == strategy.ActionSubscribeDual && r.InvestCcy != "" {
 			parts = append(parts, "投入 "+r.InvestCcy)
 		}
-		parts = append(parts, "原因 "+d.ReasonCode)
+		if d.Delta > 0 {
+			parts = append(parts, fmt.Sprintf("Δ %.2f", d.Delta))
+		}
+		if d.IV > 0 {
+			parts = append(parts, fmt.Sprintf("IV %.0f%%", d.IV*100))
+		}
+		if d.RV > 0 {
+			parts = append(parts, fmt.Sprintf("RV %.0f%%", d.RV*100))
+		}
+		if d.Row.IVPct >= 0 {
+			parts = append(parts, fmt.Sprintf("IV分位 %.0f", d.Row.IVPct))
+		}
+		if d.Score != 0 {
+			parts = append(parts, fmt.Sprintf("score %.4f", d.Score))
+		}
+		if d.EdgeVsOption != 0 {
+			parts = append(parts, fmt.Sprintf("vs 期权 %+.2f%%", d.EdgeVsOption*100))
+		}
+		parts = append(parts, "原因 "+reasonCN(d.ReasonCode))
+		if len(d.Warnings) > 0 {
+			ws := make([]string, 0, len(d.Warnings))
+			for _, w := range d.Warnings {
+				ws = append(ws, reasonCN(w))
+			}
+			parts = append(parts, "提示 "+strings.Join(ws, " / "))
+		}
 		if d.SuggestedAmt > 0 {
 			parts = append(parts, fmt.Sprintf("建议 %.0f %s", d.SuggestedAmt, r.InvestCcy))
 		}
@@ -831,25 +929,46 @@ func (a App) headerLine() string {
 	return line
 }
 
+// bestLine 本轮最优目标价：与自动执行同一套 score 口径，直接给出
+// score 最高的 dcy_ok 档；没有合格档就明确显示空仓，而不是让用户猜。
+func (a App) bestLine() string {
+	if a.snap == nil {
+		return ""
+	}
+	best, ok := strategy.BestDCY(a.snap.Decisions)
+	if !ok {
+		return warnStyle.Render(" 本轮策略空仓（无合格目标价）· 手动仍可按 o/d · ? 看策略说明")
+	}
+	r := best.Row
+	line := fmt.Sprintf(
+		"本轮最优目标价 %.0f USDT · %s · %s · %.0f 天 · 收益 %.2f%%（年化 %.1f%%）· score %.4f · Δ %.2f · 建议 %.0f %s",
+		r.Strike, strategy.DcySideName(r.OptType), strategy.FormatExpTime(r.ExpTime), r.Days,
+		r.DcyAbsYield*100, r.DcyAPR*100, best.Score, best.Delta, best.SuggestedAmt, r.InvestCcy,
+	)
+	return primaryStyle.Render(strings.Join(wrapText(" ", line, a.width), "\n"))
+}
+
 func (a App) footerLine() string {
 	if a.exec == nil {
 		if a.view == viewChain {
-			return "期权链参考（只读）：1 返回决策 · u/e/t/b 筛选 · f 排序 · r 刷新 · q 退出"
+			return "期权链参考（只读）：1 返回决策 · u/e/t/b 筛选 · f 排序 · ? 策略 · r 刷新 · q 退出"
 		}
-		return "只读模式（未接入执行器）：2 期权链 · f 排序 · r 刷新 · q 退出"
+		return "只读模式（未接入执行器）：2 期权链 · f 排序 · ? 策略 · r 刷新 · q 退出"
 	}
 	switch a.view {
 	case viewChain:
-		return "2/1 返回决策 · 期权链为参考视图（不直接下单）· u/e/t/b 筛选 · f 排序 · r 刷新"
+		return "2/1 返回决策 · 期权链参考视图 · 有买盘可 o 手动卖出（跳过策略）· u/e/t/b 筛选 · f 排序 · r 刷新"
 	case viewPositions:
 		return "3/1 返回决策 · j/k 滚动 · 4 日志 · --settle 命令结算到期纸面单"
 	case viewAudit:
 		return "4/1 返回决策 · j/k 滚动 · 最新 200 条（submit/reject/settle/restore）"
 	case viewSettings:
-		return "a 自动执行开关 · [ / ] 阈值 ±5pp · j/k 滚动（失败记录在底部）· 1/Esc 返回"
+		return "a 自动执行开关 · [ / ] 阈值 ±5pp · j/k 滚动（失败记录在底部）· ? 策略说明 · 1/Esc 返回"
+	case viewGuide:
+		return "? / 1 / Esc 返回 · j/k 滚动 · 目标价 = DCY 行权价，按 score 选档，不追最高 APR"
 	default:
 		keys := "o 卖期权 / d 申购双币赢 · 2 期权链 · p 持仓 · l 日志 · u 币种 / e 到期 / t 方向"
-		keys += " · f 排序"
+		keys += " · f 排序 · ? 策略说明"
 		if !a.expFilter.IsZero() || a.sideFilter != 0 {
 			keys += " · Esc 清除筛选"
 		}
@@ -867,10 +986,15 @@ func (a App) settingsView() string {
 	if a.autoOn {
 		autoTxt = okStyle.Render("开启")
 	}
+	reqAPR, planDeploy := strategy.RequiredPrincipalAPR(a.params)
+	apiTxt := "未在 settings.json 配置（可用 --key / 环境变量，或 Web 设置页填写）"
+	if a.settings.APIKey != "" {
+		apiTxt = "已配置（settings.json；Web 设置页可改，启动参数/环境变量优先）"
+	}
 	lines := []string{
 		fmt.Sprintf("模式 %s  ·  标的 %s  ·  参数文件 settings.json", a.exec.Mode(), a.uly),
 		"",
-		"策略参数（[ / ] 调整阈值 ±5pp，下一次刷新生效）",
+		"策略参数（legacy：v1 DCY-only 不使用这些阈值；[ / ] 仅调旧阈值）",
 		fmt.Sprintf("  期权边际阈值  : %.0f pp   （期权 APR 高出 DCY 不足此值 → 申购双币赢）", a.settings.MinOptionEdgePP),
 		fmt.Sprintf("  单笔绝对边际  : %.2f%%     （一笔实际收益差低于此值 → 申购双币赢）", a.settings.MinAbsEdgePct),
 		"  期权手续费    : 0.03%     （普通档挂单/吃单，已从期权 APR 扣除）",
@@ -880,6 +1004,12 @@ func (a App) settingsView() string {
 		fmt.Sprintf("  资金总额      : %.0f USDT（总敞口上限，单笔 %.0f；Web 设置页可改）",
 			a.settings.CapitalUSDT, g.Limits.PerOrderUSDT),
 		fmt.Sprintf("  自动交易差%%   : %.2f%%（|期权APR−DCY APR| 低于此值自动跳过；0 = 不设门槛）", a.settings.MinDiffPct),
+		fmt.Sprintf("  策略 v1       : %s · |Δ|≤%.2f · IV−RV≥%.0f%% · 单笔≤%.0f USDT · 总本金≤%.0f%%",
+			a.params.StrategyMode, a.params.MaxAbsDelta, a.params.MinIvRvSpread*100,
+			a.params.DcyMaxPrincipalUSDT, a.params.DcyTotalPrincipalPct*100),
+		fmt.Sprintf("  收益门槛      : 本金年化 ≥ %.0f%%（现金 %.0f%% + 超额 %.0f%% ÷ 部署 %.0f%%），且绝对 ≥ %.1f%%", reqAPR*100, a.params.CashAPR*100, a.params.MinCapitalExcessAPR*100, planDeploy*100, a.params.MinAbsYield*100),
+		"  目标价        : DCY 行权价（OKX 挂出），按 score 选档，不追最高 APR · ? 完整策略说明",
+		"  API 凭证      : " + apiTxt,
 		"",
 		"风控硬上限（executor 强制，只读；启动时用 --limits 覆盖）",
 		fmt.Sprintf("  单笔 %.0f / 总敞口 %.0f USDT · 并行 %d 笔 · 日限 %d 笔",
@@ -888,7 +1018,7 @@ func (a App) settingsView() string {
 		"",
 		"自动执行：按 a 切换 —— 当前 " + autoTxt,
 		fmt.Sprintf("  本次会话已自动提交 %d 单（同一产品/合约只做一次，间隔 ≥60s，每轮最多 1 单）", a.autoCount),
-		hintStyle.Render("  期权张数按 单笔上限÷现价 取整；BTC 默认 2000 USDT 不足 1 张 → 自动流向 DCY 申购"),
+		hintStyle.Render("  期权张数按 单笔上限÷现价 取整；BTC 1 张 = 0.01 BTC，默认 2000 USDT 可卖 2 张"),
 	}
 	if a.exec.Mode() == executor.ModeLive {
 		lines = append(lines, warnStyle.Render("  ⚠ live 模式：开启需 y 二次确认；进程重启后强制回到关闭"))
@@ -916,6 +1046,41 @@ func (a App) settingsView() string {
 	return a.window(lines)
 }
 
+// guideView 策略说明页：目标价（DCY 行权价）怎么选、硬门槛与资金上限。
+// 文本来自 strategy.BuildGuide，和 Web 共用同一份说明。
+func (a App) guideView() string {
+	g := strategy.BuildGuide(a.params)
+	width := a.width
+	if width <= 0 {
+		width = 110
+	}
+	lines := []string{
+		primaryStyle.Render(" " + g.Title),
+		"",
+	}
+	lines = append(lines, wrapText("  ", g.Intro, width)...)
+	lines = append(lines, "")
+	for _, s := range g.Sections {
+		title := " " + s.Title
+		if s.Key == "target" {
+			title = " " + s.Title + "   ← 重点"
+		}
+		lines = append(lines, okStyle.Render(title))
+		for i, l := range s.Lines {
+			prefix := "  • "
+			if s.Key == "target" {
+				prefix = fmt.Sprintf("  %d. ", i+1)
+			}
+			lines = append(lines, wrapText(prefix, l, width)...)
+		}
+		if s.Note != "" {
+			lines = append(lines, wrapText("  ▸ ", s.Note, width)...)
+		}
+		lines = append(lines, "")
+	}
+	return a.window(lines)
+}
+
 // autoFailKindName 失败类别 → 中文标签（与 Web 页面一致）。
 func autoFailKindName(kind string) string {
 	switch kind {
@@ -939,29 +1104,39 @@ func (a App) autoConfirmPanel() string {
 }
 
 // seedAutoDone 用已有持仓播种去重表：进程重启后不会对同一产品/合约重复自动下单。
-// 平台取数失败只影响去重强度（风控敞口仍由 executor 硬性约束）。
+//
+// 读取持仓失败时必须 fail-closed（关掉自动执行），不能当成「没有持仓」继续
+// 交易；live 模式也不看纸面单（纸面历史不是真实仓位，用它播种会让自动执行
+// 永久跳过这些产品）。
 func (a *App) seedAutoDone() {
 	if a.exec == nil {
 		return
 	}
 	pos, err := a.exec.Positions()
 	if err != nil {
+		a.autoOn = false
+		a.autoNote = "自动执行未启动：读取持仓失败（避免重复下单）→ " + err.Error()
 		return
 	}
-	for _, o := range pos.Sim {
-		if o.State != "open" {
-			continue
-		}
-		if o.Kind == "option" {
-			a.autoDone["opt|"+o.ProductID] = true
-		} else {
-			a.autoDone["dcd|"+o.ProductID] = true
+	if a.exec.Mode() != executor.ModeLive {
+		for _, o := range pos.Sim {
+			if o.State != "open" {
+				continue
+			}
+			if o.Kind == "option" {
+				a.autoDone["opt|"+o.ProductID] = true
+			} else {
+				a.autoDone["dcd|"+o.ProductID] = true
+			}
 		}
 	}
 	for _, d := range pos.LiveDCD {
-		if d.State == "" || d.State == "open" {
-			a.autoDone["dcd|"+d.ProductID] = true
+		// 只有明确结束的状态才排除；未知 state 视为在持（宁可少做一笔）。
+		switch strings.ToLower(strings.TrimSpace(d.State)) {
+		case "settled", "redeemed", "canceled", "cancelled", "failed":
+			continue
 		}
+		a.autoDone["dcd|"+d.ProductID] = true
 	}
 	for _, p := range pos.LiveOptions {
 		a.autoDone["opt|"+p.InstID] = true
@@ -1024,6 +1199,110 @@ func (a App) persistSettings() bool {
 	return true
 }
 
+// candidateEdge 本次动作真正依赖的 edge（年化小数）：
+// 卖期权看 Diff，申购 DCY 看反方向（DCY APR − 期权 APR）。
+// 排序与“差值比例”门槛必须用同一个方向，否则 DCY 会挑到最差候选。
+func candidateEdge(d strategy.Decision) float64 {
+	if d.Action == strategy.ActionSubscribeDual {
+		return -d.Row.Diff
+	}
+	return d.Row.Diff
+}
+
+// candidateScore v1 用 Score（单位 Delta 的绝对 EV）；旧决策没有 Score 时
+// 回落到按动作方向的 edge，保证兼容。
+func candidateScore(d strategy.Decision) float64 {
+	if d.Score > 0 {
+		return d.Score
+	}
+	return candidateEdge(d)
+}
+
+// reasonCN 决策 reason code 的中文说明（TUI 详情行用）。
+func reasonCN(code string) string {
+	switch code {
+	case "dcy_ok":
+		return "DCY 可申购"
+	case "no_benchmark":
+		return "无同价同到期基准"
+	case "expiry_mismatch":
+		return "到期时间不一致"
+	case "expiry_gap_warn":
+		return "到期时间差 >2h（提示）"
+	case "settle_mismatch":
+		return "结算本位不一致"
+	case "delta_too_high":
+		return "Delta 过高（近 ATM）"
+	case "delta_missing":
+		return "Delta 缺失"
+	case "rv_missing":
+		return "RV 数据缺失"
+	case "iv_missing":
+		return "IV 反解失败"
+	case "iv_rv_too_low":
+		return "IV 未高于 RV"
+	case "premium_below_fair":
+		return "低于公允价"
+	case "yield_too_low":
+		return "收益低于门槛"
+	case "bid_size_insufficient":
+		return "买盘深度不足"
+	case "spread_wide_warn":
+		return "价差偏宽（提示）"
+	case "stale_quote":
+		return "报价过期"
+	case "size_below_min":
+		return "低于最小申购"
+	case "size_above_cap":
+		return "超过单笔上限"
+	case "total_exposure_cap":
+		return "超过总敞口"
+	case "delta_exposure_cap":
+		return "超过 Delta 敞口"
+	case "max_concurrent":
+		return "并发已满"
+	case "daily_loss_limit":
+		return "触发日亏损暂停"
+	case "no_capital":
+		return "可用资金不足"
+	case "edge_too_small":
+		return "相对期权优势不足"
+	case "dcy_dominated":
+		return "期权更优（可执行）"
+	case "option_benchmark_better":
+		return "期权市场价更高（机会成本不划算）"
+	case "option_apr_higher":
+		return "期权更优"
+	case "diff_small":
+		return "差距不足"
+	case "option_apr_worse":
+		return "期权更差"
+	case "strike_gap_too_big":
+		return "行权价偏差过大"
+	case "strike_wrong_side":
+		return "行权价方向异常"
+	case "no_option_quote":
+		return "无期权报价"
+	case "no_exact_contract":
+		return "无同价同到期合约"
+	case "edge_abs_small":
+		return "单笔边际过薄"
+	case "out_of_tenor":
+		return "不在期限窗口"
+	case "unsupported_side":
+		return "方向/币种不支持"
+	case "unsupported_underlying":
+		return "标的不支持"
+	case "dcy_yield_zero":
+		return "DCY 收益为 0"
+	case "expired":
+		return "已到期"
+	case "no_spot":
+		return "无现价"
+	}
+	return code
+}
+
 // autoCandidate 选本轮自动执行标的：按策略排序取第一笔「可下单且未自动做过」的候选。
 func (a App) autoCandidate() (*orderDraft, string) {
 	// 自动执行用未过滤快照：否则看图时设置的标的/方向/本位/到期筛选会悄悄
@@ -1039,12 +1318,43 @@ func (a App) autoCandidate() (*orderDraft, string) {
 		return nil, ""
 	}
 	g := a.exec.State()
-	if g.DayRemaining <= 0 || g.OpenCount >= g.Limits.MaxConcurrent {
+	maxConc := g.Limits.MaxConcurrent
+	if a.params.StrategyMode != "legacy" && a.params.MaxConcurrent > 0 {
+		maxConc = a.params.MaxConcurrent
+	}
+	if g.DayRemaining <= 0 || g.OpenCount >= maxConc {
 		return nil, "自动跳过：并发或日笔数已达上限"
 	}
 	remaining := math.Min(g.Limits.PerOrderUSDT, g.RemainingUSDT)
 	if remaining <= 0 {
 		return nil, "自动跳过：单笔/总敞口额度已用尽"
+	}
+	// 当日已实现亏损暂停（与 Web 同一套规则）：读不到盈亏时按暂停处理。
+	if a.params.DailyLossPct > 0 && a.params.CapitalUSDT > 0 {
+		if r, ok := a.exec.(interface {
+			RealizedPnLToday(time.Time) (float64, error)
+		}); ok {
+			pnl, err := r.RealizedPnLToday(time.Now().UTC())
+			if err != nil {
+				return nil, "自动暂停：读取当日已实现盈亏失败 → " + err.Error()
+			}
+			if limit := -a.params.DailyLossPct * a.params.CapitalUSDT; pnl <= limit {
+				return nil, fmt.Sprintf("自动暂停：当日已实现亏损 %.2f USDT 已达上限 %.2f USDT",
+					-pnl, -limit)
+			}
+		}
+	}
+	// 行情新鲜度（与 Web 同一套规则）：DcdAt/SpotAt 为零表示旧数据源或测试
+	// 未提供，跳过检查。
+	if !snap.DcdAt.IsZero() && a.params.MaxDcyQuoteAge > 0 {
+		if age := time.Since(snap.DcdAt); age > time.Duration(a.params.MaxDcyQuoteAge*float64(time.Second)) {
+			return nil, fmt.Sprintf("自动跳过：DCY 报价已过期 %.0fs（上限 %.0fs）", age.Seconds(), a.params.MaxDcyQuoteAge)
+		}
+	}
+	if !snap.SpotAt.IsZero() {
+		if age := time.Since(snap.SpotAt); age > 60*time.Second {
+			return nil, fmt.Sprintf("自动跳过：现货行情已过期 %.0fs（上限 60s）", age.Seconds())
+		}
 	}
 	spot := snap.SpotPrice
 
@@ -1063,22 +1373,18 @@ func (a App) autoCandidate() (*orderDraft, string) {
 		}
 		cands = append(cands, d)
 	}
-	sort.SliceStable(cands, func(i, j int) bool { return cands[i].Row.Diff > cands[j].Row.Diff })
+	// 按“本次动作的 edge”降序：卖期权看 Diff，申购 DCY 看 −Diff。
+	// 旧实现统一按 Diff 降序，DCY 会挑到最不划算的候选（见 web/auto.go 同名修复）。
+	sort.SliceStable(cands, func(i, j int) bool { return candidateScore(cands[i]) > candidateScore(cands[j]) })
 
 	skippedMismatch := false
 	skippedDiff := false
 	minDiff := a.params.AutoMinDiff
 	for _, d := range cands {
 		// 差值比例门槛：卖期权看 Diff，申购 DCY 看反方向（DCY 领先期权多少）。
-		if minDiff > 0 {
-			edge := d.Row.Diff
-			if d.Action == strategy.ActionSubscribeDual {
-				edge = -d.Row.Diff
-			}
-			if edge < minDiff {
-				skippedDiff = true
-				continue
-			}
+		if minDiff > 0 && candidateEdge(d) < minDiff {
+			skippedDiff = true
+			continue
 		}
 		switch d.Action {
 		case strategy.ActionBuyOption:
@@ -1126,6 +1432,21 @@ func (a App) autoCandidate() (*orderDraft, string) {
 			amt := d.SuggestedAmt
 			if amt <= 0 {
 				amt = remaining
+			}
+			// v1 本金/Delta/总敞口上限（与 web auto 同一套规则；legacy 保留旧行为）。
+			if a.params.StrategyMode != "legacy" {
+				if cap := a.params.DcyMaxPrincipalUSDT; cap > 0 {
+					amt = math.Min(amt, cap)
+				}
+				if a.params.CapitalUSDT > 0 && a.params.DcyMaxPrincipalPct > 0 {
+					amt = math.Min(amt, a.params.CapitalUSDT*a.params.DcyMaxPrincipalPct)
+				}
+				if d.Delta > 0 && a.params.CapitalUSDT > 0 && a.params.DcyDeltaExposurePct > 0 {
+					amt = math.Min(amt, a.params.CapitalUSDT*a.params.DcyDeltaExposurePct/math.Max(d.Delta, 0.05))
+				}
+				if a.params.CapitalUSDT > 0 && a.params.DcyTotalPrincipalPct > 0 {
+					amt = math.Min(amt, a.params.CapitalUSDT*a.params.DcyTotalPrincipalPct-g.ExposureUSDT)
+				}
 			}
 			if prod.NotionalCcy == "USDT" {
 				amt = math.Min(amt, remaining)
@@ -1249,6 +1570,40 @@ func trimTo(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
+// wrapText 按终端显示宽度折行（中文按 2 列计）。prefix 只用于首行，
+// 续行用等宽空格对齐，便于说明页/长原因在窄终端里阅读。
+func wrapText(prefix, text string, width int) []string {
+	if width < 40 {
+		width = 40
+	}
+	indent := lipgloss.Width(prefix)
+	limit := width - indent - 2
+	if limit < 20 {
+		limit = 20
+	}
+	var out []string
+	var b strings.Builder
+	w := 0
+	for _, r := range text {
+		rw := lipgloss.Width(string(r))
+		if w+rw > limit && w > 0 {
+			out = append(out, prefix+b.String())
+			prefix = strings.Repeat(" ", indent)
+			b.Reset()
+			w = 0
+		}
+		b.WriteRune(r)
+		w += rw
+	}
+	if b.Len() > 0 {
+		out = append(out, prefix+b.String())
+	}
+	if len(out) == 0 {
+		out = []string{prefix}
+	}
+	return out
+}
+
 // orderPanel 数量输入 / 二次确认面板。
 func (a App) orderPanel() string {
 	if a.inputMode {
@@ -1263,6 +1618,14 @@ func (a App) orderPanel() string {
 	lines := []string{
 		warnStyle.Render("┌ 二次确认"),
 		"  " + d.label,
+	}
+	if d.kind == "option" {
+		lines = append(lines, "  "+hintStyle.Render(a.optionUnitText(d)))
+		if d.sz > 0 {
+			if prem := a.optionPremiumPer(d); prem > 0 {
+				lines = append(lines, fmt.Sprintf("  本单 %.0f 张约收权利金 %.2f USDT（扣费前）", d.sz, prem*d.sz))
+			}
+		}
 	}
 	if a.exec != nil {
 		g := a.exec.State()
@@ -1372,21 +1735,61 @@ func (a App) startOption() (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 	ref, ok := a.currentRef()
-	if !ok || ref.kind != rowDecision {
-		a.flash, a.flashIsErr = "请选中一条 DCY↔期权 决策行（期权榜行请用 --order opt）", true
+	if !ok {
+		a.flash, a.flashIsErr = "请先选中一行决策 / 期权", true
 		return a, nil
 	}
-	d := a.snap.Decisions[ref.idx]
-	if d.Action != strategy.ActionBuyOption || !d.Row.OptMatched {
-		a.flash, a.flashIsErr = "该行建议不是「卖出期权」", true
+	var (
+		instID string
+		ctVal  float64
+		bid    float64
+		settle string
+		base   string
+		label  string
+	)
+	switch ref.kind {
+	case rowDecision:
+		d := a.snap.Decisions[ref.idx]
+		if !d.Row.OptMatched || d.Row.OptInstID == "" || d.Row.OptBidPx == "" {
+			a.flash, a.flashIsErr = "该行没有可卖出的期权买盘（先对齐同价同到期合约）", true
+			return a, nil
+		}
+		tag := ""
+		if d.Action != strategy.ActionBuyOption {
+			tag = "（手动·跳过策略）"
+		}
+		instID, ctVal = d.Row.OptInstID, d.Row.OptCtVal
+		bid, _ = strconv.ParseFloat(strings.TrimSpace(d.Row.OptBidPx), 64)
+		settle, base = d.Row.OptSettleCcy, optionBase(d.Row.Uly)
+		label = fmt.Sprintf("卖出 %s %s（行权 %.0f，%s 到期，期权 APR %.2f%%）%s",
+			strategy.OptTypeName(d.Row.OptType), d.Row.OptInstID, d.Row.Strike,
+			d.Row.ExpTime.Format("2006-01-02"), d.Row.OptAPR*100, tag)
+	case rowOption:
+		or := a.snap.OptionRows[ref.idx]
+		if or.BidPx == "" {
+			a.flash, a.flashIsErr = "该期权档没有买盘，无法卖出", true
+			return a, nil
+		}
+		instID, ctVal = or.InstID, or.CtVal
+		bid, _ = strconv.ParseFloat(strings.TrimSpace(or.BidPx), 64)
+		settle, base = or.SettleCcy, optionBase(or.Uly)
+		if base == "" {
+			base = or.CtValCcy
+		}
+		label = fmt.Sprintf("卖出 %s %s（行权 %.0f，%s 到期）（手动·跳过策略）",
+			strategy.OptTypeName(or.OptType), or.InstID, or.Strike, strategy.InstExpiryDay(or.InstID))
+	default:
+		a.flash, a.flashIsErr = "请先选中一行决策 / 期权", true
 		return a, nil
 	}
 	a.draft = &orderDraft{
 		kind:   "option",
-		instID: d.Row.OptInstID,
-		ctVal:  d.Row.OptCtVal,
-		label: fmt.Sprintf("卖出 %s %s（行权 %.0f，%s 到期，期权 APR %.2f%%）",
-			strategy.OptTypeName(d.Row.OptType), d.Row.OptInstID, d.Row.Strike, d.Row.ExpTime.Format("2006-01-02"), d.Row.OptAPR*100),
+		instID: instID,
+		ctVal:  ctVal,
+		bid:    bid,
+		settle: settle,
+		base:   base,
+		label:  label,
 	}
 	a.inputMode = true
 	a.input.SetValue("1")
@@ -1405,17 +1808,19 @@ func (a App) startDCD() (tea.Model, tea.Cmd) {
 		return a, nil
 	}
 	d := a.snap.Decisions[ref.idx]
-	// 手动申购：subscribe_dual 建议之外的「不可对齐」行也允许（自动执行仍然只挑建议）。
-	if d.Action != strategy.ActionSubscribeDual && d.Action != strategy.ActionUnaligned {
-		a.flash, a.flashIsErr = "该行没有可申购的 DCY 产品", true
-		return a, nil
-	}
+	// 手动申购不依赖策略建议：只要产品还在快照里就允许，自动执行仍只挑
+	// subscribe_dual；执行器风控上限仍然生效。
 	prod, ok := a.snap.Products[d.Row.ProductID]
 	if !ok {
 		a.flash, a.flashIsErr = "产品快照缺失，请刷新（r）", true
 		return a, nil
 	}
-	def := d.SuggestedAmt
+	// 只有策略建议是 DCY 申购时才沿用 suggestedAmt；期权建议的金额不是 DCY
+	// 本金，手动场景从产品最小申购起。
+	def := 0.0
+	if d.Action == strategy.ActionSubscribeDual {
+		def = d.SuggestedAmt
+	}
 	if prod.MinSize > 0 && def < float64(prod.MinSize) {
 		def = float64(prod.MinSize)
 	}
@@ -1423,13 +1828,18 @@ func (a App) startDCD() (tea.Model, tea.Cmd) {
 		def = 0.01
 	}
 	tag := ""
-	if d.Action != strategy.ActionSubscribeDual {
+	switch d.Action {
+	case strategy.ActionSubscribeDual:
+		// 策略建议：不带手动标记
+	case strategy.ActionUnaligned:
 		tag = "（未对齐·手动）"
+	default:
+		tag = "（手动·跳过策略）"
 	}
 	a.draft = &orderDraft{
 		kind:    "dcd",
 		product: prod,
-		label: fmt.Sprintf("申购双币赢·%s %s%s：行权 %.0f，absYield %.6f（APR %.2f%%），投入 %s，到期 %s",
+		label: fmt.Sprintf("申购双币赢·%s %s%s：目标价（行权）%.0f，absYield %.6f（APR %.2f%%），投入 %s，到期 %s",
 			strategy.DcySideName(d.Row.OptType), prod.ProductID, tag, float64(prod.Strike), float64(prod.AbsYield),
 			float64(prod.AnnualizedYield)*100, prod.NotionalCcy, time.UnixMilli(int64(prod.ExpTime)).Format("2006-01-02")),
 	}
@@ -1444,9 +1854,61 @@ func (a App) inputHint() string {
 		return ""
 	}
 	if a.draft.kind == "option" {
-		return hintStyle.Render("单位：张（BTC 单张名义 ≈ 1 BTC）")
+		return hintStyle.Render("单位：张 · " + a.optionUnitText(a.draft))
 	}
 	return hintStyle.Render("单位：" + a.draft.product.NotionalCcy)
+}
+
+// optionUnitText 单张期权的金额说明：1 张 = 多少标的、约多少 USDT、
+// 卖 1 张约收多少权利金（扣费前）。合约乘数缺失时明确提示无法估算。
+func (a App) optionUnitText(d *orderDraft) string {
+	if d == nil || d.kind != "option" {
+		return ""
+	}
+	if d.ctVal <= 0 {
+		return "每张金额未知（缺少合约乘数）"
+	}
+	base := d.base
+	if base == "" {
+		base = "标的"
+	}
+	unit := fmt.Sprintf("%g %s", d.ctVal, base)
+	spot := 0.0
+	if a.snap != nil {
+		spot = a.snap.SpotPrice
+	}
+	if spot <= 0 {
+		return "1 张 = " + unit + "（现价未知）"
+	}
+	text := fmt.Sprintf("1 张 = %s ≈ %.2f USDT", unit, d.ctVal*spot)
+	if prem := a.optionPremiumPer(d); prem > 0 {
+		text += fmt.Sprintf(" · 卖 1 张约收 %.2f USDT", prem)
+	}
+	return text
+}
+
+// optionPremiumPer 单张权利金的 USDT 估值：币本位按现货折算，USDT/USD 本位直接计。
+func (a App) optionPremiumPer(d *orderDraft) float64 {
+	if d == nil || d.bid <= 0 || d.ctVal <= 0 {
+		return 0
+	}
+	switch d.settle {
+	case "USDT", "USD":
+		return d.bid * d.ctVal
+	default:
+		if a.snap == nil || a.snap.SpotPrice <= 0 {
+			return 0
+		}
+		return d.bid * d.ctVal * a.snap.SpotPrice
+	}
+}
+
+// optionBase BTC-USD / BTC-USDT → BTC。
+func optionBase(uly string) string {
+	if i := strings.IndexByte(uly, '-'); i > 0 {
+		return uly[:i]
+	}
+	return uly
 }
 
 // finishInput 校验数量并生成确认草稿。
@@ -2045,6 +2507,26 @@ func (a App) expPanel() string {
 
 // ─── commands ───
 
+// settleDueCmd 异步结算到期纸面单（释放敞口），失败静默（下次 tick 再试）。
+func settleDueCmd(ex Executor) tea.Cmd {
+	return func() tea.Msg {
+		if s, ok := ex.(interface{ SettleDueQuiet() }); ok {
+			s.SettleDueQuiet()
+		}
+		return nil
+	}
+}
+
+// syncLiveGuardCmd 异步对账 live 平台仓位（整体替换敞口），失败静默。
+func syncLiveGuardCmd(ex Executor) tea.Cmd {
+	return func() tea.Msg {
+		if s, ok := ex.(interface{ SyncLiveGuard() (string, error) }); ok {
+			_, _ = s.SyncLiveGuard()
+		}
+		return nil
+	}
+}
+
 func fetchCmd(a App) tea.Cmd {
 	return func() tea.Msg {
 		snap, err := a.fetcher.FetchSnapshot(a.uly)
@@ -2071,15 +2553,25 @@ func fetchPositionsCmd(a App) tea.Cmd {
 
 func submitDraftCmd(a App, d orderDraft) tea.Cmd {
 	return func() tea.Msg {
+		// 自动执行继续走严格路径；手动单改用 advisory：越限只提示，
+		// 但仍然占用额度/写审计，便于事后核对。
 		if d.kind == "option" {
-			if d.minAPR > 0 {
+			if d.auto && d.minAPR > 0 {
 				out, err := a.exec.SubmitOptionChecked(d.instID, d.sz, 0, d.minAPR)
 				return orderResultMsg{kind: d.kind, key: d.key(), auto: d.auto, label: d.label, out: out, err: err}
 			}
-			out, err := a.exec.SubmitOption(d.instID, d.sz, 0)
+			if d.auto {
+				out, err := a.exec.SubmitOption(d.instID, d.sz, 0)
+				return orderResultMsg{kind: d.kind, key: d.key(), auto: d.auto, label: d.label, out: out, err: err}
+			}
+			out, err := a.exec.SubmitOptionAdvisory(d.instID, d.sz, 0)
 			return orderResultMsg{kind: d.kind, key: d.key(), auto: d.auto, label: d.label, out: out, err: err}
 		}
-		out, err := a.exec.SubmitDCD(d.product, d.amt)
+		if d.auto {
+			out, err := a.exec.SubmitDCD(d.product, d.amt)
+			return orderResultMsg{kind: d.kind, key: d.key(), auto: d.auto, label: d.label, out: out, err: err}
+		}
+		out, err := a.exec.SubmitDCDAdvisory(d.product, d.amt)
 		return orderResultMsg{kind: d.kind, key: d.key(), auto: d.auto, label: d.label, out: out, err: err}
 	}
 }
@@ -2345,7 +2837,7 @@ func columnsFor(totalWidth int) []table.Column {
 		{Title: "到期(UTC)", Width: 11},
 		{Title: "方向", Width: 4},
 		{Title: "本位", Width: 5},
-		{Title: "行权价", Width: 7},
+		{Title: "目标价", Width: 7},
 		{Title: "距现价%", Width: 7},
 		{Title: "买价", Width: 7},
 		{Title: "DCY APR", Width: 7},

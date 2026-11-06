@@ -1,6 +1,8 @@
 # coinoption — OKX 双币赢 vs 期权 APR 对比工具
 
-Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.md`(架构)。
+Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.md`(架构)、`STRATEGY.md`（v1 稳定策略）。
+
+> **v1 稳定策略（DCY-only）已落地**：自动执行现在按 `STRATEGY.md` 的规则跑——PUT、10–30 天、`|delta| ≤ 0.30`、`IV−RV ≥ 5pp`、权利金 ≥ 1.05×保守公允价、收益 ≥ max(0.5%, 12%×天数/365)、必须有同价同到期同本位的期权基准；单笔 ≤100 USDT/10%、总本金 ≤30%、Delta 敞口 ≤5%，按 `score = 风险调整后 EV` 排序。旧 20pp / 0.5% 差% 阈值保留在设置页但**不再参与 v1 自动决策**；把 `settings.json` 的 `strategyMode` 设为 `legacy` 可回滚。RV 用 30d 日线、Delta 用 `bidVol + BS` 反算；DCY 与期权到期时间差允许 ≤12h（>2h 只提示）。
 
 ## 当前进度
 
@@ -12,7 +14,8 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 - **M3.3 完成**：Settings 页 + 自动执行（默认关闭）✅ —— 阈值/开关落盘 `settings.json`，自动执行每次刷新最多 1 单、同产品跨重启只做一次、间隔 ≥60s，仍受 executor 风控硬上限约束；live 模式开启需当次 `y` 二次确认，进程重启强制回到关闭
 - **M4 v1 完成**：OKX WebSocket 实时行情 ✅ —— 现货 + 全部期权 `tickers` 订阅（每批 300 条），心跳、指数退避重连、断线自动降级 30s REST；`market.Live` 缓存每 500ms 重组一次，TUI 1s 重绘；Web 新增 `GET /ws` 每秒推送当前筛选快照，浏览器断线自动重连并回退 REST
 - **M4 扩展**：Web 看板双标签（对比决策 / 完整期权链）✅；Web 交易默认开启（`--read-only` 可关）+ 页面自动交易开关 ✅ —— 决策行内「卖出期权 / 申购 DCY」弹窗二次确认，复用 executor 风控/审计/模式路由，live 模式启动打印实盘警告；**Web 看板按「Approva」brutalist dashboard 重做三栏 UI**（侧栏 / 列表卡片 / 策略单据 + 动作栏），见下方「Web 看板视觉与交互」
-- **M5 完成**：Web 设置页 + 整站授权码 ✅ —— 新增**资金总额**（作为总敞口上限，单笔按 40% 派生）、**差值比例**（自动交易最低差%）、**自动交易开关**（落盘 `settings.json`，重启沿用；live 启动仍强制关闭）与策略阈值热更新；**整站授权码**（`--web-code` / `COINOPTION_WEB_CODE`，未指定则首次随机生成并打印，settings.json 只存 SHA-256 摘要），未登录只能看到登录页，下单 / 自动开关 / 改设置全部要求登录，登录失败按 IP 限速 5 次/分钟，改码即注销所有会话
+- **策略说明 / 最优目标价 UI**：Web 侧栏「策略说明」+ 决策页常驻提示条（`目标价怎么选 →`），TUI `?` 页；文本由 `strategy.BuildGuide` 统一生成，明确 **目标价 = OKX 挂出的 DCY 行权价**，策略只筛不造目标价，并按 `score` 选档而不是追最高 APR。Web 顶部另有一条 **「本轮最优目标价（DCY 决策价）」**，直接显示当前筛选下 score 最高的 `dcy_ok` 档（目标价 / 到期 / 风险 Δ / 波动率溢价 / score / 建议金额），没有合格档显示红色「空仓」和主要原因；详情卡用「为什么是它」方框列出可读指标。
+- **M5 完成**：Web 设置页 + 整站授权码 ✅ —— 新增**资金总额**（默认派生总敞口上限，单笔按 40% 派生）、**总敞口/单笔绝对上限**（可独立于资金总额设置，解决「策略小仓、账户已有大额在持」被风控全拒）、**差值比例**（自动交易最低差%）、**自动交易开关**（落盘 `settings.json`，重启沿用；live 启动仍强制关闭）、**API 凭证**（API Key / Secret / Passphrase 可在页面填写，保存后立即替换运行中客户端签名；启动参数/环境变量优先）与策略阈值热更新；**整站授权码**（`--web-code` / `COINOPTION_WEB_CODE`，未指定则首次随机生成并打印，settings.json 只存 SHA-256 摘要），未登录只能看到登录页，下单 / 自动开关 / 改设置全部要求登录，登录失败按 IP 限速 5 次/分钟，改码即注销所有会话
 
 ### TUI 快捷键
 
@@ -22,10 +25,11 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 | `2` | 完整期权链（参考视图，不直接下单；`1` 返回决策页） |
 | `4` / `l` | 审计日志页（submit/reject/settle/restore，最新 200 条） |
 | `5` / `s` | Settings 页（自动执行开关、阈值调整、资金总额 / 自动交易差% / 风控只读展示、最近 10 条自动失败记录；资金与差%在 Web 设置页修改） |
+| `?` | 策略说明页（目标价 = DCY 行权价怎么选、硬门槛、资金上限；`?`/`1`/`Esc` 返回，`j/k` 滚动） |
 | `a` | Settings 页内切换自动执行（live 需 `y` 二次确认） |
 | `[` / `]` | Settings 页内期权边际阈值 ±5pp（下次刷新生效） |
-| `o` | 对选中的「卖CALL / 卖PUT」行卖出该期权（输入张数 → 二次确认） |
-| `d` | 对选中的 DCY 行申购（输入投资币种金额 → 二次确认）；「不可对齐」行也可手动申购（标注 `未对齐·手动`） |
+| `o` | 对选中的决策行 / 期权链行卖出期权（输入张数 → 二次确认）；**跳过策略建议**，只要该合约有买盘即可（标注 `手动·跳过策略`）。输入提示与确认页会标注 `1 张 = 0.01 BTC ≈ 760 USDT` 和卖 1 张约收权利金 |
+| `d` | 对选中的 DCY 行申购（输入投资币种金额 → 二次确认）；**跳过策略建议**，只要产品在快照里即可；「不可对齐」行标注 `未对齐·手动` |
 | `y` / `n` / `Esc` | 确认 / 取消 |
 | `j` / `k` | 持仓页滚动 |
 | `r` / `q` | 刷新 / 退出 |
@@ -36,6 +40,8 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 | `f` | 弹窗选择排序：`默认顺序` / `价格 高→低/低→高` / `期权APR 高→低/低→高` / `差% 高→低/低→高`（决策表与期权链表共用，详见下方「排序」） |
 | `Esc` | 关闭弹窗；无弹窗时清除全部筛选（方向 + 本位 + 到期），恢复全量 |
 
+> **手动下单可以跳过策略**：`o` / `d` 不再要求该行是策略建议（`buy_option` / `subscribe_dual` / `unaligned`）；只要期权有买盘、DCY 产品还在快照里，就能手动卖出 / 申购，界面会标 `手动·跳过策略`。仍受 `executor` 风控上限（单笔、总敞口、并发、日限）和 `--read-only` 约束；自动执行依旧只挑 `dcy_ok`。若 live 恢复的在持已超过总敞口，手动单同样会被拒——到设置页单独调高「总敞口上限」即可，资金总额不必跟着放大。
+>
 > 当前组合：`标的 + 方向 + 本位 + 到期` 四个维度可自由组合，表头上方的「组合」条实时显示（如 `BTC-USDT · PUT · 币本位 · 2026-11-06`），并给出各维度快捷项与行数；`t` 选方向、`b` 选本位、`e` 选到期、`u` 切标的、`f` 改排序，`Esc` 一键清空筛选。四个筛选同时作用于决策行和期权榜。
 >
 > **方向 / 本位 / 排序会记忆**：`t` / `b` 的选择与 `f` 的排序键即时写入 `settings.json`（`sideFilter` / `settleFilter` / `sortBy`，如 `"sortBy": "price:desc"`），退出后下次启动自动恢复（`Esc` 清除筛选也会同步落盘，但不清排序）。到期筛选不记忆。
@@ -44,7 +50,7 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 
 > 到期时间筛选：按 `e` 弹出到期日选择框（`全部` / 各可用到期日 + 行数 / `手动输入日期…`，手动模式支持 RFC3339 或 `2026-11-06`）。选定后按「到期日（UTC）」过滤决策/期权榜；表格内展示日期，详情行展示完整 `YYYY-MM-DD HH:mm`（UTC）。
 
-> 主表列宽随终端宽度自适应（120 列下不裁切）：操作 / 产品·合约 / 到期(UTC) / 方向 / 本位 / 行权价 / **距现价%** / **买价** / DCY APR / 期权APR / 差% / 天 / 建议。**决策页（`1`）每条 DCY 产品一行**，期权 APR / 差 来自对齐到的同档合约；**期权链页（`2`）单独展示完整期权链**（操作 / 期权合约 / 到期 / 方向 / 本位 / 行权价 / 距现价% / 买价 / 期权APR / DCY APR / 差% / 天），有对应 DCY 的合约在合约名后标 `←DCY`，详情行给出对应产品与差值。`本位` 列区分期权腿结算：**币本位**（`BTC-USD`/`ETH-USD` 链，结算币为标的币）与 **U本位**（`BTC-USD_UM` 链，USDT 结算）。`距现价%` =（行权价 − 现价）/ 现价，正=高于现价、负=低于现价；`买价` 是该档权利金买一价（币本位计 BTC、U本位计 USDT）。到期列只显示 UTC 日期（OKX 期权统一 08:00 结算）；选中行下方详情行展示完整产品与期权合约、交易方向、本位、到期时间、行权价、现价与距现价绝对值/百分比、买价/卖价、偏差、原因与建议金额。
+> 主表列宽随终端宽度自适应（120 列下不裁切）：操作 / 产品·合约 / 到期(UTC) / 方向 / 本位 / **目标价（DCY 行权价）** / **距现价%** / **买价** / DCY APR / 期权APR / 差% / 天 / 建议。**决策页（`1`）每条 DCY 产品一行**，期权 APR / 差 来自对齐到的同档合约；**期权链页（`2`）单独展示完整期权链**（操作 / 期权合约 / 到期 / 方向 / 本位 / 行权价 / 距现价% / 买价 / 期权APR / DCY APR / 差% / 天），有对应 DCY 的合约在合约名后标 `←DCY`，详情行给出对应产品与差值。`本位` 列区分期权腿结算：**币本位**（`BTC-USD`/`ETH-USD` 链，结算币为标的币）与 **U本位**（`BTC-USD_UM` 链，USDT 结算）。`距现价%` =（行权价 − 现价）/ 现价，正=高于现价、负=低于现价；`买价` 是该档权利金买一价（币本位计 BTC、U本位计 USDT）。到期列只显示 UTC 日期（OKX 期权统一 08:00 结算）；选中行下方详情行展示完整产品与期权合约、交易方向、本位、到期时间、行权价、现价与距现价绝对值/百分比、买价/卖价、偏差、原因与建议金额。
 
 ### 方向与买卖语义（CALL / PUT）
 
@@ -78,6 +84,10 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 > 下单键在未接入 executor（只读推荐）或选错行类型时会给出错误提示，不会发出请求；风控拒单原因（敞口/单笔/并行/日限）会以红字回显。
 >
 > 注意：期权单张名义 = 0.01 BTC（约 760 USDT），默认单笔上限 2000 USDT 可卖 2 张；需要更大仓位时再按风险承受能力放宽 `--limits`。live 启动恢复覆盖「平台 DCY 在持单 + 期权空头敞口」，**当日笔数**仍取自本地 audit（平台历史成交未计入，防重复提交靠本地记录）。
+>
+> `sim-local` / `sim-okx` 的 `[SIM]` 纸面单会落盘并在重启后恢复，**计入风控敞口**。如果只是测试、却看到「没有真实在持但敞口很大」，先 `cat ~/.coinoption/sim_orders.jsonl` 或 `--positions` 确认；`--reset-paper --yes` 可清空 open 纸面单（已结算历史保留）。切到 `--mode live` 后只恢复平台真实仓位，纸面单不再计入。
+>
+> 如果所有手动单都被 `风控拒绝[total_exposure]` 拒绝：live 启动会把平台在持（DCY 本金 + 期权空头名义）计入敞口；当它已经高于总敞口上限（默认等于资金总额）时，新单必然被拒。到设置页把「总敞口上限」调到 **≥ 在持 + 新单**（资金总额可保持不变），或先减仓。不要靠调大资金总额来解决，那会同时放大策略仓位与建议金额。
 
 
 
@@ -95,6 +105,13 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 ./bin/coinoption --positions                         # 持仓：风控快照 + [SIM] 纸面单 + 平台单
 ./bin/coinoption --settle                            # 到期纸面单按现价结算并释放敞口
 ./bin/coinoption --guard                             # 只看风控守卫
+./bin/coinoption --reset-paper --yes                 # 清空 open 纸面单（真实仓位不动；已结算历史保留）
+# 提前赎回（仅 live；BTC/ETH 币对平台不支持，金额可能低于本金）
+./bin/coinoption --redeem-quote <ordId>              # 先看赎回金额/盈亏/有效期
+./bin/coinoption --redeem <ordId> --yes              # 自动申请报价并确认（可加 --quote-id 复用）
+# 历史滚动回放 + 情景压力（公开日线，无需 Key）
+./bin/coinoption --replay --days 730 --capital 1000 --tenor 22 \
+  --strikes 0.90 --betas 1.0,0.98,0.95 --deltas 0.30,0.25,0.20 --out replay.json
 # 1 张 BTC 期权 = 0.01 BTC ≈ 760 USDT，默认 2000 单笔即可；大仓位再放宽：
 ./bin/coinoption --order opt --inst BTC-USD_UM-261106-83000-C --sz 2 \
   --limits 500000,160000,5,10
@@ -106,15 +123,21 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
   - `minOptionEdgePp`：期权须高出 DCY 的百分点（默认 20）
   - `minAbsEdgePct`：单笔绝对收益差下限（%，默认 0.5）；7 天 20pp 只有 0.38% 实际收益，短期限靠年化阈值会放行噪声
   - `maxStrikeGapPct`：行权价相对现价的最大偏差 %（默认 0.5）
-  - `capitalUsdt`：资金总额（USDT，默认 5000）——风控总敞口上限，单笔上限按 40% 派生（默认 5000 → 单笔 2000）；启动时 `--limits` 优先，Web 设置页保存后在运行期以页面保存值为准
+  - `capitalUsdt`：资金总额（USDT，默认 5000）——策略仓位与默认风控上限的基准，单笔上限按 40% 派生（默认 5000 → 单笔 2000）；启动时 `--limits` 优先，Web 设置页保存后在运行期以页面保存值为准
+  - `totalExposureUsdt` / `perOrderUsdt`：可选，风控**绝对上限**（0/缺省 = 按 `capitalUsdt` 派生）。账户已有大额在持、但策略只想用小资金试仓时，只调高这两个值即可；`perOrderUsdt` 不得大于总敞口
   - `minDiffPct`：自动交易最低差 %（默认 0 = 不设门槛）——`|期权APR − DCY APR|` 低于该值时自动执行跳过；只影响自动执行，不影响推荐动作
   - `autoTrade`：自动执行开关（默认 `false`；Web 设置页 / TUI Settings 页切换后落盘；live 启动强制关闭）
-  - `webAuthCodeHash`：Web 授权码的 SHA-256 摘要（64 位 hex，不落明文）；遗忘时用 `--web-code` 重置，或删除该字段后重启自动生成
+  - `webAuthCodeHash`：Web 授权码摘要（PBKDF2-SHA256，21 万次迭代 + 随机盐；兼容旧版 64 位 SHA-256 并在下次启动自动升级）；遗忘时用 `--web-code` 重置，或删除该字段后重启自动生成
+  - v2 策略/风控（可在 settings.json 手调）：`cashAprPct`（现金机会成本，默认 4）、`minCapitalExcessPct`（资金超额目标，默认 4）、`stressShockPct` / `stressMaxLossPct`（压力情景，默认 30/10）、`allowNegativeEdge`（默认 false）、`minIvPercentilePct`（IV 分位门槛，0=关闭）、`maxAbsDelta`（默认 0.30）、`rvWindowDays`（默认 30）
+  - `apiKey` / `apiSecret` / `apiPassphrase`：OKX API 凭证（**明文**，文件权限 0600）；启动参数/环境变量存在时优先，否则三项齐全才生效；设置页只回显掩码 Key 与是否配置，**从不回传 Secret/Passphrase**
+  - 安全提示：`settings.json` 含 API Secret/Passphrase 明文，请勿提交到 Git、不要随日志/截图外发；建议目录保持 `~/.coinoption` 的 0700 权限
   - `sideFilter` / `settleFilter`：TUI 的方向 / 本位筛选记忆
   - `sortBy`：TUI 排序记忆（如 `"price:desc"`）
-- **API 凭证不在配置文件里**：用 `--key / --secret / --passphrase`，或环境变量 `COINOPTION_API_KEY` / `COINOPTION_SECRET` / `COINOPTION_PASSPHRASE`；代理用 `--proxy` 或 `COINOPTION_PROXY`。
-- **数据文件**（同目录）：`sim_orders.jsonl`（纸面单）/ `orders.jsonl`（真实或 Demo 回执）/ `audit_log.jsonl`（审计）/ `auto_failures.jsonl`（自动失败记录，最近 10 条）/ `settings.json`，可直接 `cat` 对账。
+- **API 凭证来源**（优先级从高到低）：`--key/--secret/--passphrase` → 环境变量 `COINOPTION_API_KEY` / `COINOPTION_SECRET` / `COINOPTION_PASSPHRASE` → `settings.json` 的 `apiKey/apiSecret/apiPassphrase`（Web 设置页写入）。代理用 `--proxy` 或 `COINOPTION_PROXY`。
+- **数据文件**（同目录）：`sim_orders.jsonl`（纸面单）/ `orders.jsonl`（真实或 Demo 回执）/ `audit_log.jsonl`（审计）/ `auto_failures.jsonl`（自动失败记录，最近 10 条）/ `iv_samples.jsonl`（IV 分位采样，每小时一条）/ `settings.json` / `LOCK`（进程锁），可直接 `cat` 对账。
+- **多进程**：TUI / Web（可交易）/ 下单类命令启动时对数据目录加 flock 独占锁；第二个进程会直接报错（提示持有者 PID），避免两份 GuardState 各自放行。确认要并存时用 `--no-lock`。只读看板（`--read-only`）与 `--positions` / `--guard` 不占锁，所以「TUI 盯盘 + 浏览器只读看板」可以并存。
 - **Web 端界面偏好**：标的 / 方向 / 排序存在浏览器 `localStorage`（键 `coinoption.prefs.v1`），不在上述文件里。
+- **手动 vs 自动**：手动下单（TUI `o` / Web 下单弹窗 / CLI `--order`）对单笔、总敞口、并发、日笔数、累计 Delta、压力情景**只提示不拦截**——越限项写进回执 `warnings` 和审计（「手动放行（仅提示）」），额度仍按真实提交累加。交易所级硬规则（最小申购、步长、申购截止、无买盘）仍会直接拒绝；自动交易继续严格按上限拒绝。
 - **交易开关**：默认启动即交易——`--web` + 默认 `sim-local` 为纸面单；自动交易默认关闭，可在 Web 设置页 / TUI Settings 页开启并落盘，live 模式启动强制暂停（页面当次确认才能开）。`--read-only` 关闭全部下单与自动交易，只看板。
 
 ### 实测结论（M3 新增）
@@ -129,9 +152,8 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 
 ### 网络重试与限速（M4）
 
-- 网络错误 / HTTP 429 / 5xx：指数退避（400ms 起，±25% 抖动；429 优先用 `Retry-After`），最多 2 次重试。
-- 业务码 `50011`（限速，请求未被处理）：任何方法都重试。
-- 只读 GET 的瞬时故障（`50001/50026/50013/50004/50005`）可重试；**POST 一律不重试**，避免「已成交又重下一单」。
+- **读请求**（GET + 无副作用的报价 POST）：网络错误 / 429 / 5xx 指数退避（400ms 起，±25% 抖动；429 优先用 `Retry-After`），最多 2 次；GET 的瞬时业务码（`50001/50026/50013/50004/50005`）可重试。
+- **写请求**（下单 / DCY 申购）：只有 `50011`（限速，官方语义=请求未被处理）重试；超时、连接重置、5xx、响应解码失败一律**不重试**，返回 `*okx.AmbiguousError`「结果未知」，executor 会保留敞口占用、写 `unknown` 审计并让自动执行保持去重占位——宁可少做一笔，也不能重复下单。交易类请求用 15s 超时，并带 `clOrdId` 便于对账。
 - 签名/参数/白名单类错误（`50105/50106/50110` 等）立即失败并给出中文提示，不浪费重试。
 - **双币赢（`/api/v5/finance/sfp/dcd/*`）单独节流**：官方限速 1 req/s（User ID 级），由 `okx.Client` 按路径统一保证（默认 1.1s，重试也算在内），调用方不再各自 `sleep`——此前 CLI `--dump/--smoke` 漏写间隔会稳定撞 `50011`。
 - 代理：REST 与 WS 都遵循 `--proxy`；未显式指定时统一跟随 `HTTPS_PROXY / HTTP_PROXY / ALL_PROXY` 环境变量（此前 WS 的 Dialer 不读环境变量，只配环境变量代理时会出现「行情正常、WS 一直重连中」）。
@@ -174,13 +196,18 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 - `GET /login` — 授权码登录页（`POST /api/login {"code":"..."}` 换取会话 Cookie；`POST /api/logout` 退出）
 - `GET /` — 决策看板页（内嵌 HTML，优先通过 `/ws` 接收每秒推送；WS 不可用时自动回退 `/api/decisions`）
 - `GET /ws` — WebSocket 推送（查询参数与 `/api/decisions` 相同：`uly / exp / side / settle`），每秒一帧完整快照；断线由浏览器自动重连
-- `GET /api/decisions` — 当前决策 JSON（camelCase：`at / uly / optionUly / spotPrice / optionCount / dcdCount / decisions / optionRows / products / dcyAvailable / warn / wsConnected / wsStatus / mode / tradeEnabled / guard`）；`decisions[].row` 含 `productId / expTime / dcyApr / optApr / diff / strike / days / strikeErrPct / investCcy / optInstId / optExact / optCtVal / settleMismatch`，`optionRows[]` 含 `instId / strike / bidPx / askPx / lastPx / optApr / aprValid`（`optApr` 为扣除普通档 0.03% 手续费后的净年化）（`lastPx` 为最新成交价，无买卖盘的档位仍展示；`aprValid=false` 表示算不出卖方 APR），`decisions[]` 含 `action / reasonCode / suggestedAmt`（reasonCode 增含 `strike_wrong_side`：卖 PUT 行权价高于现价 / 卖 CALL 低于现价，摆放方向异常不推荐；`no_exact_contract`：没有同行权价 + 同到期日合约，只展示不对齐执行；`edge_abs_small`：年化差达标但单笔绝对收益差 < `minAbsEdgePct`）。`mode` 为 `read-only`（启动加 `--read-only`）或 `live/sim-okx/sim-local`；`autoAvailable / autoTrade / autoNote / autoCount` 为自动交易状态，`autoFailures` 为最近自动失败记录（最新在前，最多 10 条，字段 `ts / kind / ref / reason / detail / count`）；`guard` 给出敞口/单笔/并行/日限状态。
+- `GET /api/decisions` — 当前决策 JSON（camelCase：`at / uly / optionUly / spotPrice / optionCount / dcdCount / decisions / optionRows / products / dcyAvailable / warn / wsConnected / wsStatus / mode / tradeEnabled / guard`）；`decisions[].row` 含 `productId / expTime / dcyApr / optApr / diff / strike / days / strikeErrPct / investCcy / optInstId / optExact / optCtVal / settleMismatch`，`optionRows[]` 含 `instId / strike / bidPx / askPx / lastPx / optApr / aprValid`（`optApr` 为扣除普通档 0.03% 手续费后的净年化）（`lastPx` 为最新成交价，无买卖盘的档位仍展示；`aprValid=false` 表示算不出卖方 APR），`decisions[]` 含 `action / reasonCode / suggestedAmt`（reasonCode 增含 `strike_wrong_side`：卖 PUT 行权价高于现价 / 卖 CALL 低于现价，摆放方向异常不推荐；`no_exact_contract`：没有同行权价 + 同到期日合约，只展示不对齐执行；`edge_abs_small`：年化差达标但单笔绝对收益差 < `minAbsEdgePct`）。`mode` 为 `read-only`（启动加 `--read-only`）或 `live/sim-okx/sim-local`；`autoAvailable / autoTrade / autoNote / autoCount` 为自动交易状态，`autoFailures` 为最近自动失败记录（最新在前，最多 10 条，字段 `ts / kind / ref / reason / detail / count`）；`guard` 给出敞口/单笔/并行/日限状态；`best` 为当前筛选下 `score` 最高的 `dcy_ok` 决策（没有合格候选时省略），页面顶部「本轮最优目标价」直接用它，避免用户自己在列表里猜。
+
+> v1 决策新增字段：顶层 `rv30` / `rvWarn`；`decisions[].delta / iv / rv / fairPremium / edgeVsOption / score / minYield / warnings`。reason codes 与 v1 规则见 `STRATEGY.md` §4/§6；`strategyMode=legacy` 时回到旧 20pp/0.5% 逻辑。
 
 **Web 看板视觉与交互**：
 
 - 布局：三栏 brutalist —— **左侧栏 260px**（工作区导航 / 本轮可执行统计 / MODE·风控卡 / 语义图例）、**中间列表 44%**（决策卡或期权链列表）、**右侧详情**（策略单据 + DECIDE 动作栏 + 底部黑色 LOG 卡）。详情区铺 28px 网格纸底纹。
 - 视觉 token（与参考同源）：画布薄荷绿 `#CFE8D6`、墨色 `#121210`、纸白 `#FFFFFF`、状态绿 `#2E8C42` / 琥珀 `#E8A030` / 红 `#C03A3A`；结构线一律 3px 黑边，阴影为 4px / 6px 无模糊偏移，悬停抬升 `translate(-2px,-2px)` 阴影变 8px，按钮按下位移 4px 阴影归零；字体 Archivo（标题）/ Hanken Grotesk（正文）/ Space Mono（数字与标签），圆角基本为 0，仅 stamp 4px、chain 节点全圆。
-- 决策列表：一张卡片一条 DCY 产品 —— 左上角标 `PUT 77,000`、标题「行权价 · 高卖/低买」、右侧大号期权 APR、标签（动作 / 本位 / 需跌或需涨 / 差 pp 或原因）、底部对齐的期权合约 + 买价 + 三段链节点（DCY → 期权 → 差）。点击卡片右侧出单据，选中卡黑色左标 + 加重阴影。
+- 决策列表：一张卡片一条 DCY 产品 —— 左上角标 `PUT 77,000`、标题「目标价 · 高卖/低买」、右侧大号期权 APR、标签（动作 / 本位 / 需跌或需涨 / 差 pp 或原因）、底部对齐的期权合约 + 买价 + 三段链节点（DCY → 期权 → 差）。点击卡片右侧出单据，选中卡黑色左标 + 加重阴影。
+- 手动下单：右侧「卖出期权 / 申购 DCY」不再依赖策略建议——决策行只要期权有买盘 / 产品在快照里，按钮就可用；期权链页有买盘的任意档也可直接卖出。期权弹窗会标注**每张名义**（1 张 = 0.01 BTC × 现价）与**卖 1 张约收权利金**，输入框标题也带每张 USDT 估值。界面会提示「手动下单可跳过策略建议；执行器风控上限仍生效」，`--read-only` 仍全部禁用。
+- 持仓：左侧栏「持仓」打开只读弹窗，内容与 CLI `--positions` 一致——模式/风控快照、`[SIM]` 纸面单、平台 DCY 订单、期权空头；不触发下单。只读看板（`--read-only`）未接入执行器时提示改用命令行。
+- 策略说明：决策页顶部常驻 `策略 v1` 提示条（目标价 = OKX 挂出的 DCY 行权价；按 score 选档，不追最高 APR；不合格空仓），点「目标价怎么选 →」或侧栏「策略说明」打开完整说明（目标价规则 / 收益门槛 / score 怎么理解 / 为什么不是最近或最高 APR / 判断顺序 / 资金风险 / 术语）。再往下是「本轮最优目标价（决策价）」常驻条：直接显示当前筛选下 score 最高的 `dcy_ok` 档（目标价、到期、收益/年化、风险 Δ、波动率溢价、score、建议金额），可一键定位该档；没有合格档时显示红色「空仓」和主要原因分布。详情页用「为什么是它」小方框列出可读指标，并解释 score 的含义。
 - 期权链：紧凑行列表（合约 / 行权价 / 买价 / 期权APR），进入时自动选中第一档有买盘的合约，右侧查看报价、卖方 APR、DCY 对照与卖出入口。
 - 筛选：标的 / 方向 / 本位 chips + 到期快捷 chips + 日期输入 + SORT chips，两个页面共用同一套筛选与排序。
 - 搜索：`⌘K`（Ctrl+K）聚焦，输入即按产品 ID / 合约 / 行权价本地过滤，`Esc` 清空。
@@ -204,11 +231,17 @@ Go + TUI 开发中。文档：`DEVELOPMENT_PLAN.md`（计划）、`ARCHITECTURE.
 - `GET /api/decisions?uly=BTC-USDT&exp=2026-11-06&side=P&settle=B` — 组合筛选（标的 + 方向 + 本位 + 到期）
 - `POST /api/auto` — 自动交易开关 `{"enabled": true|false}`（落盘 `settings.json`）；`GET /api/auto` 返回当前状态与最近一次说明
 - `GET /api/auto/failures` — 最近的自动失败记录 `{"limit":10,"count":N,"failures":[{ts,kind,ref,reason,detail,count}]}`（最新在前；`kind` = `option` / `dcd` / `market`；只读看板返回 403）
-- `GET /api/settings` — 读取用户设置与生效中的风控上限（含 `capitalUsdt / minDiffPct / minOptionEdgePp / minAbsEdgePct / maxStrikeGapPct / autoTrade / autoAvailable / authEnabled / limits`）
+- `GET /api/settings` — 读取用户设置与生效中的风控上限（含 `capitalUsdt / totalExposureUsdt / perOrderUsdt / minDiffPct / minOptionEdgePp / minAbsEdgePct / maxStrikeGapPct / minAbsYieldPct / minAprPct / autoTrade / autoAvailable / authEnabled / limits`，以及 API 凭证状态 `apiKeyMasked / apiKeyConfigured / apiSecretConfigured / apiPassphraseConfigured / apiKeySource / apiKeyOverride`；**不回传 Secret/Passphrase**）
+- `GET /api/guide` — 策略说明 JSON（`title / intro / sections[]`；`sections[].key=target` 是「目标价（行权价）怎么选」，阈值取当前 settings，Web 弹窗与 TUI `?` 页共用同一份文本）
+- `GET /api/positions` — 与 CLI `--positions` 同一份持仓文本（`mode / guard / lines / info`）：模式与风控快照、`[SIM]` 纸面单、平台 DCY 订单、期权空头；只读看板未接入执行器时返回 501
 - `POST /api/settings` — 合并保存设置（只覆盖请求里出现的字段），保存后立即热更新风控与决策参数；`newAuthCode` 可改授权码，返回 `relogin:true` 时需重新登录
   ```bash
   curl -s -b /tmp/ck -H 'Content-Type: application/json' \
     -d '{"capitalUsdt":10000,"minDiffPct":2.5,"autoTrade":true}' \
+    http://127.0.0.1:8080/api/settings
+  # 填写/替换 API 凭证（三项必须同时提供）；clearApiKey:true 清除
+  curl -s -b /tmp/ck -H 'Content-Type: application/json' \
+    -d '{"apiKey":"...","apiSecret":"...","apiPassphrase":"..."}' \
     http://127.0.0.1:8080/api/settings
   ```
 
@@ -231,23 +264,45 @@ curl -s -X POST http://127.0.0.1:8080/api/auto \
 ```
 
 - `--web` 默认装配 executor 并开启交易（sim-local 为纸面单）；`--read-only` 关闭全部下单与自动交易。**自动交易**：默认关闭，在设置页（或侧栏 AUTO TRADE）开启后落盘，重启沿用；live 模式启动强制暂停，需在页面当次确认。
-- **设置页**（左侧栏「设置」）：资金总额、差值比例、自动交易开关、三个策略阈值、修改授权码、只读风控上限。保存后资金总额立即派生总敞口 / 单笔上限，阈值立即重算决策，无需重启。
+- **设置页**（左侧栏「设置」）：资金总额、总敞口上限、单笔上限（后两项 0 = 按资金总额派生）、差值比例、自动交易开关、三个策略阈值、API 凭证（Key / Secret / Passphrase，三项需同时填写，可一键清除）、修改授权码、生效中的风控上限。保存后资金总额立即派生总敞口 / 单笔上限（显式覆盖优先），阈值立即重算决策，API 凭证立即替换运行中客户端签名（DCY 下一次轮询最长 30s 生效），无需重启。启动参数/环境变量提供了凭证时，设置页只显示 `由启动参数/环境变量提供` 并禁用编辑。
 - **自动失败记录**：侧栏 AUTO TRADE 下方的 `FAIL LOG › 失败 N` 打开最近 10 条记录（时间 / 类别 / 合约或产品 / 原因 / 当时的候选摘要，相同原因标 `×N`），数据来自 WS 推送的 `autoFailures`，弹窗开着时会实时刷新；也可 `curl /api/auto/failures` 或直接 `cat ~/.coinoption/auto_failures.jsonl`。TUI 的 Settings 页底部同样列出这 10 条。
 - 手动卖出：期权链里**任何有买盘**的合约都可卖（实值档仍已被榜单过滤）；决策页仍只对建议行动作。手动申购：DCY 产品**即使没有「申购」建议（不可对齐）也可手动申购**；自动执行则只挑**精确对齐的建议**（差% 最大、60s 冷却、成交前复核 APR、抵押品不一致跳过、差% 未达「差值比例」跳过、成功才写去重表）。
 - 复用 TUI 同一条执行链路：`live` 真实下单 / `sim-okx` 期权走 OKX Demo、DCY 纸面 / `sim-local` 全纸面；风控（总敞口、单笔、并行、日限）与审计仍由 `internal/executor` 强制校验，拒单原因原样回显。
-- 期权卖方敞口按 `sz × ctVal × ctMult × 现价` 折算（BTC 1 张 = 0.01 BTC），默认单笔 2000 USDT 可卖 2 张；更大仓位先在设置页调大资金总额，或用 `--limits` 显式覆盖，例如 `--limits 20000,5000,5,10`（总敞口/单笔/并行/日限，USDT/笔；启动时 `--limits` 优先于资金总额，Web 设置页保存后以页面值为准）。
+- 期权卖方敞口按 `sz × ctVal × ctMult × 现价` 折算（BTC 1 张 = 0.01 BTC），默认单笔 2000 USDT 可卖 2 张；更大仓位先调高设置页的**总敞口/单笔上限**（资金总额仍控制策略仓位），或用 `--limits` 显式覆盖，例如 `--limits 20000,5000,5,10`（总敞口/单笔/并行/日限，USDT/笔；启动时 `--limits` 优先于资金总额与设置覆盖，Web 设置页保存后以页面值为准）。
 - 端点只接受 `POST` + `application/json`（`text/plain` 返回 415），且本服务不返回 CORS 头；整站还需要授权码，未登录的写请求返回 401。
 - 无 API Key 时 DCY 决策为空，自动交易没有候选；期权链来自公开行情，仍可手动卖出任意有买盘的合约（纸面）验证链路。
 
 ## 构建
 
 ```bash
-make build          # 产物 ./bin/coinoption
+make build          # 本机产物 ./bin/coinoption
 go run ./cmd/coinoption --smoke       # 冒烟测试
 go run ./cmd/coinoption --dump      # CSV 决策输出
 go run ./cmd/coinoption             # TUI 主界面
 go test ./internal/strategy/        # 黄金回归
 ```
+
+### 交叉编译 Linux（部署到服务器）
+
+```bash
+make build-linux                      # amd64 + arm64 两个架构
+make build-linux LINUX_ARCHS=amd64    # 只编 x86_64
+make build-linux LINUX_ARCHS=arm64    # 只编 ARM64（ARM 云主机 / 64 位树莓派）
+```
+
+产物：
+
+- `bin/coinoption-linux-amd64` — x86_64 服务器
+- `bin/coinoption-linux-arm64` — ARM64（含 Apple Silicon 上的 Linux 虚拟机 / 云 ARM 实例）
+
+交叉编译使用 `CGO_ENABLED=0`（纯静态 ELF，不依赖目标机 glibc）、`-trimpath`（去掉本机路径）与 `-ldflags "-s -w"`（去符号表）；已用 `file` 验证为 statically linked。直接把对应文件 `scp` 到服务器并 `chmod +x` 即可运行，例如：
+
+```bash
+scp bin/coinoption-linux-amd64 user@host:/opt/coinoption/coinoption
+ssh user@host 'chmod +x /opt/coinoption/coinoption && /opt/coinoption/coinoption --smoke'
+```
+
+`make clean` 删除 `bin/` 下的所有构建产物（不影响 `~/.coinoption` 里的数据）。
 
 ## 运行参数
 
@@ -261,12 +316,24 @@ go test ./internal/strategy/        # 黄金回归
 | `--demo` | — | 公开行情/Demo 兼容标志（TUI 执行路径以 `--mode` 为准） |
 | `--optdebug` | — | 期权链诊断：到期日分布 × bid 覆盖 |
 | `--mode` | — | `live` / `sim-okx`（期权走 Demo，DCY 本地纸面）/ `sim-local`（默认，全本地） |
+| `--positions` | — | 查看风控快照 + `[SIM]` 纸面单 + 平台仓位 |
+| `--settle` | — | 结算到期纸面单并释放敞口 |
+| `--reset-paper` | — | 清空 open 纸面单；必须同时加 `--yes`；保留已结算历史，真实仓位不动 |
+| `--yes` | — | 确认 `--reset-paper` / `--redeem` 破坏性操作 |
+| `--redeem-quote` | — | 查询提前赎回报价（ordId；仅 live）：赎回金额、相对本金盈亏、有效期 |
+| `--redeem` | — | 确认提前赎回（ordId）；未给 `--quote-id` 时自动申请报价；必须 `--yes` |
+| `--quote-id` | — | 复用已有赎回报价 ID |
+| `--no-lock` | — | 不抢数据目录锁（允许多进程并存；不推荐） |
+| `--replay` | — | 历史滚动回放 + 情景压力（公开日线，无需 Key） |
+| `--days` / `--capital` / `--tenor` | — | 回放天数（默认 730）/ 初始资金 / 期限 |
+| `--strikes` / `--betas` / `--deltas` | — | 回放参数扫描：行权价/现价、DCY 定价系数、MaxAbsDelta |
+| `--out` | — | 回放 JSON 报告路径 |
 | `--store` | — | 数据目录，默认 `~/.coinoption` |
-| `--limits` | — | 风控覆盖 `"total,perOrder,concurrent,perDay"`（段序：总敞口 / 单笔 / 并行 / 日限；期权大名义验证需放宽），默认 `5000,2000,5,10`；启动时优先于 `settings.json` 的资金总额（Web 设置页保存后在运行期以页面值为准） |
+| `--limits` | — | 风控覆盖 `"total,perOrder,concurrent,perDay"`（段序：总敞口 / 单笔 / 并行 / 日限；期权大名义验证需放宽），默认 `5000,2000,5,10`；启动时优先于 `settings.json` 的资金总额与 `totalExposureUsdt/perOrderUsdt` 覆盖（Web 设置页保存后在运行期以页面值为准） |
 | `--uly` | — | 标的，默认 `BTC-USDT`（支持 ETH-USDT/SOL-USDT；TUI 可用 `u` 快速切换） |
 | `--web` | — | 启动 Web 看板（默认开启交易；自动交易默认关闭但沿用 `settings.json`，数据经 `/ws` 实时推送） |
 | `--read-only` | — | Web 看板只读：不装配执行器、不自动交易（仍要求授权码） |
-| `--addr` | — | Web 服务监听地址（`--web` 开启时生效，默认 `:8080`） |
+| `--addr` | — | Web 服务监听地址（`--web` 开启时生效，默认 `127.0.0.1:8080`，仅本机） |
 | `--web-code` | `COINOPTION_WEB_CODE` | Web 授权码（整站访问控制）；不传则读取 `settings.json` 摘要，首次随机生成并打印；命令行显式指定优先 |
 | `--ws` | — | 启用 OKX WebSocket 实时行情（默认 `true`；`--ws=false` 回退 REST 轮询/15s 缓存） |
 
@@ -276,6 +343,7 @@ go test ./internal/strategy/        # 黄金回归
 
 - 双币赢（sfp/dcd）接口：需要「读取」权限（产品/订单查询）；实盘申购需要「交易」权限
 - 期权卖单：需要「交易」权限（`tdMode=cross`）
+- **凭证配置位置**：Web 设置页「API 凭证」（保存后立即替换运行中客户端签名）或 `settings.json`；`--key/--secret/--passphrase` 与环境变量优先级最高。填写后可用 `--dump` / 页面 DCY 产品数验证是否鉴权成功。
 - **IP 白名单**：私有接口会校验来源 IP（实测出口 `198.176.52.187` 未在 Key 白名单 → `50110`）；需在 OKX 后台加入当前出口 IP，或改用不绑定 IP 的 Key
 - **代理出口是 IPv6 时**：OKX 报文里的 IP 是「它看到的出口」，不是代理配置本身。若白名单只填了 IPv4，而出口为 IPv6（`2408:...`），必然 50106/50110。先跑 `./bin/coinoption --proxy <...> --egress` 看真实出口，再二选一：把该 IPv6 加入白名单，或在代理侧强制 IPv4 出口（Clash `ipv6: false` / 换 IPv4-only 节点）。配置非法的代理（如漏写 `http://`）现在会启动即报错，不会静默直连
 
@@ -286,4 +354,6 @@ go test ./internal/strategy/        # 黄金回归
    `./bin/coinoption --mode sim-okx --order opt --inst BTC-USD_UM-261106-83000-C --sz 1 --px 0 --limits 500000,160000,5,10`
    预期：Demo 成交回执写入 `orders.jsonl`，DCY 仍走本地纸面。
 3. **小实盘**：先用 `--limits 5000,2000,5,10` 下 1 笔最小 DCY 申购（如 10 USDT 等值），确认订单与 `--positions` 平台数据一致。
+4. **回放**：`--replay --days 730 --out replay.json`，核对 §7.2 的验收项（尤其 edge≥0 的成交笔数是否够 30 笔/6 个月）。
+5. **赎回**：live 下对 1 笔最小单跑 `--redeem-quote`，确认金额口径与到账时间；BTC/ETH 币对预期返回「不支持提前赎回」。
 4. **自动执行**：在 sim-local 打开 Settings → `a` 观察 1–2 轮（同一产品只做一次）；确认无误后再考虑 sim-okx / live（live 需当次 `y` 确认）。

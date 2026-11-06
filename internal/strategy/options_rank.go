@@ -47,6 +47,8 @@ type OptionRow struct {
 	LastPx        string    `json:"lastPx"`        // 最新成交价（无买卖盘时仍可能非空，如 _UM 冷门档）
 	Days          float64   `json:"days"`          // 剩余天数
 	SettleCcy     string    `json:"settleCcy"`     // BTC | USDT
+	CtVal         float64   `json:"ctVal"`         // 每张对应标的数量（ctVal×ctMult；BTC=0.01）
+	CtValCcy      string    `json:"ctValCcy"`      // 标的币种（BTC）
 	SpotPx        float64   `json:"spotPx"`        // 现价（与 Strike 同计价口径）
 	StrikeDiff    float64   `json:"strikeDiff"`    // 行权价 − 现价（正=CALL 侧，负=PUT 侧）
 	StrikeDiffPct float64   `json:"strikeDiffPct"` // (行权价−现价)/现价 ×100
@@ -93,6 +95,8 @@ func RankOptions(instruments []okx.Instrument, tickers []okx.OptionTicker,
 			LastPx:    q.LastPx,
 			Days:      days,
 			SettleCcy: q.SettleCcy,
+			CtVal:     q.CtVal,
+			CtValCcy:  q.CtValCcy,
 			SpotPx:    spotPx,
 		}
 		if spotPx > 0 {

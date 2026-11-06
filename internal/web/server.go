@@ -30,7 +30,10 @@ type Trader interface {
 	State() executor.GuardState
 	SubmitOption(instID string, sz, limPx float64) (executor.Outcome, error)
 	SubmitOptionChecked(instID string, sz, limPx, minAPR float64) (executor.Outcome, error)
+	// 手动下单：风控上限只提示，不拦截（自动执行仍走严格方法）。
+	SubmitOptionAdvisory(instID string, sz, limPx float64) (executor.Outcome, error)
 	SubmitDCD(p okx.DCDProduct, amt float64) (executor.Outcome, error)
+	SubmitDCDAdvisory(p okx.DCDProduct, amt float64) (executor.Outcome, error)
 	Positions() (executor.PositionsView, error)
 }
 
@@ -41,7 +44,12 @@ type SettingsStore interface {
 	SaveSettings(store.Settings) error
 }
 
-// ServerOption 可选能力（手动下单 / 自动执行 / 设置 / 授权码）。
+// CredentialSetter 运行期替换 OKX API 凭证（*okx.Client 实现）。
+type CredentialSetter interface {
+	SetAuth(key, secret, passphrase string)
+}
+
+// ServerOption 可选能力（手动下单 / 自动执行 / 设置 / 授权码 / API 凭证）。
 type ServerOption func(*serverConfig)
 
 type serverConfig struct {
@@ -58,6 +66,14 @@ type serverConfig struct {
 	auth       *authenticator // nil = 不启用授权码（仅测试/内嵌场景）
 	// failures 自动失败记录持久化（nil = 只保留进程内最近 10 条）。
 	failures FailureStore
+	// creds API 凭证的运行期入口（nil = 只保存到 settings.json，重启生效）。
+	creds CredentialSetter
+	// apiKeyOverride 启动参数/环境变量提供了凭证：优先于 settings.json，
+	// 此时设置页不允许覆盖当前进程正在使用的凭证。
+	apiKeyOverride bool
+	// limitsOverride 启动参数 --limits 提供了风控上限：设置页保存时不得用
+	// settings.json 派生值把它覆盖掉（此前保存一次设置，--limits 就静默失效）。
+	limitsOverride bool
 }
 
 // WithTrader 启用 Web 手动下单（不传 = 只读，与旧行为一致）。
@@ -85,26 +101,53 @@ func WithAutoFailures(s FailureStore) ServerOption {
 	return func(c *serverConfig) { c.failures = s }
 }
 
-// WithSettingsStore 启用 Web 设置页（资金总额 / 差值比例 / 策略阈值 / 授权码修改）。
+// WithSettingsStore 启用 Web 设置页（资金总额 / 差值比例 / 策略阈值 / API 凭证 / 授权码修改）。
 func WithSettingsStore(s SettingsStore) ServerOption {
 	return func(c *serverConfig) { c.settings = s }
 }
 
+// WithCredentialSetter 设置页保存 API 凭证后立即替换运行中客户端的凭证。
+// 不传 = 只写 settings.json，下次启动生效。
+func WithCredentialSetter(s CredentialSetter) ServerOption {
+	return func(c *serverConfig) { c.creds = s }
+}
+
+// WithAPIKeyOverride 标记启动参数/环境变量已提供 API 凭证：
+// 它们优先于 settings.json，设置页只显示说明并禁用编辑。
+func WithAPIKeyOverride(v bool) ServerOption {
+	return func(c *serverConfig) { c.apiKeyOverride = v }
+}
+
+// WithLimitsOverride 标记启动参数 --limits 已显式指定风控上限：
+// 设置页保存不得用资金派生值覆盖它。
+func WithLimitsOverride(v bool) ServerOption {
+	return func(c *serverConfig) { c.limitsOverride = v }
+}
+
 // WithAuthCode 整站启用授权码（明文；启动时由 main 传入 --web-code 或随机生成值）。
+//
+// 空授权码按「谁都不能登录」处理（fail-closed）：以前直接 return 会让整站
+// **无鉴权裸奔**，调用方传了个空串也不会有任何提示。
 func WithAuthCode(code string) ServerOption {
 	return func(c *serverConfig) {
+		a := newAuthenticator()
 		if strings.TrimSpace(code) == "" {
+			c.auth = a // spec 为空 → check 恒 false
 			return
 		}
-		a := newAuthenticator()
-		if err := a.setHash(HashCode(code)); err == nil {
+		spec, err := NewCodeHash(code)
+		if err != nil {
+			c.auth = a // 派生失败同样锁死，绝不降级成无鉴权
+			return
+		}
+		if err := a.setHash(spec); err == nil {
 			c.auth = a
 		}
 	}
 }
 
 // WithAuthHash 用 settings.json 里持久化的授权码摘要启用整站授权。
-// 摘要非法时保持零摘要（任何授权码都登录不了）——宁可锁死，也不能裸奔。
+// 摘要非法时保持空摘要（任何授权码都登录不了）——宁可锁死，也不能裸奔。
 func WithAuthHash(hashHex string) ServerOption {
 	return func(c *serverConfig) {
 		a := newAuthenticator()
@@ -126,38 +169,82 @@ type decisionsResponse struct {
 	AutoFailures  []store.AutoFailure  `json:"autoFailures"`
 	AuthEnabled   bool                 `json:"authEnabled"`
 	Guard         *executor.GuardState `json:"guard,omitempty"`
+	// Best 当前筛选下 score 最高的可申购 DCY；没有合格候选时省略。
+	// 与自动执行使用同一套 score 口径，页面顶部直接显示其目标价。
+	Best *strategy.Decision `json:"best,omitempty"`
 }
 
 // settingsResponse 设置页/接口返回：用户可调项 + 生效中的风控上限。
-// 授权码只回 authEnabled（是否启用），绝不回传摘要或明文。
+// 授权码只回 authEnabled（是否启用）；API 凭证只回掩码 Key 与「是否配置」，
+// 绝不回传 Secret/Passphrase 或授权码摘要。
 type settingsResponse struct {
-	CapitalUSDT     float64              `json:"capitalUsdt"`
-	MinDiffPct      float64              `json:"minDiffPct"`
-	MinOptionEdgePP float64              `json:"minOptionEdgePp"`
-	MinAbsEdgePct   float64              `json:"minAbsEdgePct"`
-	MaxStrikeGapPct float64              `json:"maxStrikeGapPct"`
-	AutoTrade       bool                 `json:"autoTrade"`
-	AutoAvailable   bool                 `json:"autoAvailable"`
-	AuthEnabled     bool                 `json:"authEnabled"`
-	Limits          executor.Limits      `json:"limits"`
-	Guard           *executor.GuardState `json:"guard,omitempty"`
-	Relogin         bool                 `json:"relogin,omitempty"`
+	CapitalUSDT float64 `json:"capitalUsdt"`
+	// 0 = 按资金总额派生；>0 = 用户显式设置的绝对风控上限。
+	TotalExposureUSDT float64 `json:"totalExposureUsdt"`
+	PerOrderUSDT      float64 `json:"perOrderUsdt"`
+	MinDiffPct        float64 `json:"minDiffPct"`
+	MinOptionEdgePP   float64 `json:"minOptionEdgePp"`
+	MinAbsEdgePct     float64 `json:"minAbsEdgePct"`
+	MaxStrikeGapPct   float64 `json:"maxStrikeGapPct"`
+	StrategyMode      string  `json:"strategyMode"`
+	// v1 策略参数（只读回显；可在 settings.json 调整）。
+	TenorMinDays         float64              `json:"tenorMinDays"`
+	TenorMaxDays         float64              `json:"tenorMaxDays"`
+	MinDaysToExpiry      float64              `json:"minDaysToExpiry"`
+	MaxExpiryGapHours    float64              `json:"maxExpiryGapHours"`
+	MaxAbsDelta          float64              `json:"maxAbsDelta"`
+	MinIvRvSpread        float64              `json:"minIvRvSpread"`
+	FairVolBuffer        float64              `json:"fairVolBuffer"`
+	MinPremiumOverFair   float64              `json:"minPremiumOverFair"`
+	MinAbsYieldPct       float64              `json:"minAbsYieldPct"`
+	MinAPRPct            float64              `json:"minAprPct"`
+	CashAPRPct           float64              `json:"cashAprPct"`
+	MinCapitalExcessPct  float64              `json:"minCapitalExcessPct"`
+	StressShockPct       float64              `json:"stressShockPct"`
+	StressMaxLossPct     float64              `json:"stressMaxLossPct"`
+	AllowNegativeEdge    bool                 `json:"allowNegativeEdge"`
+	MinEdgeRatio         float64              `json:"minEdgeRatio"`
+	MinEdgeAbs           float64              `json:"minEdgeAbs"`
+	DcyMaxPrincipalPct   float64              `json:"dcyMaxPrincipalPct"`
+	DcyMaxPrincipalUSDT  float64              `json:"dcyMaxPrincipalUsdt"`
+	DcyTotalPrincipalPct float64              `json:"dcyTotalPrincipalPct"`
+	DcyDeltaExposurePct  float64              `json:"dcyDeltaExposurePct"`
+	MaxConcurrent        int                  `json:"maxConcurrent"`
+	DailyLossPct         float64              `json:"dailyLossPct"`
+	RVWindowDays         int                  `json:"rvWindowDays"`
+	MinIVPercentilePct   float64              `json:"minIvPercentilePct"`
+	AutoTrade            bool                 `json:"autoTrade"`
+	AutoAvailable        bool                 `json:"autoAvailable"`
+	AuthEnabled          bool                 `json:"authEnabled"`
+	Limits               executor.Limits      `json:"limits"`
+	Guard                *executor.GuardState `json:"guard,omitempty"`
+	Relogin              bool                 `json:"relogin,omitempty"`
+	// API 凭证状态（只读回显）。
+	APIKeyMasked            string `json:"apiKeyMasked,omitempty"`
+	APIKeyConfigured        bool   `json:"apiKeyConfigured"`
+	APISecretConfigured     bool   `json:"apiSecretConfigured"`
+	APIPassphraseConfigured bool   `json:"apiPassphraseConfigured"`
+	APIKeySource            string `json:"apiKeySource"` // "startup" | "settings" | "none"
+	APIKeyOverride          bool   `json:"apiKeyOverride"`
+	// RestartRequired 本次保存了凭证但进程未接入运行期客户端，需重启生效。
+	RestartRequired bool `json:"restartRequired,omitempty"`
 }
 
 // orderResponse 下单回执（camelCase，避免直接序列化 executor.Outcome 的字段名）。
 type orderResponse struct {
-	OK        bool    `json:"ok"`
-	Mode      string  `json:"mode"`
-	Kind      string  `json:"kind"`
-	Ref       string  `json:"ref"`
-	OrdID     string  `json:"ordId,omitempty"`
-	QuoteID   string  `json:"quoteId,omitempty"`
-	Amt       float64 `json:"amt"`
-	InvestCcy string  `json:"investCcy,omitempty"`
-	AmtUSDT   float64 `json:"amtUsdt"`
-	Premium   float64 `json:"premium,omitempty"`
-	Sim       bool    `json:"sim"`
-	Detail    string  `json:"detail"`
+	OK        bool     `json:"ok"`
+	Mode      string   `json:"mode"`
+	Kind      string   `json:"kind"`
+	Ref       string   `json:"ref"`
+	OrdID     string   `json:"ordId,omitempty"`
+	QuoteID   string   `json:"quoteId,omitempty"`
+	Amt       float64  `json:"amt"`
+	InvestCcy string   `json:"investCcy,omitempty"`
+	AmtUSDT   float64  `json:"amtUsdt"`
+	Premium   float64  `json:"premium,omitempty"`
+	Sim       bool     `json:"sim"`
+	Detail    string   `json:"detail"`
+	Warnings  []string `json:"warnings,omitempty"`
 }
 
 // cacheTTL 快照缓存时长：WS 实时模式只缓存 1s，避免页面/WS 推送重复重组；
@@ -371,6 +458,26 @@ h1 { margin:0; font-family:var(--font-display); font-weight:800; font-size:30px;
 .tabs-note { margin-left:18px; margin-bottom:10px; font-family:var(--font-mono); font-size:10px; letter-spacing:.04em; opacity:.6; }
 .status-mono { margin-left:auto; margin-bottom:10px; font-family:var(--font-mono); font-size:10px; letter-spacing:.04em; color:var(--red); font-weight:700; }
 
+/* ── 策略悬条：目标价说明始终可见 ── */
+.strategy-strip { display:flex; align-items:center; gap:10px; padding:8px 24px; border-bottom:var(--line); background:var(--paper); font-family:var(--font-mono); font-size:10px; line-height:1.55; }
+.strategy-strip b { font-family:var(--font-display); font-size:11px; white-space:nowrap; letter-spacing:.03em; }
+.strategy-strip .chip { margin-left:auto; white-space:nowrap; }
+@media (max-width:900px) { .strategy-strip { flex-wrap:wrap; } .strategy-strip .chip { margin-left:0; } }
+
+/* ── 本轮最优目标价 ── */
+.best-bar { display:flex; align-items:center; gap:14px; padding:8px 24px; border-bottom:var(--line); background:var(--paper); }
+.best-kicker { flex:0 0 auto; font-family:var(--font-mono); font-size:9px; letter-spacing:.1em; text-transform:uppercase; opacity:.65; }
+.best-kicker span { display:block; font-size:9px; letter-spacing:0; opacity:.75; }
+.best-line { display:flex; align-items:baseline; gap:4px; flex:0 0 auto; }
+.best-price { font-family:var(--font-display); font-weight:800; font-size:28px; line-height:1; letter-spacing:-.03em; }
+.best-price.is-none { font-size:18px; color:var(--red); letter-spacing:0; }
+.best-unit { font-family:var(--font-mono); font-size:10px; opacity:.55; }
+.best-desc { flex:1; min-width:0; font-family:var(--font-mono); font-size:10px; line-height:1.7; opacity:.85; }
+.best-jump { flex:0 0 auto; white-space:nowrap; }
+.best-bar.is-ok { background:#E6F3E9; }
+.best-bar.is-none { background:#F7E3E3; }
+@media (max-width:900px) { .best-bar { flex-wrap:wrap; gap:6px 12px; } .best-desc { flex-basis:100%; order:5; } }
+
 /* ── split ── */
 .split { flex:1; display:flex; min-height:0; }
 .queue { width:44%; flex:0 0 44%; border-right:var(--line); display:flex; flex-direction:column; min-height:0; }
@@ -450,6 +557,10 @@ h1 { margin:0; font-family:var(--font-display); font-weight:800; font-size:30px;
 .doc-table td { padding:8px 0; border-bottom:1px solid rgba(18,18,16,.2); vertical-align:middle; }
 .doc-table td.note { font-family:var(--font-body); font-size:11px; opacity:.6; }
 .doc-table td.val { font-weight:700; }
+.why-box { margin-top:18px; border:3px solid var(--ink); background:var(--paper); box-shadow:var(--shadow-sm); padding:12px 14px; }
+.why-line { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+.why-line span { border:2px solid var(--ink); background:var(--mint); padding:2px 7px; font-family:var(--font-mono); font-size:10px; }
+.why-note { margin-top:8px; font-family:var(--font-mono); font-size:10px; line-height:1.6; opacity:.65; }
 .doc-chain { margin-top:24px; border-top:3px solid var(--ink); padding-top:16px; }
 .doc-chain .chain { gap:8px; flex-wrap:wrap; margin-top:10px; }
 .chain-item { display:flex; align-items:center; gap:6px; }
@@ -508,6 +619,7 @@ h1 { margin:0; font-family:var(--font-display); font-weight:800; font-size:30px;
 .ominfo { font-family:var(--font-mono); font-size:11px; line-height:1.9; margin-bottom:12px; }
 .omfield { display:flex; gap:10px; align-items:center; font-family:var(--font-mono); font-size:11px; }
 .omfield span { flex:0 0 90px; opacity:.65; }
+.omfield span.is-wide { flex:0 0 190px; }
 .omfield input { flex:1; background:var(--paper); border:2px solid var(--ink); padding:8px; font-family:var(--font-mono); font-size:14px; outline:none; }
 .omnote { margin-top:12px; font-family:var(--font-mono); font-size:11px; line-height:1.6; opacity:.75; }
 .omnote.err { color:var(--red); opacity:1; font-weight:700; }
@@ -519,13 +631,28 @@ h1 { margin:0; font-family:var(--font-display); font-weight:800; font-size:30px;
 .dialog-wide { width:min(700px,96vw); }
 .set-grid { display:grid; grid-template-columns:1fr 1fr; gap:18px 26px; align-items:start; }
 .set-section { display:flex; flex-direction:column; gap:8px; min-width:0; }
+.set-section.is-wide { grid-column:1 / -1; }
 .set-section .omfield span { flex:0 0 92px; }
+.set-section .omfield input[type="password"] { letter-spacing:.08em; }
 .set-hint { font-family:var(--font-mono); font-size:10px; line-height:1.65; opacity:.6; }
 .set-mono { font-family:var(--font-mono); font-size:11px; line-height:1.9; white-space:pre-line; }
+#posBody { white-space:pre-wrap; max-height:52vh; overflow:auto; background:var(--paper); border:2px solid var(--ink); padding:12px; margin:0; }
 .set-section .chip { align-self:flex-start; }
 .set-section #setLogout { background:var(--paper); }
 #authFoot { cursor:pointer; text-decoration:underline; text-underline-offset:2px; }
 @media (max-width:700px) { .set-grid { grid-template-columns:1fr; } }
+
+/* ── 策略说明 ── */
+.guide-hero { border:3px solid var(--ink); background:var(--paper); box-shadow:var(--shadow-sm); padding:12px 14px; font-family:var(--font-mono); font-size:11px; line-height:1.8; }
+.guide-hero b { font-family:var(--font-display); font-size:13px; display:block; margin-bottom:4px; }
+.guide-sec { margin-top:16px; padding-top:12px; border-top:1px solid rgba(18,18,16,.25); }
+.guide-sec:first-of-type { border-top:0; }
+.guide-sec h4 { margin:0 0 8px; font-family:var(--font-display); font-size:14px; }
+.guide-sec.is-target { border:3px solid var(--ink); background:var(--amber-stripe); box-shadow:var(--shadow-sm); padding:12px 14px; margin-top:16px; }
+.guide-sec ol, .guide-sec ul { margin:0; padding-left:20px; font-family:var(--font-mono); font-size:11px; line-height:1.85; }
+.guide-sec li + li { margin-top:4px; }
+.guide-note { margin-top:8px; font-family:var(--font-mono); font-size:11px; font-weight:700; line-height:1.7; }
+.guide-pill { display:inline-block; border:2px solid var(--ink); padding:0 6px; margin-right:6px; font-size:9px; letter-spacing:.06em; background:var(--paper); }
 
 /* ── focus ── */
 button:focus-visible { outline:2px solid var(--ink); outline-offset:2px; }
@@ -593,6 +720,14 @@ input:focus-visible { outline:none; box-shadow:inset 0 0 0 2px var(--ink); }
       <span class="nav-left"><i class="ti ti-list-details"></i>完整期权链</span>
       <span class="nav-badge is-muted" id="navChainN">0</span>
     </button>
+    <button class="nav-item" id="positionsNav" type="button">
+      <span class="nav-left"><i class="ti ti-wallet"></i>持仓</span>
+      <span class="nav-badge is-muted"><i class="ti ti-arrow-up-right"></i></span>
+    </button>
+    <button class="nav-item" id="guideNav" type="button">
+      <span class="nav-left"><i class="ti ti-help-circle"></i>策略说明</span>
+      <span class="nav-badge is-muted"><i class="ti ti-arrow-up-right"></i></span>
+    </button>
     <button class="nav-item" id="settingsNav" type="button">
       <span class="nav-left"><i class="ti ti-adjustments-horizontal"></i>设置</span>
       <span class="nav-badge is-muted" id="navSetMark"><i class="ti ti-lock"></i></span>
@@ -640,6 +775,17 @@ input:focus-visible { outline:none; box-shadow:inset 0 0 0 2px var(--ink); }
       <span class="tabs-note mono" id="tabNote"></span>
       <span class="status-mono" id="status"></span>
     </nav>
+    <div class="strategy-strip">
+      <b>策略 v1</b>
+      <span>目标价 = OKX 挂出的 DCY 行权价；策略只挑「风险调整后最划算」的一档，不追最高 APR，挑不到就空仓。</span>
+      <button class="chip" id="strategyMore" type="button">目标价怎么选 →</button>
+    </div>
+    <div class="best-bar" id="bestBar">
+      <div class="best-kicker">本轮最优目标价<span>（DCY 决策价）</span></div>
+      <div class="best-line"><span class="best-price" id="bestPrice">—</span><span class="best-unit" id="bestUnit">USDT</span></div>
+      <div class="best-desc" id="bestDesc">等待行情…</div>
+      <button class="chip best-jump" id="bestJump" type="button" disabled>查看这档 →</button>
+    </div>
     <div class="split">
       <section class="queue">
         <div class="queue-head">
@@ -705,6 +851,8 @@ input:focus-visible { outline:none; box-shadow:inset 0 0 0 2px var(--ink); }
       <div class="set-section">
         <div class="mono-label">资金与自动交易</div>
         <label class="omfield"><span>资金总额 USDT</span><input id="setCapital" type="number" step="100" min="1"></label>
+        <label class="omfield"><span>总敞口上限 USDT</span><input id="setTotalExposure" type="number" step="any" min="0" placeholder="0 = 按资金总额"></label>
+        <label class="omfield"><span>单笔上限 USDT</span><input id="setPerOrder" type="number" step="any" min="0" placeholder="0 = 资金总额 × 40%"></label>
         <div class="set-hint" id="setDerived">单笔上限 = 资金总额 × 40%</div>
         <label class="omfield"><span>差值比例 %</span><input id="setDiff" type="number" step="0.5" min="0" max="1000"></label>
         <div class="set-hint">自动交易要求「期权APR − DCY APR」的绝对值达到该值；0 = 不设门槛。</div>
@@ -715,12 +863,27 @@ input:focus-visible { outline:none; box-shadow:inset 0 0 0 2px var(--ink); }
         <label class="omfield"><span>期权边际 pp</span><input id="setEdge" type="number" step="1" min="1" max="100"></label>
         <label class="omfield"><span>绝对边际 %</span><input id="setAbs" type="number" step="0.1" min="0.01" max="100"></label>
         <label class="omfield"><span>行权价偏差 %</span><input id="setGap" type="number" step="0.1" min="0.01" max="50"></label>
-        <div class="set-hint">保存后立即按新阈值重算决策，不需重启。</div>
+        <div class="set-hint">legacy 阈值：v1 DCY-only 不使用；保存后仍会落盘，供 strategyMode=legacy 回滚。</div>
+      </div>
+      <div class="set-section is-wide">
+        <div class="mono-label">策略 v1（DCY-only，只读）</div>
+        <div class="set-mono" id="setV1">—</div>
+        <div class="set-hint">v1 以绝对 EV（IV/RV）+ 收益门槛（0.5% / 12% 年化）+ 硬风控为准；旧 20pp/0.5% 阈值不再参与自动决策。高级参数可在 settings.json 调整。</div>
+        <button class="chip" id="setGuide" type="button">查看策略说明（目标价怎么选）</button>
+      </div>
+      <div class="set-section is-wide" id="setAPISection">
+        <div class="mono-label">API 凭证（DCY / 私有接口）</div>
+        <div class="set-mono" id="setAPIStatus">—</div>
+        <label class="omfield"><span>API Key</span><input id="setAPIKey" type="password" autocomplete="off" spellcheck="false" placeholder="留空不修改" maxlength="128"></label>
+        <label class="omfield"><span>API Secret</span><input id="setAPISecret" type="password" autocomplete="new-password" spellcheck="false" placeholder="留空不修改" maxlength="128"></label>
+        <label class="omfield"><span>Passphrase</span><input id="setAPIPass" type="password" autocomplete="new-password" spellcheck="false" placeholder="留空不修改" maxlength="128"></label>
+        <div class="set-hint">三项需同时填写；保存后立即用新凭证签名（DCY 产品下一次轮询生效，最长 30s）。启动参数 / 环境变量优先于本页。</div>
+        <button class="chip" id="setAPIClear" type="button">清除已保存凭证</button>
       </div>
       <div class="set-section">
-        <div class="mono-label">风控上限（只读）</div>
+        <div class="mono-label">风控上限（生效中）</div>
         <div class="set-mono" id="setLimits">—</div>
-        <div class="set-hint">资金总额 = 总敞口上限；单笔自动按 40% 派生，仍受并发/日限约束。</div>
+        <div class="set-hint">总敞口/单笔可在上方单独设置：0 = 按资金总额派生（总敞口 = 资金，单笔 = 40%）。策略仓位用「资金总额」控制，账户已有大额在持时只调高总敞口，避免策略跟着放大。</div>
       </div>
       <div class="set-section" id="setAuthSection">
         <div class="mono-label">访问授权</div>
@@ -731,6 +894,26 @@ input:focus-visible { outline:none; box-shadow:inset 0 0 0 2px var(--ink); }
     </div>
     <div class="omnote" id="setNote"></div>
     <div class="ombtns"><button id="setCancel">取消</button><button id="setSave" class="primary">保存设置</button></div>
+  </div>
+</div>
+
+<div class="modal hidden" id="positionsModal">
+  <div class="dialog dialog-wide">
+    <div class="dialog-head"><h3>持仓</h3><button class="icon-btn" id="posClose" title="关闭"><i class="ti ti-x"></i></button></div>
+    <div class="omnote" id="posNote"></div>
+    <pre class="set-mono" id="posBody">—</pre>
+    <div class="ombtns"><button id="posRefresh">刷新</button><button id="posClose2" class="primary">关闭</button></div>
+  </div>
+</div>
+
+<div class="modal hidden" id="guideModal">
+  <div class="dialog dialog-wide">
+    <div class="dialog-head">
+      <h3 id="guideTitle">策略说明 · v1</h3>
+      <button class="icon-btn" id="guideClose" title="关闭"><i class="ti ti-x"></i></button>
+    </div>
+    <div id="guideBody"></div>
+    <div class="ombtns"><button id="guideOk" class="primary">知道了</button></div>
   </div>
 </div>
 
@@ -778,6 +961,7 @@ let wsDown = false;
 let animateDoc = false;
 let authEnabled = false;
 let setAutoOn = false;
+let setAutoTouched = false; // 只有用户在本弹窗里动过 auto 才回写，避免覆盖侧栏开关
 let setData = null;
 
 const MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
@@ -828,6 +1012,12 @@ function instDay(instId) {
 function pct(v) { return v == null ? "-" : (v * 100).toFixed(2); }
 function signed(v) { const d = Number(v) || 0; return (d > 0 ? "+" : "") + d.toFixed(2); }
 function fmtNum(v) { if (v == null || isNaN(v)) return "-"; return Math.round(v).toLocaleString("en-US"); }
+function trimDec(v, n) {
+  const x = Number(v);
+  if (!isFinite(x)) return "-";
+  const s = x.toFixed(n);
+  return s.indexOf(".") >= 0 ? s.replace(/0+$/, "").replace(/\.$/, "") : s;
+}
 function shortProduct(pid) {
   const p = (pid || "").split("-");
   return p.length > 2 ? p.slice(2).join("-") : (pid || "");
@@ -896,6 +1086,36 @@ function reasonTxt(code) {
     case "no_exact_contract": return "无同价同到期合约";
     case "edge_abs_small": return "单笔边际过薄";
     case "out_of_tenor": return "不在期限窗口";
+    case "dcy_ok": return "DCY 可申购";
+    case "no_benchmark": return "无同价同到期基准";
+    case "expiry_mismatch": return "到期时间不一致";
+    case "expiry_gap_warn": return "到期时间差 >2h（提示）";
+    case "settle_mismatch": return "结算本位不一致";
+    case "delta_too_high": return "Delta 过高（近 ATM）";
+    case "delta_missing": return "Delta 缺失";
+    case "rv_missing": return "RV 数据缺失";
+    case "iv_missing": return "IV 反解失败";
+    case "iv_rv_too_low": return "IV 未高于 RV";
+    case "premium_below_fair": return "低于公允价";
+    case "yield_too_low": return "收益低于门槛";
+    case "bid_size_insufficient": return "买盘深度不足";
+    case "spread_wide_warn": return "价差偏宽（提示）";
+    case "stale_quote": return "报价过期";
+    case "size_below_min": return "低于最小申购";
+    case "size_above_cap": return "超过单笔上限";
+    case "total_exposure_cap": return "超过总敞口";
+    case "delta_exposure_cap": return "超过 Delta 敞口";
+    case "max_concurrent": return "并发已满";
+    case "daily_loss_limit": return "触发日亏损暂停";
+    case "no_capital": return "可用资金不足";
+    case "edge_too_small": return "相对期权优势不足";
+    case "dcy_dominated": return "期权更优（可执行）";
+    case "option_benchmark_better": return "期权市场价更高（机会成本不划算）";
+    case "unsupported_side": return "方向/币种不支持";
+    case "unsupported_underlying": return "标的不支持";
+    case "dcy_yield_zero": return "DCY 收益为 0";
+    case "expired": return "已到期";
+    case "no_spot": return "无现价";
   }
   return code || "-";
 }
@@ -1114,15 +1334,20 @@ function openSettings() {
       if (!res.ok) throw new Error(res.j.error || "读取设置失败");
       setData = res.j;
       $("setCapital").value = fmtInput(setData.capitalUsdt);
+      $("setTotalExposure").value = setData.totalExposureUsdt > 0 ? fmtInput(setData.totalExposureUsdt) : "";
+      $("setPerOrder").value = setData.perOrderUsdt > 0 ? fmtInput(setData.perOrderUsdt) : "";
       $("setDiff").value = fmtInput(setData.minDiffPct);
       $("setEdge").value = fmtInput(setData.minOptionEdgePp);
       $("setAbs").value = fmtInput(setData.minAbsEdgePct);
       $("setGap").value = fmtInput(setData.maxStrikeGapPct);
       $("setCode").value = "";
       setAutoOn = !!setData.autoTrade;
+      setAutoTouched = false;
       renderSetAuto();
       renderSetDerived();
       renderSetLimits();
+      renderSetV1();
+      renderAPIStatus();
       $("setAuthSection").classList.toggle("hidden", !setData.authEnabled);
       $("settingsModal").classList.remove("hidden");
       $("setCapital").focus();
@@ -1142,10 +1367,21 @@ function renderSetAuto() {
 }
 function renderSetDerived() {
   const c = Number($("setCapital").value) || 0;
-  const per = Math.round(c * 0.4 * 100) / 100;
-  $("setDerived").textContent = c > 0
-    ? "单笔上限 = 资金总额 × 40% = " + fmtNum(per) + " USDT"
-    : "资金总额必须大于 0";
+  const total = Number($("setTotalExposure").value) || 0;
+  const per = Number($("setPerOrder").value) || 0;
+  const effTotal = total > 0 ? total : c;
+  const effPer = per > 0 ? per : Math.round(c * 0.4 * 100) / 100;
+  if (!(c > 0)) {
+    $("setDerived").textContent = "资金总额必须大于 0";
+    return;
+  }
+  const override = (total > 0 || per > 0) ? "（已手动覆盖）" : "（按资金总额派生）";
+  let msg = "生效：总敞口 " + fmtNum(effTotal) + " · 单笔 " + fmtNum(effPer) + " USDT" + override;
+  const exp = setData && setData.guard ? (Number(setData.guard.exposureUsdt) || 0) : 0;
+  if (exp > effTotal) {
+    msg += "；当前在持 " + fmtNum(exp) + " 已超过上限，新单会被拒";
+  }
+  $("setDerived").textContent = msg;
 }
 function renderSetLimits() {
   const l = setData && setData.limits;
@@ -1157,25 +1393,183 @@ function renderSetLimits() {
     "单笔 " + fmtNum(l.perOrderUsdt) + " / 总敞口 " + fmtNum(l.totalExposureUsdt) + " USDT\n" +
     "并行 " + l.maxConcurrent + " 笔 · 日限 " + l.maxSessionsPerDay + " 笔";
 }
+function renderSetV1() {
+  const d = setData || {};
+  const pct = function (v) { return (v == null || !isFinite(Number(v))) ? "—" : (Number(v) * 100).toFixed(1) + "%"; };
+  const dec = function (v, n) { return (v == null || !isFinite(Number(v))) ? "—" : Number(v).toFixed(n); };
+  $("setV1").textContent =
+    "目标价 = DCY 行权价（OKX 挂出），按 score 选档；不追最高 APR\n" +
+    "模式 " + (d.strategyMode || "dcy_only") +
+    " · 期限 " + dec(d.tenorMinDays, 0) + "–" + dec(d.tenorMaxDays, 0) + " 天" +
+    " · |Delta| ≤ " + dec(d.maxAbsDelta, 2) + "\n" +
+    "收益 ≥ max(" + dec(d.minAbsYieldPct, 2) + "%, " + dec(d.minAprPct, 0) + "% × 天数/365) · 不赚太少\n" +
+    "IV−RV ≥ " + pct(d.minIvRvSpread) +
+    " · 权利金/公允 ≥ " + dec(d.minPremiumOverFair, 2) +
+    " · 单笔 ≤ " + fmtNum(d.dcyMaxPrincipalUsdt) + " USDT / " + pct(d.dcyMaxPrincipalPct) + "\n" +
+    "总本金 ≤ " + pct(d.dcyTotalPrincipalPct) +
+    " · Delta 敞口 ≤ " + pct(d.dcyDeltaExposurePct) +
+    " · 并发 ≤ " + fmtNum(d.maxConcurrent) +
+    " · RV " + fmtNum(d.rvWindowDays) + "d";
+}
+function renderAPIStatus() {
+  const d = setData || {};
+  const el = $("setAPIStatus");
+  const override = !!d.apiKeyOverride;
+  if (override) {
+    el.textContent = "当前使用启动参数 / 环境变量中的凭证（优先级最高），本页不可覆盖。";
+  } else if (d.apiKeyConfigured) {
+    el.textContent = "已配置：" + (d.apiKeyMasked || "••••") + " · Secret / Passphrase 已保存（不回显）";
+  } else {
+    el.textContent = "未配置。填写三项并保存后，DCY / 私有接口即可使用。";
+  }
+  ["setAPIKey", "setAPISecret", "setAPIPass"].forEach(function (id) {
+    const input = $(id);
+    input.value = "";
+    input.disabled = override;
+    input.placeholder = override ? "由启动参数/环境变量提供" : (d.apiKeyConfigured ? "留空不修改" : "填写后保存");
+  });
+  $("setAPIClear").classList.toggle("hidden", override || !d.apiKeyConfigured);
+}
 function closeSettings() {
   $("settingsModal").classList.add("hidden");
 }
+// ── 持仓 ──
+function openPositions() {
+  $("positionsModal").classList.remove("hidden");
+  $("posNote").className = "omnote";
+  $("posNote").textContent = "读取持仓…";
+  $("posBody").textContent = "—";
+  fetch("/api/positions", { cache: "no-store" })
+    .then(function (r) {
+      if (r.status === 401) { location.replace("/login"); throw new Error("会话已失效"); }
+      return r.json().then(function (j) { return { ok: r.ok, j: j }; });
+    })
+    .then(function (res) {
+      if (!res.ok) throw new Error(res.j.error || "读取持仓失败");
+      const j = res.j || {};
+      $("posBody").textContent = (j.lines || []).join("\n") || "（空）";
+      const at = j.generatedAt ? new Date(j.generatedAt).toLocaleString() : "—";
+      $("posNote").textContent = "只读展示 · 不触发下单 · 生成于 " + at;
+    })
+    .catch(function (e) {
+      $("posNote").className = "omnote err";
+      $("posNote").textContent = "✗ " + e.message;
+      $("posBody").textContent = "只读看板可用命令行查看：./coinoption --positions";
+    });
+}
+function closePositions() {
+  $("positionsModal").classList.add("hidden");
+}
+// ── 策略说明（目标价选择）──
+function openGuide() {
+  const modal = $("guideModal");
+  const body = $("guideBody");
+  modal.classList.remove("hidden");
+  body.innerHTML = "";
+  body.appendChild(h("div", "omnote", "读取策略说明…"));
+  fetch("/api/guide", { cache: "no-store" })
+    .then(function (r) {
+      if (r.status === 401) { location.replace("/login"); throw new Error("会话已失效"); }
+      return r.json().then(function (j) { return { ok: r.ok, j: j }; });
+    })
+    .then(function (res) {
+      if (!res.ok) throw new Error(res.j.error || "读取策略说明失败");
+      renderGuide(res.j);
+    })
+    .catch(function (e) {
+      body.innerHTML = "";
+      body.appendChild(h("div", "omnote err", "✗ " + e.message));
+    });
+}
+function closeGuide() {
+  $("guideModal").classList.add("hidden");
+}
+function renderGuide(g) {
+  const body = $("guideBody");
+  body.innerHTML = "";
+  $("guideTitle").textContent = g.title || "策略说明 · v1";
+  const hero = h("div", "guide-hero");
+  hero.appendChild(h("b", "", "一句话"));
+  hero.appendChild(h("div", "", g.intro || ""));
+  body.appendChild(hero);
+  (g.sections || []).forEach(function (s) {
+    const sec = h("section", "guide-sec" + (s.key === "target" ? " is-target" : ""));
+    const title = h("h4");
+    if (s.key === "target") title.appendChild(h("span", "guide-pill", "重点"));
+    title.appendChild(document.createTextNode(s.title || ""));
+    sec.appendChild(title);
+    const list = document.createElement(s.key === "target" ? "ol" : "ul");
+    (s.lines || []).forEach(function (line) { list.appendChild(h("li", "", line)); });
+    sec.appendChild(list);
+    if (s.note) sec.appendChild(h("div", "guide-note", "▸ " + s.note));
+    body.appendChild(sec);
+  });
+}
+function clearAPICreds() {
+  if (!setData || !setData.apiKeyConfigured) return;
+  if (!window.confirm("清除 settings.json 中保存的 API 凭证？当前进程会立即失去私有接口权限（除非凭证来自启动参数/环境变量）。")) return;
+  const btn = $("setAPIClear");
+  btn.disabled = true;
+  setNote("清除中…");
+  fetch("/api/settings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ clearApiKey: true })
+  }).then(function (r) {
+    if (r.status === 401) { location.replace("/login"); throw new Error("会话已失效"); }
+    return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, j: j }; });
+  }).then(function (res) {
+    if (!res.ok) throw new Error(res.j.error || "清除失败");
+    setData = res.j;
+    renderAPIStatus();
+    setNote("✓ 已清除保存的 API 凭证", false);
+    setFlash("✓ 已清除保存的 API 凭证", false);
+    refresh();
+  }).catch(function (e) {
+    setNote("✗ " + e.message, true);
+  }).then(function () { btn.disabled = false; });
+}
 function saveSettings() {
   const capital = Number($("setCapital").value);
+  const totalExposure = Number($("setTotalExposure").value) || 0;
+  const perOrder = Number($("setPerOrder").value) || 0;
   const diff = Number($("setDiff").value);
   const edge = Number($("setEdge").value);
   const abs = Number($("setAbs").value);
   const gap = Number($("setGap").value);
   if (!(capital > 0)) { setNote("资金总额必须为正数", true); return; }
+  if (totalExposure < 0 || perOrder < 0) { setNote("风控上限不能为负数（0 = 按资金总额派生）", true); return; }
+  const effTotal = totalExposure > 0 ? totalExposure : capital;
+  if (perOrder > effTotal) {
+    setNote("单笔上限不能超过总敞口上限（" + fmtNum(effTotal) + "）", true);
+    return;
+  }
   if (!(diff >= 0)) { setNote("差值比例不能为负数（0 = 不设门槛）", true); return; }
   const body = {
     capitalUsdt: capital,
+    totalExposureUsdt: totalExposure,
+    perOrderUsdt: perOrder,
     minDiffPct: diff,
     minOptionEdgePp: edge,
     minAbsEdgePct: abs,
-    maxStrikeGapPct: gap,
-    autoTrade: setAutoOn
+    maxStrikeGapPct: gap
   };
+  if (setAutoTouched) {
+    body.autoTrade = setAutoOn;
+    if (curMode === "live") body.confirmLive = true;
+  }
+  const apiKey = $("setAPIKey").value.trim();
+  const apiSecret = $("setAPISecret").value.trim();
+  const apiPass = $("setAPIPass").value.trim();
+  if (apiKey || apiSecret || apiPass) {
+    if (!(apiKey && apiSecret && apiPass)) {
+      setNote("API Key / Secret / Passphrase 需三项同时填写", true);
+      return;
+    }
+    body.apiKey = apiKey;
+    body.apiSecret = apiSecret;
+    body.apiPassphrase = apiPass;
+  }
   const code = $("setCode").value.trim();
   if (code) body.newAuthCode = code;
   const btn = $("setSave");
@@ -1198,7 +1592,12 @@ function saveSettings() {
     autoOn = !!res.j.autoTrade;
     autoNote = autoOn ? "自动交易已开启" : "自动交易已暂停";
     closeSettings();
-    setFlash("✓ 设置已保存并立即生效", false);
+    renderAPIStatus();
+    if (res.j.restartRequired) {
+      setFlash("✓ 设置已保存；API 凭证需重启服务后生效", false);
+    } else {
+      setFlash("✓ 设置已保存并立即生效", false);
+    }
     renderTradeBar();
     refresh();
   }).catch(function (e) {
@@ -1228,10 +1627,11 @@ function renderMeta(j) {
   actionCounts = { buy_option: buy, subscribe_dual: sub, unaligned: unal };
   $("navDecN").textContent = decs.length;
   $("navChainN").textContent = opts.length;
-  $("chipExec").textContent = buy + " 可执行";
+  $("chipExec").textContent = (buy + sub) + " 可执行";
+  $("chipExec").title = "策略建议数量；手动下单不受此限制（仍受风控上限约束）";
   $("chipUnaligned").textContent = unal + " 不可对齐";
   $("chipUnaligned").className = "tag " + (unal > 0 ? "tag-red" : "tag-paper");
-  $("statExec").textContent = buy;
+  $("statExec").textContent = buy + sub;
   $("statOf").textContent = "of " + decs.length + " 决策";
   $("statBuy").textContent = buy;
   $("statSub").textContent = sub;
@@ -1263,6 +1663,66 @@ function updateSortUI() {
   const d = $("sortDir");
   d.textContent = sortDesc ? "↓ 高→低" : "↑ 低→高";
   d.disabled = !sortKey;
+}
+
+// 本轮最优目标价：直接取服务端 strategy.BestDCY 的结果（与自动执行同一套
+// 排序），不再让用户自己在列表里猜哪一档最划算。
+function topRejectReasons(j) {
+  const counts = new Map();
+  (j.decisions || []).forEach(function (d) {
+    const c = d.reasonCode;
+    if (!c || c === "dcy_ok") return;
+    // CALL / 非 USDT 档不是 v1 的目标，排除后原因分布才有意义。
+    if (c === "unsupported_side" || c === "unsupported_underlying" || c === "dcy_yield_zero") return;
+    counts.set(c, (counts.get(c) || 0) + 1);
+  });
+  return Array.from(counts.entries())
+    .sort(function (a, b) { return b[1] - a[1] || (a[0] < b[0] ? -1 : 1); })
+    .slice(0, 2)
+    .map(function (p) { return reasonTxt(p[0]) + " " + p[1] + " 个"; })
+    .join(" · ");
+}
+function renderBest(j) {
+  const bar = $("bestBar");
+  const price = $("bestPrice");
+  const unit = $("bestUnit");
+  const desc = $("bestDesc");
+  const jump = $("bestJump");
+  const b = j.best;
+  if (b && b.row) {
+    const r = b.row;
+    const bits = [];
+    if (r.dcyAbsYield > 0) bits.push("收益 " + (r.dcyAbsYield * 100).toFixed(2) + "%（年化 " + (r.dcyApr * 100).toFixed(1) + "%）");
+    if (b.delta > 0) bits.push("风险 Δ " + Number(b.delta).toFixed(2));
+    if (b.iv > 0 && b.rv > 0) bits.push("波动率溢价 " + ((b.iv - b.rv) * 100).toFixed(1) + "pp");
+    if (b.score) bits.push("score " + Number(b.score).toFixed(4) + "（本轮最高）");
+    if (b.suggestedAmt) bits.push("建议 " + fmtNum(b.suggestedAmt) + " " + (r.investCcy || ""));
+    price.textContent = fmtNum(r.strike);
+    price.classList.remove("is-none");
+    unit.textContent = "USDT";
+    bar.classList.add("is-ok");
+    bar.classList.remove("is-none");
+    desc.textContent = dcySideName(r.optType) + " · " + (r.expTime ? expStr(r.expTime) : "-") +
+      "（" + Math.round(r.days || 0) + " 天）· " + bits.join(" · ");
+    jump.textContent = "查看这档 →";
+    jump.disabled = false;
+    jump.onclick = function () {
+      if (curQuery) { curQuery = ""; $("search").value = ""; }
+      jumpToDecision(r.productId);
+    };
+  } else {
+    const why = topRejectReasons(j);
+    price.textContent = "策略空仓";
+    price.classList.add("is-none");
+    unit.textContent = "";
+    bar.classList.add("is-none");
+    bar.classList.remove("is-ok");
+    desc.textContent = "当前筛选下没有通过全部门槛的目标价" +
+      (why ? " · 主要原因：" + why : "") + "；等下一轮，不硬做。";
+    jump.textContent = "看策略说明 →";
+    jump.disabled = false;
+    jump.onclick = openGuide;
+  }
 }
 function setStatus(txt) { $("status").textContent = txt || ""; }
 function setFlash(msg, isErr) {
@@ -1434,7 +1894,7 @@ function buildDecisionCard(d) {
 
   const top = h("div", "req-top");
   const main = h("div", "req-main");
-  main.appendChild(h("div", "req-name", "行权 " + fmtNum(r.strike) + " · " + sideLabel(r.optType)));
+  main.appendChild(h("div", "req-name", "目标价 " + fmtNum(r.strike) + " · " + sideLabel(r.optType)));
   main.appendChild(h("div", "req-sub", "到期 " + (r.expTime ? expStr(r.expTime) : "-") +
     " · 剩余 " + Math.round(r.days || 0) + " 天 · 投入 " + (r.investCcy || "-")));
   const amt = h("div", "req-amt");
@@ -1458,6 +1918,11 @@ function buildDecisionCard(d) {
   } else {
     tags.appendChild(tagEl(reasonTxt(d.reasonCode), "tag-mint"));
   }
+  if (d.delta > 0) tags.appendChild(tagEl("Δ " + Number(d.delta).toFixed(2), "tag-paper"));
+  if (d.iv > 0) tags.appendChild(tagEl("IV " + (d.iv * 100).toFixed(0) + "%", "tag-mint"));
+  if (d.rv > 0) tags.appendChild(tagEl("RV " + (d.rv * 100).toFixed(0) + "%", "tag-paper"));
+  if (d.score) tags.appendChild(tagEl("score " + Number(d.score).toFixed(4), "tag-paper"));
+  (d.warnings || []).forEach(function (w) { tags.appendChild(tagEl(reasonTxt(w), "tag-amber")); });
 
   const foot = h("div", "req-foot");
   const meta = h("div", "req-meta");
@@ -1541,6 +2006,41 @@ function toStrikeText(optType, strike, spot) {
   }
   return d >= 0 ? "涨 " + d.toFixed(2) + "%" : "已穿 " + Math.abs(d).toFixed(2) + "%";
 }
+function targetReason(d) {
+  const bits = [];
+  const r = d.row || {};
+  if (r.dcyAbsYield > 0) bits.push("收益 " + (r.dcyAbsYield * 100).toFixed(2) + "%");
+  if (r.dcyApr > 0) bits.push("年化 " + (r.dcyApr * 100).toFixed(1) + "%");
+  if (d.delta > 0) bits.push("风险 Δ " + Number(d.delta).toFixed(2));
+  if (d.iv > 0 && d.rv > 0) bits.push("波动率溢价 " + ((d.iv - d.rv) * 100).toFixed(1) + "pp");
+  if (d.fairPremium > 0 && r.dcyAbsYield > 0) bits.push("权利金/公允 " + (r.dcyAbsYield / d.fairPremium).toFixed(2) + "×");
+  if (d.edgeVsOption) bits.push("vs 期权 " + signed(d.edgeVsOption * 100) + "%");
+  if (d.score) bits.push("score " + Number(d.score).toFixed(4));
+  return bits.join(" · ");
+}
+function whyBox(d) {
+  const box = h("div", "why-box");
+  box.appendChild(monoLabel("为什么是它"));
+  const ok = d.reasonCode === "dcy_ok";
+  const txt = ok ? targetReason(d) : "";
+  if (txt) {
+    const line = h("div", "why-line");
+    txt.split(" · ").forEach(function (t) { line.appendChild(h("span", "", t)); });
+    box.appendChild(line);
+    box.appendChild(h("div", "why-note",
+      "它通过了全部硬门槛。score 越高，代表「每承担 1 份 Delta 风险，绝对 EV 越大」；不是按 APR 高低选。"));
+  } else {
+    const why = d.reasonCode ? reasonTxt(d.reasonCode) : "";
+    let note = "未通过硬门槛" + (why ? "：" + why : "") + "；完整判断见上方原因码。";
+    const r = d.row || {};
+    if (d.reasonCode === "yield_too_low" && d.minYield > 0 && r.dcyAbsYield > 0) {
+      note = "收益 " + (r.dcyAbsYield * 100).toFixed(2) + "% 低于门槛 " +
+        (d.minYield * 100).toFixed(2) + "%；锁资金赚太少，不做。";
+    }
+    box.appendChild(h("div", "why-note", note));
+  }
+  return box;
+}
 function renderDecisionDoc(j, doc, rail, log) {
   const d = (j.decisions || []).find(function (x) { return (x.row || {}).productId === selDec; });
   if (!d) {
@@ -1579,12 +2079,13 @@ function renderDecisionDoc(j, doc, rail, log) {
     ["DCY APR", pct(r.dcyApr) + "%", "双币赢年化"],
     ["期权 APR", hasBid ? pct(r.optApr) + "%" : "—", hasBid ? "按买一价计的净年化（已扣 0.03%）" : "无买盘，算不出"],
     ["差%", hasBid ? signed(r.diff * 100) + "pp" : "—", "期权 − DCY"],
-    ["行权价", fmtNum(r.strike), dist == null ? "无现价" : "距现价 " + signed(dist) + "%"],
-    ["到行权", toStrikeText(r.optType, r.strike, spot), r.optType === 80 || r.optType === "P" ? "现价需跌到行权价的比例（安全垫）" : "现价需涨到行权价的比例"],
+    ["目标价", fmtNum(r.strike), (dist == null ? "无现价" : "距现价 " + signed(dist) + "%") + " · OKX DCY 行权价"],
+    ["到目标价", toStrikeText(r.optType, r.strike, spot), r.optType === 80 || r.optType === "P" ? "现价需跌到目标价的比例（安全垫）" : "现价需涨到目标价的比例"],
     ["买一价", r.optBidPx || "—", (r.optSettleCcy || "本位") + " 计价权利金"],
-    ["剩余天数", Math.round(r.days || 0) + " 天", "7–30 天窗口内才可执行"],
+    ["剩余天数", Math.round(r.days || 0) + " 天", "10–30 天窗口内才可执行"],
     ["原因码", d.reasonCode || "-", reasonTxt(d.reasonCode)]
   ]));
+  doc.appendChild(whyBox(d));
 
   const chainWrap = h("div", "doc-chain");
   chainWrap.appendChild(monoLabel("对照链"));
@@ -1597,25 +2098,31 @@ function renderDecisionDoc(j, doc, rail, log) {
   doc.appendChild(chainWrap);
 
   rail.appendChild(monoLabel("DECIDE"));
-  const canSell = tradeEnabled && hasBid && d.action === "buy_option";
+  // 手动下单不要求策略建议：只要合约有买盘 / 产品仍在快照里，就可以手动卖出 /
+  // 申购（跳过自动策略）；执行器风控上限仍然生效。--read-only 仍全部禁用。
+  const canSell = tradeEnabled && !!r.optInstId && hasBid;
   const sell = stampButton("ti-stamp", "卖出期权", "⌘ + ↵", canSell ? "is-green" : "", function () { openOrder("option", d); });
   sell.disabled = !canSell;
+  sell.title = "手动卖出：跳过策略建议，仍受执行器风控上限约束";
   rail.appendChild(sell);
-  const canDcy = tradeEnabled && (d.action === "subscribe_dual" || d.action === "unaligned");
+  const prod = (j.products || {})[r.productId];
+  const canDcy = tradeEnabled && !!prod;
   const dcd = stampButton("ti-coin", "申购 DCY", "⌘ + D", canDcy ? "is-amber" : "", function () { openOrder("dcd", d); });
   dcd.disabled = !canDcy;
+  dcd.title = "手动申购：跳过策略建议，仍受执行器风控上限约束";
   rail.appendChild(dcd);
   rail.appendChild(policyCard());
   if (!tradeEnabled) rail.appendChild(h("div", "rail-hint", "当前为只读看板（--read-only）"));
   else if (r.settleMismatch) rail.appendChild(h("div", "rail-hint", "抵押品本位与投资币种不一致：请手动核对保证金后再下单"));
-  else if (d.action === "unaligned") rail.appendChild(h("div", "rail-hint", "未对齐：可手动申购 DCY，自动执行不会碰这一行"));
+  else if (d.action === "unaligned") rail.appendChild(h("div", "rail-hint", "未对齐：可手动申购 DCY / 卖出有买盘的期权；自动执行不会碰这一行"));
+  else rail.appendChild(h("div", "rail-hint", "手动下单可跳过策略建议；执行器风控上限仍生效"));
 
   log.appendChild(logCard("DECISION LOG", "REASON / MATCH / PRICE", [
     "REASON   " + (d.reasonCode || "-") + " · " + reasonTxt(d.reasonCode),
     "ACTION   " + actionTitle(d) + " · 建议 " + (d.suggestedAmt ? fmtNum(d.suggestedAmt) + " " + (r.investCcy || "") : "不下单"),
     "MATCH    " + (r.optInstId || "未对齐") + " · " + (r.optMatched ? "±1 天窗口内最近同向档" : "未找到同向合约"),
     "PRICE    " + (hasBid ? "买价 " + r.optBidPx + " · 期权APR " + pct(r.optApr) + "%" : "无买盘，仅展示对齐"),
-    "STRIKE   " + fmtNum(r.strike) + " · 偏差 " + signed(r.strikeErrPct || 0) + "%",
+    "TARGET   " + fmtNum(r.strike) + " · 目标价（DCY 行权价）· 偏差 " + signed(r.strikeErrPct || 0) + "%",
     "UPDATED  " + timeHM(j.at) + " · 行情每秒刷新，仅作研究参考"
   ]));
   return true;
@@ -1679,11 +2186,13 @@ function renderChainDoc(j, decByOpt, doc, rail, log) {
     row: {
       productId: "", optInstId: r.instId, optType: r.optType, strike: r.strike,
       expTime: r.expiry, optBidPx: r.bidPx, optApr: r.optApr, optSettleCcy: r.settleCcy,
-      spot: r.spotPx, days: r.days, investCcy: "USDT", optMatched: false
+      spot: r.spotPx, days: r.days, investCcy: "USDT", optMatched: false,
+      ctVal: r.ctVal, uly: r.uly
     }
   };
   const sell = stampButton("ti-stamp", "卖出期权", "⌘ + ↵", canSell ? "is-green" : "", function () { openOrder("option", target); });
   sell.disabled = !canSell;
+  sell.title = "手动卖出：跳过策略建议，仍受执行器风控上限约束";
   rail.appendChild(sell);
   if (hasDcy) {
     const jump = stampButton("ti-arrow-back-up", "查看 DCY", "", "", function () { jumpToDecision(d.row.productId); });
@@ -1693,6 +2202,7 @@ function renderChainDoc(j, decByOpt, doc, rail, log) {
   let hintTxt = "";
   if (!tradeEnabled) hintTxt = "当前为只读看板（--read-only）";
   else if (!r.aprValid || !r.bidPx) hintTxt = "该档无买盘，无法卖出";
+  else hintTxt = "手动卖出可跳过策略建议；执行器风控上限仍生效";
 
   if (hintTxt) rail.appendChild(h("div", "rail-hint", hintTxt));
 
@@ -1741,6 +2251,7 @@ function renderDoc(j, decByOpt) {
 function renderRows(j) {
   lastSnap = j;
   const decByOpt = buildDecByOpt(j);
+  renderBest(j);
   renderQueue(j, decByOpt);
   renderDoc(j, decByOpt);
   updateSortUI();
@@ -1907,22 +2418,47 @@ function openOrder(kind, d) {
   const r = d.row;
   pending = { kind: kind, d: d };
   $("omTitle").textContent = kind === "option" ? "卖出期权 · SELL" : "申购双币赢 · DCY";
+  $("omAmtLabel").classList.remove("is-wide");
   const info = [];
   if (kind === "option") {
+    const ctVal = Number(r.optCtVal || r.ctVal || 0);
+    const spot = Number(r.spot || r.spotPx || 0);
+    const bid = Number(r.optBidPx || r.bidPx || 0);
+    const settle = String(r.optSettleCcy || r.settleCcy || "");
+    const base = String(r.uly || curUly || "").split("-")[0] || "标的";
+    const perNotional = (ctVal > 0 && spot > 0) ? ctVal * spot : 0;
     info.push("合约 " + r.optInstId);
     info.push("方向 " + optTypeName(r.optType) + " · 行权 " + fmtNum(r.strike) + " · 到期 " + expStr(r.expTime));
     info.push("买一价 " + (r.optBidPx || "-") + " · 期权APR " + pct(r.optApr) + "%");
+    if (perNotional > 0) {
+      info.push("每张名义 ≈ " + trimDec(perNotional, 2) + " USDT（1 张 = " + trimDec(ctVal, 4) + " " + base + " × 现价 " + fmtNum(spot) + "）");
+      if (bid > 0) {
+        const prem = bid * ctVal * ((settle === "USDT" || settle === "USD") ? 1 : spot);
+        info.push("卖 1 张约收权利金 ≈ " + trimDec(prem, 2) + " USDT（扣 0.03% 手续费前）");
+      }
+    } else {
+      info.push("每张金额未知：缺少合约乘数或现价");
+    }
+    info.push("手动卖出：跳过策略建议，仍受执行器风控上限约束");
     info.push("按买一价挂限价单；风控按合约名义折算，超上限会被拒单");
-    $("omAmtLabel").textContent = "卖出张数";
+    $("omAmtLabel").textContent = perNotional > 0
+      ? "卖出张数（每张 ≈ " + trimDec(perNotional, 2) + " USDT）"
+      : "卖出张数";
+    if (perNotional > 0) $("omAmtLabel").classList.add("is-wide");
     $("omAmt").value = "1";
     $("omAmt").min = "0";
   } else {
     info.push("产品 " + r.productId);
-    info.push("方向 " + dcySideName(r.optType) + " · 行权 " + fmtNum(r.strike) + " · 到期 " + expStr(r.expTime));
+    info.push("方向 " + dcySideName(r.optType) + " · 目标价（行权）" + fmtNum(r.strike) + " · 到期 " + expStr(r.expTime));
     info.push("DCY APR " + pct(r.dcyApr) + "% · 投入 " + (r.investCcy || "-"));
     info.push("可投区间 " + (r.dcyMinSize || "-") + " – " + (r.dcyMaxSize || "-") + " " + (r.investCcy || ""));
+    info.push("手动申购：跳过策略建议，仍受执行器风控上限约束");
     $("omAmtLabel").textContent = "投入 " + (r.investCcy || "");
-    const def = Number(d.suggestedAmt || r.dcyMinSize || 0);
+    // 只有策略建议是 DCY 申购时才沿用 suggestedAmt（期权建议的金额是张数/
+    // 名义，不是 DCY 本金）；其他手动场景从产品最小申购起。
+    let def = 0;
+    if (d.action === "subscribe_dual" && Number(d.suggestedAmt) > 0) def = Number(d.suggestedAmt);
+    if (!(def > 0)) def = Number(r.dcyMinSize || 0);
     $("omAmt").value = def > 0 ? String(Math.round(def * 10000) / 10000) : "";
     $("omAmt").min = r.dcyMinSize > 0 ? String(r.dcyMinSize) : "0";
   }
@@ -1930,9 +2466,15 @@ function openOrder(kind, d) {
   box.innerHTML = "";
   for (const line of info) box.appendChild(h("div", "", line));
   $("omNote").className = "omnote";
-  $("omNote").textContent = curMode === "live"
-    ? "⚠ 实盘模式：确认后将向 OKX 提交真实订单，请再次核对合约与数量。"
-    : "当前为 " + curMode + " 模式：不会提交真实订单。";
+  if (curMode === "live") {
+    $("omNote").textContent = "⚠ 实盘模式：确认后将向 OKX 提交真实订单，请再次核对合约与数量。";
+  } else if (curMode === "sim-local") {
+    $("omNote").textContent = "当前为 sim-local 纸面模式：不会提交真实订单；在持来自本地纸面单（sim_orders.jsonl）。";
+  } else if (curMode === "sim-okx") {
+    $("omNote").textContent = "当前为 sim-okx：期权走 OKX Demo，DCY 为纸面；在持含本地纸面单。";
+  } else {
+    $("omNote").textContent = "当前为 " + curMode + " 模式：不会提交真实订单。";
+  }
   $("omSubmit").textContent = curMode === "live" ? "确认实盘下单" : "确认下单";
   $("omSubmit").disabled = false;
   $("orderModal").classList.remove("hidden");
@@ -1971,12 +2513,14 @@ async function submitOrder() {
     if (!resp.ok) throw new Error(j.error || ("HTTP " + resp.status));
     $("orderModal").classList.add("hidden");
     pending = null;
-    setFlash("✓ " + (j.detail || "已提交"), false);
+    var flashTxt = "✓ " + (j.detail || "已提交");
+    if (j.warnings && j.warnings.length) flashTxt += "｜提示：" + j.warnings.join("；");
+    setFlash(flashTxt, false);
     dropStamp(kind === "option" ? "SELL" : "DCY", "#2E8C42");
     setTimeout(refresh, 2500);
   } catch (e) {
     $("omNote").className = "omnote err";
-    $("omNote").textContent = "✗ " + e.message;
+    $("omNote").textContent = "✗ [" + curMode + "] " + e.message;
     $("omSubmit").disabled = false;
   } finally {
     submitting = false;
@@ -2054,17 +2598,32 @@ $("omSubmit").addEventListener("click", submitOrder);
 $("omAmt").addEventListener("keydown", function (e) { if (e.key === "Enter") submitOrder(); });
 $("orderModal").addEventListener("click", function (e) { if (e.target === $("orderModal")) closeOrder(); });
 $("settingsNav").addEventListener("click", openSettings);
+$("guideNav").addEventListener("click", openGuide);
+$("strategyMore").addEventListener("click", openGuide);
+$("setGuide").addEventListener("click", openGuide);
+$("guideClose").addEventListener("click", closeGuide);
+$("guideOk").addEventListener("click", closeGuide);
+$("guideModal").addEventListener("click", function (e) { if (e.target === $("guideModal")) closeGuide(); });
+$("positionsNav").addEventListener("click", openPositions);
+$("posClose").addEventListener("click", closePositions);
+$("posClose2").addEventListener("click", closePositions);
+$("posRefresh").addEventListener("click", openPositions);
+$("positionsModal").addEventListener("click", function (e) { if (e.target === $("positionsModal")) closePositions(); });
 $("setClose").addEventListener("click", closeSettings);
 $("setCancel").addEventListener("click", closeSettings);
 $("setSave").addEventListener("click", saveSettings);
 $("setCapital").addEventListener("input", renderSetDerived);
+$("setTotalExposure").addEventListener("input", renderSetDerived);
+$("setPerOrder").addEventListener("input", renderSetDerived);
 $("setAuto").addEventListener("click", function () {
   if (!setAutoOn && curMode === "live" &&
       !window.confirm("实盘自动交易：会按策略自动提交真实订单，确认开启？")) return;
+  setAutoTouched = true;
   setAutoOn = !setAutoOn;
   renderSetAuto();
 });
 $("setLogout").addEventListener("click", logout);
+$("setAPIClear").addEventListener("click", clearAPICreds);
 $("settingsModal").addEventListener("click", function (e) { if (e.target === $("settingsModal")) closeSettings(); });
 $("autoFailClose").addEventListener("click", closeAutoFailures);
 $("autoFailOk").addEventListener("click", closeAutoFailures);
@@ -2077,6 +2636,8 @@ document.addEventListener("keydown", function (e) {
     return;
   }
   if (e.key === "Escape") {
+    if (!$("guideModal").classList.contains("hidden")) { closeGuide(); return; }
+    if (!$("positionsModal").classList.contains("hidden")) { closePositions(); return; }
     if (!$("autoFailModal").classList.contains("hidden")) { closeAutoFailures(); return; }
     if (!$("settingsModal").classList.contains("hidden")) { closeSettings(); return; }
     if (!$("orderModal").classList.contains("hidden")) { closeOrder(); return; }
@@ -2086,6 +2647,11 @@ document.addEventListener("keydown", function (e) {
       $("search").value = "";
       if (lastSnap) { const m = buildDecByOpt(lastSnap); renderQueue(lastSnap, m); renderDoc(lastSnap, m); }
     }
+    return;
+  }
+  if (e.key === "?" && !/^(INPUT|TEXTAREA|SELECT)$/.test((e.target && e.target.tagName) || "")) {
+    e.preventDefault();
+    openGuide();
     return;
   }
   if (!meta) return;
@@ -2135,7 +2701,12 @@ func New(fetcher SnapshotFetcher, uly string, addr string, opts ...ServerOption)
 	}
 	// Web 端可能被多标签/多设备同时操作：下单串行化，避免并发提交
 	// 交叉写审计/纸面单，也让「先校验决策、再提交」保持原子语义。
-	var orderMu sync.Mutex
+	// 自动执行必须复用同一把锁——此前它完全绕过 orderMu，手动单和自动单
+	// 可以同时落到同一产品上。
+	orderMu := &sync.Mutex{}
+	if cfg.auto != nil {
+		orderMu = cfg.auto.SubmitMu()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -2163,6 +2734,48 @@ func New(fetcher SnapshotFetcher, uly string, addr string, opts ...ServerOption)
 			return
 		}
 		writeJSON(w, http.StatusOK, makeResponse(snap, day, side, settle, cfg))
+	})
+	// 策略说明：文本由 strategy.BuildGuide 生成，参数取当前 settings，
+	// 保证页面里的阈值和实际决策一致（Web/TUI 共用同一份内容）。
+	mux.HandleFunc("/api/guide", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "只支持 GET"})
+			return
+		}
+		p := cfg.autoParams
+		if cfg.settings != nil {
+			if st, err := cfg.settings.LoadSettings(); err == nil {
+				p = paramsFromSettings(st, cfg)
+			}
+		}
+		writeJSON(w, http.StatusOK, strategy.BuildGuide(p))
+	})
+	// 持仓：风控快照 + 纸面单 + 平台真实仓位（只读展示，不触发下单）。
+	mux.HandleFunc("/api/positions", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "只支持 GET"})
+			return
+		}
+		if cfg.trader == nil {
+			writeJSON(w, http.StatusNotImplemented, map[string]any{
+				"error": "只读看板未接入执行器；请在命令行运行 coinoption --positions",
+			})
+			return
+		}
+		v, err := cfg.trader.Positions()
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": "读取持仓失败: " + err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"generatedAt": v.GeneratedAt,
+			"mode":        string(v.Mode),
+			"guard":       v.Guard,
+			"info":        v.Info,
+			"lines":       v.Lines(),
+		})
 	})
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
@@ -2269,10 +2882,14 @@ func New(fetcher SnapshotFetcher, uly string, addr string, opts ...ServerOption)
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "该合约不在当前期权链或没有买盘（实值档已被过滤）"})
 			return
 		}
-		out, err := cfg.trader.SubmitOption(req.InstID, req.Sz, req.Px)
+		out, err := cfg.trader.SubmitOptionAdvisory(req.InstID, req.Sz, req.Px)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
+		}
+		// 手动单同样登记去重：否则自动执行会在 60s 后对同一合约再卖一次。
+		if cfg.auto != nil {
+			cfg.auto.MarkDone("opt", req.InstID)
 		}
 		writeJSON(w, http.StatusOK, orderResponseFrom(out))
 	})
@@ -2321,10 +2938,13 @@ func New(fetcher SnapshotFetcher, uly string, addr string, opts ...ServerOption)
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "产品快照缺失（DCY 未接入或已下架），请刷新"})
 			return
 		}
-		out, err := cfg.trader.SubmitDCD(prod, req.Amt)
+		out, err := cfg.trader.SubmitDCDAdvisory(prod, req.Amt)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
+		}
+		if cfg.auto != nil {
+			cfg.auto.MarkDone("dcd", prod.ProductID)
 		}
 		writeJSON(w, http.StatusOK, orderResponseFrom(out))
 	})
@@ -2343,13 +2963,21 @@ func New(fetcher SnapshotFetcher, uly string, addr string, opts ...ServerOption)
 		}
 		var req struct {
 			Enabled *bool `json:"enabled"`
+			// ConfirmLive 实盘开启自动交易的显式服务端确认。此前只有前端
+			// window.confirm，一个裸 POST 就能让实盘自主交易跑起来。
+			ConfirmLive bool `json:"confirmLive"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<12)).Decode(&req); err != nil || req.Enabled == nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体需为 {\"enabled\": true|false}"})
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体需为 {\"enabled\": true|false, \"confirmLive\": true|false}"})
 			return
 		}
-		cfg.auto.SetEnabled(*req.Enabled)
-		// 开关落盘：重启后 Web/TUI 都沿用最后一次选择（live 模式启动时仍强制关闭）。
+		if *req.Enabled && cfg.trader != nil && cfg.trader.Mode() == executor.ModeLive && !req.ConfirmLive {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "实盘开启自动交易需在请求中带 confirmLive=true（二次确认）",
+			})
+			return
+		}
+		// 先落盘再改运行态，且持 settingsMu，避免与 /api/settings 交叉写文件。
 		if cfg.settings != nil {
 			cfg.settingsMu.Lock()
 			if st, err := cfg.settings.LoadSettings(); err == nil {
@@ -2357,6 +2985,17 @@ func New(fetcher SnapshotFetcher, uly string, addr string, opts ...ServerOption)
 				_ = cfg.settings.SaveSettings(st)
 			}
 			cfg.settingsMu.Unlock()
+		}
+		cfg.auto.SetEnabled(*req.Enabled)
+		if rec, ok := cfg.trader.(interface{ RecordAudit(store.AuditEvent) error }); ok {
+			mode := ""
+			if cfg.trader != nil {
+				mode = string(cfg.trader.Mode())
+			}
+			_ = rec.RecordAudit(store.AuditEvent{
+				Event: "auto", Mode: mode,
+				Detail: map[bool]string{true: "自动交易已开启", false: "自动交易已暂停"}[*req.Enabled],
+			})
 		}
 		enabled, note, count := cfg.auto.Status()
 		writeJSON(w, http.StatusOK, map[string]any{"enabled": enabled, "note": note, "count": count})
@@ -2406,7 +3045,15 @@ func New(fetcher SnapshotFetcher, uly string, addr string, opts ...ServerOption)
 	if cfg.auth != nil {
 		handler = cfg.auth.wrap(mux)
 	}
-	return &http.Server{Addr: addr, Handler: handler}
+	return &http.Server{
+		Addr:    addr,
+		Handler: handler,
+		// 无超时的 http.Server 会被慢连接拖住（本服务还暴露下单接口）。
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 }
 
 // handleSaveSettings 合并保存设置：只覆盖请求里出现的字段，校验后落盘并热更新。
@@ -2415,13 +3062,20 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request, cfg serverConfig
 		return
 	}
 	var req struct {
-		CapitalUSDT     *float64 `json:"capitalUsdt"`
-		MinDiffPct      *float64 `json:"minDiffPct"`
-		MinOptionEdgePP *float64 `json:"minOptionEdgePp"`
-		MinAbsEdgePct   *float64 `json:"minAbsEdgePct"`
-		MaxStrikeGapPct *float64 `json:"maxStrikeGapPct"`
-		AutoTrade       *bool    `json:"autoTrade"`
-		NewAuthCode     *string  `json:"newAuthCode"`
+		CapitalUSDT       *float64 `json:"capitalUsdt"`
+		TotalExposureUSDT *float64 `json:"totalExposureUsdt"`
+		PerOrderUSDT      *float64 `json:"perOrderUsdt"`
+		MinDiffPct        *float64 `json:"minDiffPct"`
+		MinOptionEdgePP   *float64 `json:"minOptionEdgePp"`
+		MinAbsEdgePct     *float64 `json:"minAbsEdgePct"`
+		MaxStrikeGapPct   *float64 `json:"maxStrikeGapPct"`
+		AutoTrade         *bool    `json:"autoTrade"`
+		ConfirmLive       bool     `json:"confirmLive"`
+		NewAuthCode       *string  `json:"newAuthCode"`
+		APIKey            *string  `json:"apiKey"`
+		APISecret         *string  `json:"apiSecret"`
+		APIPassphrase     *string  `json:"apiPassphrase"`
+		ClearAPIKey       *bool    `json:"clearApiKey"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<14)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "请求体需为 JSON: " + err.Error()})
@@ -2445,6 +3099,31 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request, cfg serverConfig
 			return
 		}
 		st.CapitalUSDT = v
+	}
+	if req.TotalExposureUSDT != nil {
+		v := *req.TotalExposureUSDT
+		if v != 0 && (v < 1 || v > 1e9) {
+			bad("总敞口上限需为 0（按资金总额派生）或 1 – 1,000,000,000 USDT")
+			return
+		}
+		st.TotalExposureUSDT = v
+	}
+	if req.PerOrderUSDT != nil {
+		v := *req.PerOrderUSDT
+		if v != 0 && (v < 1 || v > 1e9) {
+			bad("单笔上限需为 0（按资金总额派生）或 1 – 1,000,000,000 USDT")
+			return
+		}
+		st.PerOrderUSDT = v
+	}
+	// 单笔不得超过总敞口，否则任何新单都会先过单笔、再被总敞口拒绝。
+	effTotal := st.TotalExposureUSDT
+	if effTotal <= 0 {
+		effTotal = st.CapitalUSDT
+	}
+	if st.PerOrderUSDT > effTotal {
+		bad(fmt.Sprintf("单笔上限 %.2f 不能超过总敞口上限 %.2f", st.PerOrderUSDT, effTotal))
+		return
 	}
 	if req.MinDiffPct != nil {
 		v := *req.MinDiffPct
@@ -2478,8 +3157,49 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request, cfg serverConfig
 		}
 		st.MaxStrikeGapPct = v
 	}
+	prevAuto := st.AutoTrade
 	if req.AutoTrade != nil {
+		// 实盘开启自动交易同样需要服务端二次确认（此前只有 /api/auto 拦，
+		// 设置页这条路径可以绕过）。
+		if *req.AutoTrade && cfg.trader != nil && cfg.trader.Mode() == executor.ModeLive && !req.ConfirmLive {
+			bad("实盘开启自动交易需在请求中带 confirmLive=true（二次确认）")
+			return
+		}
 		st.AutoTrade = *req.AutoTrade
+	}
+
+	// API 凭证：三项必须同时提供；clearApiKey 清除 settings.json 中保存的凭证。
+	// 启动参数/环境变量存在时它们仍在运行期生效（apiKeyOverride），这里只落盘。
+	credsChanged := false
+	// 启动参数/环境变量已提供凭证时，不允许通过设置接口把新 Key 写进
+	// settings.json（会在下次不带 flag 启动时悄悄变成实盘凭证）。
+	if cfg.apiKeyOverride && (req.APIKey != nil || req.APISecret != nil || req.APIPassphrase != nil) {
+		bad("当前进程的 API 凭证来自启动参数/环境变量，设置页不能覆盖；请先去掉启动参数再重启")
+		return
+	}
+	if req.ClearAPIKey != nil && *req.ClearAPIKey {
+		if st.APIKey != "" || st.APISecret != "" || st.APIPassphrase != "" {
+			st.APIKey, st.APISecret, st.APIPassphrase = "", "", ""
+			credsChanged = true
+		}
+	} else if req.APIKey != nil || req.APISecret != nil || req.APIPassphrase != nil {
+		if req.APIKey == nil || req.APISecret == nil || req.APIPassphrase == nil {
+			bad("API Key / Secret / Passphrase 需三项同时填写")
+			return
+		}
+		key := strings.TrimSpace(*req.APIKey)
+		secret := strings.TrimSpace(*req.APISecret)
+		passphrase := strings.TrimSpace(*req.APIPassphrase)
+		if key == "" || secret == "" || passphrase == "" {
+			bad("API 凭证不能为空；如需清除请使用「清除已保存凭证」")
+			return
+		}
+		if len(key) > 128 || len(secret) > 128 || len(passphrase) > 128 {
+			bad("API 凭证单项长度不能超过 128")
+			return
+		}
+		st.APIKey, st.APISecret, st.APIPassphrase = key, secret, passphrase
+		credsChanged = true
 	}
 
 	relogin := false
@@ -2493,7 +3213,12 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request, cfg serverConfig
 			bad("当前未启用 Web 授权码")
 			return
 		}
-		st.WebAuthCodeHash = HashCode(code)
+		spec, err := NewCodeHash(code)
+		if err != nil {
+			bad("生成授权码摘要失败: " + err.Error())
+			return
+		}
+		st.WebAuthCodeHash = spec
 		relogin = true
 	}
 
@@ -2502,12 +3227,39 @@ func handleSaveSettings(w http.ResponseWriter, r *http.Request, cfg serverConfig
 		return
 	}
 	applySettings(cfg, c, st)
+	if st.AutoTrade != prevAuto {
+		if rec, ok := cfg.trader.(interface{ RecordAudit(store.AuditEvent) error }); ok {
+			mode := ""
+			if cfg.trader != nil {
+				mode = string(cfg.trader.Mode())
+			}
+			detail := "设置页：自动交易已暂停"
+			if st.AutoTrade {
+				detail = "设置页：自动交易已开启"
+			}
+			_ = rec.RecordAudit(store.AuditEvent{Event: "auto", Mode: mode, Detail: detail})
+		}
+	}
+	restartRequired := false
+	if credsChanged {
+		switch {
+		case cfg.creds == nil:
+			// 未接入运行期客户端（例如只读嵌入）：只落盘，重启后生效。
+			restartRequired = st.APIKey != ""
+		case cfg.apiKeyOverride:
+			// 启动参数/环境变量优先：当前进程继续使用它们，保存值留给下次。
+		default:
+			// 立即替换运行中客户端的签名凭证；DCY 产品下一次轮询即使用新 Key。
+			cfg.creds.SetAuth(st.APIKey, st.APISecret, st.APIPassphrase)
+		}
+	}
 	if relogin {
 		// 改码即注销所有会话：本次响应后页面会跳回 /login。
 		_ = cfg.auth.setHash(st.WebAuthCodeHash)
 	}
 	resp := makeSettingsResponse(cfg, st)
 	resp.Relogin = relogin
+	resp.RestartRequired = restartRequired
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -2518,6 +3270,7 @@ func paramsFromSettings(st store.Settings, cfg serverConfig) strategy.Params {
 	p.MinAbsEdge = st.MinAbsEdgePct / 100
 	p.MaxStrikeGapPct = st.MaxStrikeGapPct
 	p.AutoMinDiff = st.MinDiffPct / 100
+	st.ApplyTo(&p)
 	if cfg.trader != nil {
 		if lim := cfg.trader.State().Limits.PerOrderUSDT; lim > 0 {
 			p.CapitalCap = lim
@@ -2526,12 +3279,24 @@ func paramsFromSettings(st store.Settings, cfg serverConfig) strategy.Params {
 	return p
 }
 
-// applySettings 把设置热更新到风控（资金总额）、行情层（阈值）与自动引擎。
+// applySettings 把设置热更新到风控（资金总额 + 绝对上限）、行情层（阈值）与自动引擎。
 func applySettings(cfg serverConfig, c *cachedFetcher, st store.Settings) {
-	if cfg.trader != nil {
+	// --limits 显式指定时，风控上限以启动参数为准；否则保存一次设置就会把它
+	// 用资金派生值覆盖掉（单笔从 2000 变成 capital×40% 等）。
+	if cfg.trader != nil && !cfg.limitsOverride {
 		if cs, ok := cfg.trader.(interface{ SetCapital(float64) }); ok {
 			cs.SetCapital(st.CapitalUSDT)
 		}
+		if rl, ok := cfg.trader.(interface{ SetRiskLimits(float64, float64) }); ok {
+			rl.SetRiskLimits(st.TotalExposureUSDT, st.PerOrderUSDT)
+		}
+	}
+	// v2 组合风控上限由策略参数派生，不受 --limits 影响（--limits 只管
+	// 总敞口/单笔/并发/日笔数四项）。
+	if rc, ok := cfg.trader.(interface {
+		SetRiskCaps(float64, float64, float64)
+	}); ok {
+		rc.SetRiskCaps(st.CapitalUSDT*st.DcyDeltaExposurePct, st.StressShockPct/100, st.StressMaxLossPct/100)
 	}
 	p := paramsFromSettings(st, cfg)
 	c.SetParams(p)
@@ -2543,13 +3308,56 @@ func applySettings(cfg serverConfig, c *cachedFetcher, st store.Settings) {
 
 func makeSettingsResponse(cfg serverConfig, st store.Settings) settingsResponse {
 	resp := settingsResponse{
-		CapitalUSDT:     st.CapitalUSDT,
-		MinDiffPct:      st.MinDiffPct,
-		MinOptionEdgePP: st.MinOptionEdgePP,
-		MinAbsEdgePct:   st.MinAbsEdgePct,
-		MaxStrikeGapPct: st.MaxStrikeGapPct,
-		AuthEnabled:     cfg.auth != nil,
+		CapitalUSDT:       st.CapitalUSDT,
+		TotalExposureUSDT: st.TotalExposureUSDT,
+		PerOrderUSDT:      st.PerOrderUSDT,
+		MinDiffPct:        st.MinDiffPct,
+		MinOptionEdgePP:   st.MinOptionEdgePP,
+		MinAbsEdgePct:     st.MinAbsEdgePct,
+		MaxStrikeGapPct:   st.MaxStrikeGapPct,
+		AuthEnabled:       cfg.auth != nil,
+		APIKeyOverride:    cfg.apiKeyOverride,
+
+		StrategyMode:         st.StrategyMode,
+		TenorMinDays:         st.TenorMinDays,
+		TenorMaxDays:         st.TenorMaxDays,
+		MinDaysToExpiry:      st.MinDaysToExpiry,
+		MaxExpiryGapHours:    st.MaxExpiryGapHours,
+		MaxAbsDelta:          st.MaxAbsDelta,
+		MinIvRvSpread:        st.MinIvRvSpread,
+		FairVolBuffer:        st.FairVolBuffer,
+		MinPremiumOverFair:   st.MinPremiumOverFair,
+		MinAbsYieldPct:       st.MinAbsYieldPct,
+		MinAPRPct:            st.MinAPRPct,
+		CashAPRPct:           st.CashAPRPct,
+		MinCapitalExcessPct:  st.MinCapitalExcessPct,
+		StressShockPct:       st.StressShockPct,
+		StressMaxLossPct:     st.StressMaxLossPct,
+		AllowNegativeEdge:    st.AllowNegativeEdge,
+		MinEdgeRatio:         st.MinEdgeRatio,
+		MinEdgeAbs:           st.MinEdgeAbs,
+		DcyMaxPrincipalPct:   st.DcyMaxPrincipalPct,
+		DcyMaxPrincipalUSDT:  st.DcyMaxPrincipalUSDT,
+		DcyTotalPrincipalPct: st.DcyTotalPrincipalPct,
+		DcyDeltaExposurePct:  st.DcyDeltaExposurePct,
+		MaxConcurrent:        st.MaxConcurrent,
+		DailyLossPct:         st.DailyLossPct,
+		RVWindowDays:         st.RVWindowDays,
+		MinIVPercentilePct:   st.MinIVPercentilePct,
 	}
+	// API 凭证状态：只回显掩码 Key 与是否配置，Secret/Passphrase 绝不回传。
+	switch {
+	case cfg.apiKeyOverride:
+		resp.APIKeySource = "startup"
+	case st.APIKey != "" && st.APISecret != "" && st.APIPassphrase != "":
+		resp.APIKeySource = "settings"
+		resp.APIKeyConfigured = true
+		resp.APIKeyMasked = maskAPIKey(st.APIKey)
+	default:
+		resp.APIKeySource = "none"
+	}
+	resp.APISecretConfigured = st.APISecret != ""
+	resp.APIPassphraseConfigured = st.APIPassphrase != ""
 	if cfg.trader != nil {
 		g := cfg.trader.State()
 		resp.Limits = g.Limits
@@ -2562,6 +3370,14 @@ func makeSettingsResponse(cfg serverConfig, st store.Settings) settingsResponse 
 		resp.AutoTrade = st.AutoTrade
 	}
 	return resp
+}
+
+// maskAPIKey 只暴露首尾各 4 位，便于用户确认「是哪把 Key」而不泄露完整值。
+func maskAPIKey(key string) string {
+	if len(key) <= 8 {
+		return strings.Repeat("•", len(key))
+	}
+	return key[:4] + "…" + key[len(key)-4:]
 }
 
 // parseFilters 解析 Web 页面/WS 共用的筛选参数。
@@ -2618,6 +3434,9 @@ func makeResponse(snap *market.Snapshot, day time.Time, side, settle rune, cfg s
 		resp.AutoNote = note
 		resp.AutoCount = count
 		resp.AutoFailures = cfg.auto.Failures()
+	}
+	if best, ok := strategy.BestDCY(resp.Decisions); ok {
+		resp.Best = &best
 	}
 	return resp
 }
@@ -2688,6 +3507,7 @@ func orderResponseFrom(o executor.Outcome) orderResponse {
 		OK: true, Mode: string(o.Mode), Kind: o.Kind, Ref: o.Ref,
 		OrdID: o.OrdID, QuoteID: o.QuoteID, Amt: o.Amt, InvestCcy: o.InvestCcy,
 		AmtUSDT: o.AmtUSDT, Premium: o.Premium, Sim: o.Sim, Detail: o.Detail,
+		Warnings: o.Warnings,
 	}
 }
 
